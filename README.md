@@ -34,6 +34,7 @@ make check
 | `Ctrl + t` | 新しいタブを作成 | 現在の Workspace に追加 |
 | `Ctrl + Shift + E` | **左Drawer操作モード** に入る | 折りたたまれている場合は展開 |
 | `Ctrl + Shift + G` | **右Drawer（GitHub）** を開いて操作モードに入る | — |
+| `Ctrl + Shift + R` | **`config.conductty` を即時リロード** | テーマ・透過・フォント・キーマップを反映 |
 
 ### ペイン操作モード（`Ctrl + Shift + H`）
 

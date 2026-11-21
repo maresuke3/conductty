@@ -1,4 +1,5 @@
 mod browser;
+mod win_backdrop;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use std::thread;
 
 use browser::{BrowserBounds, EmbeddedBrowser};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
-use term_core::config::AppConfig;
+use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme};
 use term_core::grid::TerminalGrid;
 use term_core::input::{
     Action, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode, KeyEvent as CoreKeyEvent,
@@ -17,7 +18,7 @@ use term_core::input::{
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_drawer::{DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot};
-use term_render::tokyonight_moon_bg;
+use term_render::bg_from_rgb;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -215,6 +216,7 @@ impl PerformableContext for TabNavCtx<'_> {
 
 struct App {
     config: AppConfig,
+    theme: ResolvedTheme,
     rt: tokio::runtime::Runtime,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
@@ -225,7 +227,7 @@ struct App {
     panes: HashMap<PaneId, PaneRuntime>,
     next_pane_id: PaneId,
     go_to_active: bool,
-    left_drawer_open: bool,
+    left_drawer_mode: LeftDrawerMode,
     left_drawer_selected_idx: usize,
     renaming_workspace_idx: Option<usize>,
     rename_buf: String,
@@ -259,10 +261,10 @@ impl App {
             (1200.0, 800.0)
         };
 
-        let left_w = if self.left_drawer_open {
-            LEFT_DRAWER_WIDTH.min(w * 0.30)
-        } else {
-            LEFT_RAIL_WIDTH
+        let left_w = match self.left_drawer_mode {
+            LeftDrawerMode::Always => LEFT_DRAWER_WIDTH.min(w * 0.30),
+            LeftDrawerMode::Collapsed => LEFT_RAIL_WIDTH,
+            LeftDrawerMode::Hidden => 0.0,
         };
 
         let right_w = if self.right_drawer_open {
@@ -500,11 +502,20 @@ impl App {
                 self.go_to_active = !self.go_to_active;
             }
             Action::ToggleLeftDrawer => {
-                self.left_drawer_open = true;
+                if self.config.features.left_drawer_mode == LeftDrawerMode::Hidden {
+                    self.router.mode = InputMode::Normal;
+                    return;
+                }
+                self.left_drawer_mode = LeftDrawerMode::Always;
                 self.left_drawer_selected_idx = self.manager.active_workspace;
             }
             Action::ToggleLeftDrawerCollapse => {
-                self.left_drawer_open = !self.left_drawer_open;
+                if self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed {
+                    self.left_drawer_mode = match self.left_drawer_mode {
+                        LeftDrawerMode::Always => LeftDrawerMode::Collapsed,
+                        LeftDrawerMode::Collapsed | LeftDrawerMode::Hidden => LeftDrawerMode::Always,
+                    };
+                }
                 self.router.mode = InputMode::Normal;
             }
             Action::ExitLeftDrawerMode => {
@@ -555,6 +566,10 @@ impl App {
                 }
             }
             Action::ToggleRightDrawer => {
+                if !self.config.features.right_drawer {
+                    self.router.mode = InputMode::Normal;
+                    return;
+                }
                 self.right_drawer_open = true;
                 self.drawer_selected_idx = 0;
                 self.drawer_scroll_to_selected = true;
@@ -588,9 +603,11 @@ impl App {
                 }
             }
             Action::DrawerPreview => {
-                if let Some(item) = self.selected_drawer_item() {
-                    self.right_drawer_open = true;
-                    self.pending_browser_url = Some(item.url);
+                if self.config.features.embedded_browser {
+                    if let Some(item) = self.selected_drawer_item() {
+                        self.right_drawer_open = true;
+                        self.pending_browser_url = Some(item.url);
+                    }
                 }
             }
             Action::DrawerSendToPane => {
@@ -614,6 +631,21 @@ impl App {
             Action::Paste => {
                 self.paste_clipboard();
             }
+            Action::ReloadConfig => {
+                let new_cfg = AppConfig::load();
+                self.theme = new_cfg.resolve_theme();
+                self.router = InputRouter::from_config(&new_cfg);
+                self.left_drawer_mode = new_cfg.features.left_drawer_mode;
+                if !new_cfg.features.right_drawer {
+                    self.right_drawer_open = false;
+                    self.browser = None;
+                }
+                configure_fonts(&self.egui_ctx, &new_cfg.appearance.font_families);
+                if let Some(window) = &self.window {
+                    win_backdrop::apply(window, new_cfg.appearance.background_opacity);
+                }
+                self.config = new_cfg;
+            }
             Action::EnterPaneMode | Action::ExitPaneMode => {}
         }
     }
@@ -622,8 +654,11 @@ impl App {
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            // デザイン方針として不透明 (TokyoNight Moon #222436) を基本とする
-            let transparent = false;
+            // macOS (Metal) は winit の透過をそのまま使う。Windows は win_backdrop (WS_EX_LAYERED) で透過するため false にする
+            let is_wslg = cfg!(target_os = "linux") && std::env::var_os("WSL_DISTRO_NAME").is_some();
+            let transparent = cfg!(target_os = "macos")
+                && self.config.appearance.background_opacity < 0.999
+                && !is_wslg;
             let attrs = WindowAttributes::default()
                 .with_title("conductty")
                 .with_transparent(transparent);
@@ -632,6 +667,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .create_window(attrs)
                     .expect("failed to create window"),
             );
+            win_backdrop::apply(&window, self.config.appearance.background_opacity);
 
             configure_fonts(&self.egui_ctx, &self.config.appearance.font_families);
             let egui_state = egui_winit::State::new(
@@ -649,7 +685,9 @@ impl ApplicationHandler<UserEvent> for App {
             self.window = Some(window);
 
             // 初回起動時にバックグラウンドで GitHub タスクをプリフェッチしておく
-            self.trigger_drawer_refresh();
+            if self.config.features.right_drawer {
+                self.trigger_drawer_refresh();
+            }
         }
 
         if self.panes.is_empty() {
@@ -816,8 +854,9 @@ impl ApplicationHandler<UserEvent> for App {
                     (MouseButton::Left, ElementState::Released) => {
                         if self.selecting {
                             self.selecting = false;
-                            // copy-on-select = true
-                            self.copy_selection();
+                            if self.config.features.copy_on_select {
+                                self.copy_selection();
+                            }
                         }
                     }
                     _ => {}
@@ -923,7 +962,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let pane_mode = self.router.mode == InputMode::Pane;
                 let zoomed = self.manager.active_tab().zoomed;
                 let go_to_active = self.go_to_active;
-                let left_drawer_open = self.left_drawer_open;
+                let left_drawer_mode = self.left_drawer_mode;
                 let left_selected = self.left_drawer_selected_idx;
                 let active_ws_idx = self.manager.active_workspace;
                 let active_tab_idx = self.manager.active_workspace().active_tab;
@@ -963,6 +1002,8 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let mut refresh_requested = false;
                 let mut toggle_left_collapse = false;
+                let can_collapse_left =
+                    self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed;
                 let mut switch_ws_target: Option<usize> = None;
                 let mut switch_tab_target: Option<(usize, usize)> = None;
                 let mut new_ws_requested = false;
@@ -996,7 +1037,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut computed_cell_size = self.cell_size;
 
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
-                    if left_drawer_open {
+                    match left_drawer_mode {
+                        LeftDrawerMode::Always => {
                         egui::SidePanel::left("conductty_left_drawer")
                             .exact_width(LEFT_DRAWER_WIDTH)
                             .resizable(false)
@@ -1014,7 +1056,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if ui.button("<<").clicked() {
+                                            if can_collapse_left && ui.button("<<").clicked() {
                                                 toggle_left_collapse = true;
                                             }
                                             if ui.button("+ New").clicked() {
@@ -1146,7 +1188,8 @@ impl ApplicationHandler<UserEvent> for App {
                                     .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
                                 );
                             });
-                    } else {
+                        }
+                        LeftDrawerMode::Collapsed => {
                         egui::SidePanel::left("conductty_left_rail")
                             .exact_width(LEFT_RAIL_WIDTH)
                             .resizable(false)
@@ -1174,6 +1217,8 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
                                 });
                             });
+                        }
+                        LeftDrawerMode::Hidden => {}
                     }
 
                     if right_drawer_open {
@@ -1611,7 +1656,10 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
 
                                         // Kitty Graphics 画像の描画
-                                        if g.scroll_offset == 0 && !g.kitty.placements.is_empty() {
+                                        if self.config.features.kitty_graphics
+                                            && g.scroll_offset == 0
+                                            && !g.kitty.placements.is_empty()
+                                        {
                                             for p in &g.kitty.placements {
                                                 let Some(img) = g.kitty.images.get(&p.image_id)
                                                 else {
@@ -1698,10 +1746,12 @@ impl ApplicationHandler<UserEvent> for App {
                             if go_to_active {
                                 status_parts.push("GO_TO (press pane number)");
                             }
-                            if !left_drawer_open {
+                            if self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed
+                                && left_drawer_mode != LeftDrawerMode::Always
+                            {
                                 status_parts.push("Ctrl+Shift+E: Spaces");
                             }
-                            if !right_drawer_open {
+                            if self.config.features.right_drawer && !right_drawer_open {
                                 status_parts.push("Ctrl+Shift+G: GitHub");
                             }
                             if !status_parts.is_empty() {
@@ -1736,7 +1786,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 egui_state.handle_platform_output(window, platform_output);
 
-                let bg = tokyonight_moon_bg(self.config.appearance.background_opacity);
+                let bg_alpha = if cfg!(target_os = "windows") {
+                    1.0
+                } else {
+                    self.config.appearance.background_opacity
+                };
+                let bg = bg_from_rgb(self.theme.bg, bg_alpha);
                 match gpu.render_egui(window, &self.egui_ctx, full_output, bg) {
                     Ok(()) => {}
                     Err(wgpu::SurfaceError::Lost) => {
@@ -1776,8 +1831,7 @@ impl ApplicationHandler<UserEvent> for App {
                     need_redraw = true;
                 }
                 if toggle_left_collapse {
-                    self.left_drawer_open = !self.left_drawer_open;
-                    self.router.mode = InputMode::Normal;
+                    self.handle_action(Action::ToggleLeftDrawerCollapse);
                     need_redraw = true;
                 }
                 if new_ws_requested {
@@ -2284,6 +2338,10 @@ fn to_core_key_event(key: &Key, mods: ModifiersState) -> Option<CoreKeyEvent> {
             let ch = chars.next()?;
             if ch == ' ' {
                 CoreKeyCode::Space
+            } else if mods.control_key() && ('\x01'..='\x1a').contains(&ch) {
+                // Windows winit は Ctrl+文字 を制御文字 (\x01..\x1a) として渡すことがあるため英字に戻す
+                let letter = (b'a' + (ch as u8 - 1)) as char;
+                CoreKeyCode::Char(letter)
             } else {
                 CoreKeyCode::Char(ch)
             }
@@ -2313,7 +2371,12 @@ fn to_core_key_event(key: &Key, mods: ModifiersState) -> Option<CoreKeyEvent> {
 }
 
 fn main() {
-    let config = AppConfig::default();
+    let config = AppConfig::load();
+    let theme = config.resolve_theme();
+    let router = InputRouter::from_config(&config);
+    let left_drawer_mode = config.features.left_drawer_mode;
+    let right_drawer_open =
+        config.features.right_drawer && config.features.right_drawer_default_open;
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -2322,6 +2385,7 @@ fn main() {
 
     let mut app = App {
         config,
+        theme,
         rt,
         proxy,
         window: None,
@@ -2332,11 +2396,11 @@ fn main() {
         panes: HashMap::new(),
         next_pane_id: 1,
         go_to_active: false,
-        left_drawer_open: true,
+        left_drawer_mode,
         left_drawer_selected_idx: 0,
         renaming_workspace_idx: None,
         rename_buf: String::new(),
-        right_drawer_open: false,
+        right_drawer_open,
         drawer_snapshot: DrawerSnapshot::default(),
         drawer_selected_idx: 0,
         drawer_scroll_to_selected: false,
@@ -2349,7 +2413,7 @@ fn main() {
         pending_browser_url: None,
         browser_error: None,
         kitty_textures: HashMap::new(),
-        router: InputRouter::default(),
+        router,
         modifiers: ModifiersState::empty(),
     };
     let _ = event_loop.run_app(&mut app);
