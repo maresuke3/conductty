@@ -1,0 +1,11 @@
+[package]
+name = "term-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portable-pty.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+vte.workspace = true
