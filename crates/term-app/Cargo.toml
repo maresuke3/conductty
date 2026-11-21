@@ -8,6 +8,7 @@ name = "conductty"
 path = "src/main.rs"
 
 [dependencies]
+arboard.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true

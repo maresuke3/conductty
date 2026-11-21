@@ -16,7 +16,7 @@ use term_core::pty::PtySession;
 use term_drawer::{DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot};
 use term_render::tokyonight_moon_bg;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -103,12 +103,6 @@ impl GpuState {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        eprintln!(
-            "[wgpu] backend={:?} format={:?} alpha={:?}",
-            adapter.get_info().backend,
-            format,
-            alpha_mode
-        );
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
@@ -229,6 +223,11 @@ struct App {
     drawer_selected_idx: usize,
     drawer_scroll_to_selected: bool,
     cursor_pos: Pos2,
+    cell_size: (f32, f32),
+    selection: Option<(PaneId, (usize, usize), (usize, usize))>,
+    selecting: bool,
+    clipboard: Option<arboard::Clipboard>,
+    kitty_textures: HashMap<(PaneId, u32), egui::TextureHandle>,
     router: InputRouter,
     modifiers: ModifiersState,
 }
@@ -338,6 +337,67 @@ impl App {
         ordered.get(self.drawer_selected_idx).cloned()
     }
 
+    fn hit_test_cell(&self, pos: Pos2) -> Option<(PaneId, usize, usize)> {
+        let area = self.terminal_area();
+        if pos.x >= area.width {
+            return None;
+        }
+        let (char_w, row_h) = self.cell_size;
+        let pad_x = self.config.appearance.window_padding_x;
+        let pad_y = self.config.appearance.window_padding_y;
+        for (pane_id, rect) in self.tab.visible_rects(area) {
+            if pos.x >= rect.x
+                && pos.x <= rect.x + rect.width
+                && pos.y >= rect.y
+                && pos.y <= rect.y + rect.height
+            {
+                let col = ((pos.x - rect.x - pad_x).max(0.0) / char_w).floor() as usize;
+                let row = ((pos.y - rect.y - pad_y).max(0.0) / row_h).floor() as usize;
+                return Some((pane_id, col, row));
+            }
+        }
+        None
+    }
+
+    fn copy_selection(&mut self) {
+        let Some((pane_id, start, end)) = self.selection else {
+            return;
+        };
+        if start == end {
+            return;
+        }
+        let text = if let Some(pane) = self.panes.get(&pane_id) {
+            pane.grid
+                .lock()
+                .ok()
+                .map(|g| g.extract_text(start, end))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if !text.is_empty() {
+            if let Some(cb) = &mut self.clipboard {
+                let _ = cb.set_text(text);
+            }
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(cb) = &mut self.clipboard else {
+            return;
+        };
+        if let Ok(text) = cb.get_text() {
+            if !text.is_empty() {
+                if let Some(pane) = self.panes.get_mut(&self.tab.focused_pane) {
+                    if let Ok(mut g) = pane.grid.lock() {
+                        g.reset_scroll();
+                    }
+                    let _ = pane.pty.write_bytes(text.as_bytes());
+                }
+            }
+        }
+    }
+
     fn handle_action(&mut self, action: Action) {
         let area = self.terminal_area();
         match action {
@@ -401,6 +461,13 @@ impl App {
             Action::DrawerRefresh => {
                 self.trigger_drawer_refresh();
             }
+            Action::Copy => {
+                self.copy_selection();
+                self.selection = None;
+            }
+            Action::Paste => {
+                self.paste_clipboard();
+            }
             Action::EnterPaneMode | Action::ExitPaneMode => {}
             Action::NewTab => {
                 eprintln!("NewTab will be wired in Step 4");
@@ -412,9 +479,8 @@ impl App {
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            // macOS (Metal) は標準で透過が安定。Windows (DWM) / WSLg はリサイズ時の白抜け・EGLクラッシュを防ぐため明示オプトイン時のみ透過にする
-            let transparent = cfg!(target_os = "macos")
-                || std::env::var_os("CONDUCTTY_TRANSPARENT").is_some();
+            // デザイン方針として不透明 (TokyoNight Moon #222436) を基本とする
+            let transparent = false;
             let attrs = WindowAttributes::default()
                 .with_title("conductty")
                 .with_transparent(transparent);
@@ -522,6 +588,40 @@ impl ApplicationHandler<UserEvent> for App {
                     let scale = window.scale_factor() as f32;
                     self.cursor_pos =
                         Pos2::new(position.x as f32 / scale, position.y as f32 / scale);
+                }
+                if self.selecting {
+                    if let Some((pane_id, col, row)) = self.hit_test_cell(self.cursor_pos) {
+                        if let Some((sel_pane, start, _)) = self.selection {
+                            if sel_pane == pane_id {
+                                self.selection = Some((sel_pane, start, (col, row)));
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        if let Some((pane_id, col, row)) = self.hit_test_cell(self.cursor_pos) {
+                            self.tab.focused_pane = pane_id;
+                            self.selection = Some((pane_id, (col, row), (col, row)));
+                            self.selecting = true;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                    }
+                    (MouseButton::Left, ElementState::Released) => {
+                        if self.selecting {
+                            self.selecting = false;
+                            // copy-on-select = true
+                            self.copy_selection();
+                        }
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -635,6 +735,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let scroll_to_selected = self.drawer_scroll_to_selected;
                 self.drawer_scroll_to_selected = false;
                 let mut pending_resizes: Vec<(PaneId, usize, usize)> = Vec::new();
+
+                let selection = self.selection;
+                let mut computed_cell_size = self.cell_size;
 
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
                     if right_drawer_open {
@@ -754,6 +857,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let font_id = FontId::new(font_size, FontFamily::Monospace);
                             let char_w = ui.fonts(|f| f.glyph_width(&font_id, 'M'));
                             let row_h = font_size + cell_extra_h + 2.0;
+                            computed_cell_size = (char_w, row_h);
 
                             for (pane_id, rect) in &visible_panes {
                                 let egui_rect = Rect::from_min_size(
@@ -790,6 +894,47 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
 
                                     if let Ok(g) = runtime.grid.lock() {
+                                        // 選択範囲のハイライト描画 (#3d59a1)
+                                        if let Some((sel_pane, a, b)) = selection {
+                                            if sel_pane == *pane_id && a != b {
+                                                let ((sc, sr), (ec, er)) = if (a.1, a.0) <= (b.1, b.0) {
+                                                    (a, b)
+                                                } else {
+                                                    (b, a)
+                                                };
+                                                for row in sr..=er.min(g.rows.saturating_sub(1)) {
+                                                    let c_start = if row == sr { sc } else { 0 };
+                                                    let c_end = if row == er {
+                                                        ec.min(g.cols.saturating_sub(1))
+                                                    } else {
+                                                        g.cols.saturating_sub(1)
+                                                    };
+                                                    if c_end >= c_start {
+                                                        let sel_rect = Rect::from_min_size(
+                                                            Pos2::new(
+                                                                rect.x
+                                                                    + pad_x
+                                                                    + c_start as f32 * char_w,
+                                                                rect.y + pad_y + row as f32 * row_h,
+                                                            ),
+                                                            Vec2::new(
+                                                                (c_end - c_start + 1) as f32
+                                                                    * char_w,
+                                                                row_h,
+                                                            ),
+                                                        );
+                                                        painter.rect_filled(
+                                                            sel_rect,
+                                                            0.0,
+                                                            Color32::from_rgba_unmultiplied(
+                                                                0x3d, 0x59, 0xa1, 140,
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         for row in 0..g.rows {
                                             let y = rect.y + pad_y + row as f32 * row_h;
                                             let mut col = 0;
@@ -800,11 +945,22 @@ impl ApplicationHandler<UserEvent> for App {
                                                 let fg = first.fg;
                                                 let bg = first.bg;
                                                 let mut run = String::new();
+                                                let mut box_chars: Vec<(usize, char)> = Vec::new();
+                                                let mut non_ascii_chars: Vec<(usize, char)> =
+                                                    Vec::new();
                                                 let start_col = col;
                                                 while col < g.cols {
                                                     if let Some(cell) = g.visible_cell(col, row) {
                                                         if cell.fg == fg && cell.bg == bg {
-                                                            run.push(cell.ch);
+                                                            if is_box_drawing_char(cell.ch) {
+                                                                box_chars.push((col, cell.ch));
+                                                                run.push(' ');
+                                                            } else if !cell.ch.is_ascii() {
+                                                                non_ascii_chars.push((col, cell.ch));
+                                                                run.push(' ');
+                                                            } else {
+                                                                run.push(cell.ch);
+                                                            }
                                                             col += 1;
                                                             continue;
                                                         }
@@ -813,15 +969,16 @@ impl ApplicationHandler<UserEvent> for App {
                                                 }
 
                                                 if let Some(bg_rgb) = bg {
-                                                    let bg_rect = Rect::from_min_size(
-                                                        Pos2::new(
-                                                            rect.x + pad_x + start_col as f32 * char_w,
-                                                            y,
-                                                        ),
-                                                        Vec2::new(
-                                                            (col - start_col) as f32 * char_w,
-                                                            row_h,
-                                                        ),
+                                                    let x0 = (rect.x
+                                                        + pad_x
+                                                        + start_col as f32 * char_w)
+                                                        .round();
+                                                    let x1 =
+                                                        (rect.x + pad_x + col as f32 * char_w)
+                                                            .round();
+                                                    let bg_rect = Rect::from_min_max(
+                                                        Pos2::new(x0, y.round()),
+                                                        Pos2::new(x1, (y + row_h).round()),
                                                     );
                                                     painter.rect_filled(
                                                         bg_rect,
@@ -832,24 +989,61 @@ impl ApplicationHandler<UserEvent> for App {
                                                     );
                                                 }
 
+                                                let fg_color = Color32::from_rgb(fg.r, fg.g, fg.b);
+                                                for (b_col, b_ch) in box_chars {
+                                                    let cell_rect = Rect::from_min_size(
+                                                        Pos2::new(
+                                                            (rect.x + pad_x + b_col as f32 * char_w)
+                                                                .round(),
+                                                            y.round(),
+                                                        ),
+                                                        Vec2::new(char_w.round(), row_h.round()),
+                                                    );
+                                                    draw_box_drawing(
+                                                        &painter,
+                                                        b_ch,
+                                                        cell_rect,
+                                                        fg_color,
+                                                    );
+                                                }
+
                                                 let trimmed = run.trim_end();
                                                 if !trimmed.is_empty() {
                                                     let pos = Pos2::new(
-                                                        rect.x + pad_x + start_col as f32 * char_w,
-                                                        y,
+                                                        (rect.x + pad_x + start_col as f32 * char_w)
+                                                            .round(),
+                                                        y.round(),
                                                     );
                                                     painter.text(
                                                         pos,
                                                         egui::Align2::LEFT_TOP,
                                                         trimmed,
                                                         font_id.clone(),
-                                                        Color32::from_rgb(fg.r, fg.g, fg.b),
+                                                        fg_color,
+                                                    );
+                                                }
+
+                                                // 日本語や Nerd Font アイコンはグリッド座標に厳密固定して描画する
+                                                let mut buf = [0u8; 4];
+                                                for (n_col, n_ch) in non_ascii_chars {
+                                                    let pos = Pos2::new(
+                                                        (rect.x + pad_x + n_col as f32 * char_w)
+                                                            .round(),
+                                                        y.round(),
+                                                    );
+                                                    let s = n_ch.encode_utf8(&mut buf);
+                                                    painter.text(
+                                                        pos,
+                                                        egui::Align2::LEFT_TOP,
+                                                        s,
+                                                        font_id.clone(),
+                                                        fg_color,
                                                     );
                                                 }
                                             }
                                         }
 
-                                        if is_focused && g.scroll_offset == 0 {
+                                        if is_focused && g.scroll_offset == 0 && g.cursor_visible {
                                             let cx = rect.x + pad_x + g.cursor_col as f32 * char_w;
                                             let cy = rect.y + pad_y + g.cursor_row as f32 * row_h;
                                             let cursor_rect = Rect::from_min_size(
@@ -863,6 +1057,63 @@ impl ApplicationHandler<UserEvent> for App {
                                                     0x82, 0xaa, 0xff, 160,
                                                 ),
                                             );
+                                        }
+
+                                        // Kitty Graphics 画像の描画
+                                        if g.scroll_offset == 0 && !g.kitty.placements.is_empty() {
+                                            for p in &g.kitty.placements {
+                                                let Some(img) = g.kitty.images.get(&p.image_id)
+                                                else {
+                                                    continue;
+                                                };
+                                                let tex = self
+                                                    .kitty_textures
+                                                    .entry((*pane_id, p.image_id))
+                                                    .or_insert_with(|| {
+                                                        let color_img =
+                                                            egui::ColorImage::from_rgba_unmultiplied(
+                                                                [
+                                                                    img.width as usize,
+                                                                    img.height as usize,
+                                                                ],
+                                                                &img.rgba,
+                                                            );
+                                                        ctx.load_texture(
+                                                            format!(
+                                                                "kitty-{}-{}",
+                                                                pane_id, p.image_id
+                                                            ),
+                                                            color_img,
+                                                            egui::TextureOptions::LINEAR,
+                                                        )
+                                                    });
+
+                                                let img_w = p
+                                                    .cols
+                                                    .map(|c| c as f32 * char_w)
+                                                    .unwrap_or(img.width as f32);
+                                                let img_h = p
+                                                    .rows
+                                                    .map(|r| r as f32 * row_h)
+                                                    .unwrap_or(img.height as f32);
+                                                let img_pos = Pos2::new(
+                                                    rect.x + pad_x + p.col as f32 * char_w,
+                                                    rect.y + pad_y + p.row as f32 * row_h,
+                                                );
+                                                let img_rect = Rect::from_min_size(
+                                                    img_pos,
+                                                    Vec2::new(img_w, img_h),
+                                                );
+                                                painter.image(
+                                                    tex.id(),
+                                                    img_rect,
+                                                    Rect::from_min_max(
+                                                        Pos2::new(0.0, 0.0),
+                                                        Pos2::new(1.0, 1.0),
+                                                    ),
+                                                    Color32::WHITE,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -913,6 +1164,7 @@ impl ApplicationHandler<UserEvent> for App {
                         });
                 });
 
+                self.cell_size = computed_cell_size;
                 let egui_wants_repaint = full_output
                     .viewport_output
                     .get(&egui::ViewportId::ROOT)
@@ -1051,6 +1303,156 @@ fn render_github_section(
     }
 }
 
+fn is_box_drawing_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '│' | '┃'
+            | '─'
+            | '━'
+            | '┌'
+            | '╭'
+            | '┐'
+            | '╮'
+            | '└'
+            | '╰'
+            | '┘'
+            | '╯'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '\u{e0b4}'
+            | '\u{e0b6}'
+    )
+}
+
+/// 罫線文字（Box Drawing）はフォントに任せずセル全幅・全高で直接描画して隙間をなくす
+fn draw_box_drawing(painter: &egui::Painter, ch: char, rect: Rect, color: Color32) -> bool {
+    let cx = rect.center().x.round();
+    let cy = rect.center().y.round();
+    let t = 1.5_f32;
+    let ht = t * 0.5;
+    let bt = 2.5_f32;
+    let hbt = bt * 0.5;
+
+    let v_full = Rect::from_min_max(
+        Pos2::new(cx - ht, rect.top()),
+        Pos2::new(cx + ht, rect.bottom()),
+    );
+    let h_full = Rect::from_min_max(
+        Pos2::new(rect.left(), cy - ht),
+        Pos2::new(rect.right(), cy + ht),
+    );
+    let v_up = Rect::from_min_max(Pos2::new(cx - ht, rect.top()), Pos2::new(cx + ht, cy + ht));
+    let v_down = Rect::from_min_max(
+        Pos2::new(cx - ht, cy - ht),
+        Pos2::new(cx + ht, rect.bottom()),
+    );
+    let h_left = Rect::from_min_max(
+        Pos2::new(rect.left(), cy - ht),
+        Pos2::new(cx + ht, cy + ht),
+    );
+    let h_right = Rect::from_min_max(
+        Pos2::new(cx - ht, cy - ht),
+        Pos2::new(rect.right(), cy + ht),
+    );
+
+    match ch {
+        '│' => {
+            painter.rect_filled(v_full, 0.0, color);
+        }
+        '┃' => {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(cx - hbt, rect.top()),
+                    Pos2::new(cx + hbt, rect.bottom()),
+                ),
+                0.0,
+                color,
+            );
+        }
+        '─' => {
+            painter.rect_filled(h_full, 0.0, color);
+        }
+        '━' => {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(rect.left(), cy - hbt),
+                    Pos2::new(rect.right(), cy + hbt),
+                ),
+                0.0,
+                color,
+            );
+        }
+        '┌' | '╭' => {
+            painter.rect_filled(v_down, 0.0, color);
+            painter.rect_filled(h_right, 0.0, color);
+        }
+        '┐' | '╮' => {
+            painter.rect_filled(v_down, 0.0, color);
+            painter.rect_filled(h_left, 0.0, color);
+        }
+        '└' | '╰' => {
+            painter.rect_filled(v_up, 0.0, color);
+            painter.rect_filled(h_right, 0.0, color);
+        }
+        '┘' | '╯' => {
+            painter.rect_filled(v_up, 0.0, color);
+            painter.rect_filled(h_left, 0.0, color);
+        }
+        '├' => {
+            painter.rect_filled(v_full, 0.0, color);
+            painter.rect_filled(h_right, 0.0, color);
+        }
+        '┤' => {
+            painter.rect_filled(v_full, 0.0, color);
+            painter.rect_filled(h_left, 0.0, color);
+        }
+        '┬' => {
+            painter.rect_filled(h_full, 0.0, color);
+            painter.rect_filled(v_down, 0.0, color);
+        }
+        '┴' => {
+            painter.rect_filled(h_full, 0.0, color);
+            painter.rect_filled(v_up, 0.0, color);
+        }
+        '┼' => {
+            painter.rect_filled(v_full, 0.0, color);
+            painter.rect_filled(h_full, 0.0, color);
+        }
+        // Powerline 丸角キャップ (U+E0B6 , U+E0B4 ) をセル全高にピッタリ合わせて描画
+        '\u{e0b6}' => {
+            let r = (rect.height() * 0.5).min(rect.width()).round() as u8;
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius {
+                    nw: r,
+                    sw: r,
+                    ne: 0,
+                    se: 0,
+                },
+                color,
+            );
+        }
+        '\u{e0b4}' => {
+            let r = (rect.height() * 0.5).min(rect.width()).round() as u8;
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius {
+                    nw: 0,
+                    sw: 0,
+                    ne: r,
+                    se: r,
+                },
+                color,
+            );
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = Command::new("open").arg(url).spawn();
@@ -1080,6 +1482,17 @@ fn configure_fonts(ctx: &egui::Context, families: &[String]) {
     for family_name in families {
         if let Some(bytes) = find_font_bytes(&search_dirs, family_name) {
             let key = format!("conductty-{family_name}");
+            fonts
+                .font_data
+                .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+            loaded_names.push(key);
+        }
+    }
+
+    // Nerd Font アイコン用フォールバック（FiraCodeNF / SymbolsNerdFont 等）
+    for nf_name in ["FiraCodeNF", "SymbolsNerdFont", "NerdFont"] {
+        let key = format!("conductty-nf-{nf_name}");
+        if let Some(bytes) = find_font_bytes(&search_dirs, nf_name) {
             fonts
                 .font_data
                 .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
@@ -1140,6 +1553,9 @@ fn font_search_dirs() -> Vec<PathBuf> {
     dirs.push(PathBuf::from("/usr/share/fonts"));
     dirs.push(PathBuf::from("/usr/local/share/fonts"));
     dirs.push(PathBuf::from("/Library/Fonts"));
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local_app_data).join("Microsoft\\Windows\\Fonts"));
+    }
     dirs.push(PathBuf::from("/mnt/c/Windows/Fonts"));
     if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
         for entry in entries.flatten() {
@@ -1254,6 +1670,11 @@ fn main() {
         drawer_selected_idx: 0,
         drawer_scroll_to_selected: false,
         cursor_pos: Pos2::ZERO,
+        cell_size: (10.0, 22.0),
+        selection: None,
+        selecting: false,
+        clipboard: arboard::Clipboard::new().ok(),
+        kitty_textures: HashMap::new(),
         router: InputRouter::default(),
         modifiers: ModifiersState::empty(),
     };
