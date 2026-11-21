@@ -1,9 +1,12 @@
+mod browser;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use browser::{BrowserBounds, EmbeddedBrowser};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
 use term_core::config::AppConfig;
 use term_core::grid::TerminalGrid;
@@ -22,6 +25,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const RIGHT_DRAWER_WIDTH: f32 = 340.0;
+const RIGHT_BROWSER_WIDTH: f32 = 560.0;
 
 #[derive(Debug, Clone)]
 enum UserEvent {
@@ -227,6 +231,9 @@ struct App {
     selection: Option<(PaneId, (usize, usize), (usize, usize))>,
     selecting: bool,
     clipboard: Option<arboard::Clipboard>,
+    browser: Option<EmbeddedBrowser>,
+    pending_browser_url: Option<String>,
+    browser_error: Option<String>,
     kitty_textures: HashMap<(PaneId, u32), egui::TextureHandle>,
     router: InputRouter,
     modifiers: ModifiersState,
@@ -246,7 +253,11 @@ impl App {
         };
 
         let drawer_w = if self.right_drawer_open {
-            RIGHT_DRAWER_WIDTH.min(w * 0.45)
+            if self.browser.is_some() {
+                RIGHT_BROWSER_WIDTH.min(w * 0.55)
+            } else {
+                RIGHT_DRAWER_WIDTH.min(w * 0.45)
+            }
         } else {
             0.0
         };
@@ -398,6 +409,33 @@ impl App {
         }
     }
 
+    fn right_browser_bounds(&self) -> BrowserBounds {
+        let (w, h) = if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let scale = window.scale_factor() as f32;
+            (
+                (size.width as f32 / scale).max(100.0),
+                (size.height as f32 / scale).max(100.0),
+            )
+        } else {
+            (1200.0, 800.0)
+        };
+        let drawer_w = RIGHT_BROWSER_WIDTH.min(w * 0.55);
+        let top_bar_h = 46.0_f32;
+        BrowserBounds {
+            x: (w - drawer_w) as f64,
+            y: top_bar_h as f64,
+            width: drawer_w as f64,
+            height: (h - top_bar_h).max(40.0) as f64,
+        }
+    }
+
+    fn sync_browser_window(&self) {
+        if let (Some(browser), Some(parent)) = (&self.browser, &self.window) {
+            browser.sync_to_parent(parent, self.right_browser_bounds());
+        }
+    }
+
     fn handle_action(&mut self, action: Action) {
         let area = self.terminal_area();
         match action {
@@ -430,6 +468,11 @@ impl App {
             }
             Action::CloseRightDrawer => {
                 self.right_drawer_open = false;
+                if self.browser.take().is_some() {
+                    if let Some(window) = &self.window {
+                        window.focus_window();
+                    }
+                }
                 self.router.mode = InputMode::Normal;
             }
             Action::DrawerNext => {
@@ -446,6 +489,12 @@ impl App {
             Action::DrawerOpen => {
                 if let Some(item) = self.selected_drawer_item() {
                     open_url(&item.url);
+                }
+            }
+            Action::DrawerPreview => {
+                if let Some(item) = self.selected_drawer_item() {
+                    self.right_drawer_open = true;
+                    self.pending_browser_url = Some(item.url);
                 }
             }
             Action::DrawerSendToPane => {
@@ -559,7 +608,44 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(url) = self.pending_browser_url.take() {
+            self.right_drawer_open = true;
+            self.browser_error = None;
+            let bounds = self.right_browser_bounds();
+            if let Some(browser) = &mut self.browser {
+                browser.load_url(&url);
+                if let Some(parent) = &self.window {
+                    browser.sync_to_parent(parent, bounds);
+                }
+            } else if let Some(parent) = &self.window {
+                match EmbeddedBrowser::open(event_loop, parent, &url, bounds) {
+                    Ok(b) => self.browser = Some(b),
+                    Err(err) => self.browser_error = Some(err),
+                }
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self
+            .browser
+            .as_ref()
+            .is_some_and(|b| b.window_id() == id)
+        {
+            if matches!(event, WindowEvent::CloseRequested) {
+                self.browser = None;
+                if let Some(window) = &self.window {
+                    window.focus_window();
+                    window.request_redraw();
+                }
+            }
+            return;
+        }
+
         if let (Some(window), Some(egui_state)) = (&self.window, &mut self.egui_state) {
             let response = egui_state.on_window_event(window, &event);
             if response.repaint {
@@ -576,9 +662,13 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
+                self.sync_browser_window();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+            }
+            WindowEvent::Moved(_) => {
+                self.sync_browser_window();
             }
             WindowEvent::ModifiersChanged(new_mods) => {
                 self.modifiers = new_mods.state();
@@ -610,6 +700,8 @@ impl ApplicationHandler<UserEvent> for App {
                             self.selection = Some((pane_id, (col, row), (col, row)));
                             self.selecting = true;
                             if let Some(window) = &self.window {
+                                // WebView2 子ウィンドウにフォーカスが移っていた場合に親端末へ戻す
+                                window.focus_window();
                                 window.request_redraw();
                             }
                         }
@@ -730,8 +822,18 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let mut refresh_requested = false;
                 let mut close_drawer_requested = false;
+                let mut close_browser_requested = false;
                 let mut open_url_target: Option<String> = None;
+                let mut preview_url_target: Option<String> = None;
                 let mut send_to_pane_text: Option<String> = None;
+                let browser_active = self.browser.is_some();
+                let browser_url = self.browser.as_ref().map(|b| b.url.clone());
+                let browser_error = self.browser_error.clone();
+                let drawer_panel_w = if browser_active {
+                    RIGHT_BROWSER_WIDTH.min((area.width + RIGHT_BROWSER_WIDTH) * 0.55)
+                } else {
+                    RIGHT_DRAWER_WIDTH
+                };
                 let scroll_to_selected = self.drawer_scroll_to_selected;
                 self.drawer_scroll_to_selected = false;
                 let mut pending_resizes: Vec<(PaneId, usize, usize)> = Vec::new();
@@ -742,7 +844,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
                     if right_drawer_open {
                         egui::SidePanel::right("conductty_right_drawer")
-                            .exact_width(RIGHT_DRAWER_WIDTH)
+                            .exact_width(drawer_panel_w)
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
@@ -750,6 +852,27 @@ impl ApplicationHandler<UserEvent> for App {
                                     .inner_margin(12.0),
                             )
                             .show(ctx, |ui| {
+                                if let Some(url) = &browser_url {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("<- List").clicked() {
+                                            close_browser_requested = true;
+                                        }
+                                        if ui.button("External").clicked() {
+                                            open_url_target = Some(url.clone());
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("x").clicked() {
+                                                    close_drawer_requested = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.separator();
+                                    return;
+                                }
+
                                 ui.horizontal(|ui| {
                                     ui.heading(
                                         egui::RichText::new("GitHub")
@@ -768,6 +891,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     );
                                 });
                                 ui.separator();
+
+                                if let Some(err) = &browser_error {
+                                    ui.label(
+                                        egui::RichText::new(err)
+                                            .small()
+                                            .color(Color32::from_rgb(0xff, 0x75, 0x7f)),
+                                    );
+                                }
 
                                 if drawer_snapshot.is_loading {
                                     ui.label(
@@ -812,6 +943,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             self.drawer_selected_idx,
                                             scroll_to_selected,
                                             &mut open_url_target,
+                                            &mut preview_url_target,
                                             &mut send_to_pane_text,
                                         );
                                         render_github_section(
@@ -824,6 +956,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             self.drawer_selected_idx,
                                             scroll_to_selected,
                                             &mut open_url_target,
+                                            &mut preview_url_target,
                                             &mut send_to_pane_text,
                                         );
                                         render_github_section(
@@ -836,6 +969,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             self.drawer_selected_idx,
                                             scroll_to_selected,
                                             &mut open_url_target,
+                                            &mut preview_url_target,
                                             &mut send_to_pane_text,
                                         );
                                     });
@@ -843,7 +977,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 ui.separator();
                                 ui.label(
                                     egui::RichText::new(
-                                        "j/k: select | o/Enter: open | s: send | r: refresh | q/Esc: close",
+                                        "j/k: select | b: preview | o: open | s: send | r: refresh | q/Esc: close",
                                     )
                                     .small()
                                     .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
@@ -1170,9 +1304,17 @@ impl ApplicationHandler<UserEvent> for App {
                     .get(&egui::ViewportId::ROOT)
                     .is_some_and(|v| v.repaint_delay.is_zero());
 
-                egui_state.handle_platform_output(window, full_output.platform_output.clone());
-                // egui_winit は TextEdit 非フォーカス時に IME を無効化するため、端末用に常に有効化し直す
-                window.set_ime_allowed(true);
+                // egui_winit が毎フレーム set_ime_allowed(false) を呼んで Windows IME (TSF) が
+                // 「あ」固定になるのを防ぐため、端末用 IME 出力を常に Some に保つ
+                let mut platform_output = full_output.platform_output.clone();
+                if platform_output.ime.is_none() {
+                    let cursor_rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(10.0, 20.0));
+                    platform_output.ime = Some(egui::output::IMEOutput {
+                        rect: cursor_rect,
+                        cursor_rect,
+                    });
+                }
+                egui_state.handle_platform_output(window, platform_output);
 
                 let bg = tokyonight_moon_bg(self.config.appearance.background_opacity);
                 match gpu.render_egui(window, &self.egui_ctx, full_output, bg) {
@@ -1188,11 +1330,28 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut need_redraw = egui_wants_repaint;
                 if close_drawer_requested {
                     self.right_drawer_open = false;
+                    if self.browser.take().is_some() {
+                        if let Some(w) = &self.window {
+                            w.focus_window();
+                        }
+                    }
                     self.router.mode = InputMode::Normal;
+                    need_redraw = true;
+                }
+                if close_browser_requested {
+                    if self.browser.take().is_some() {
+                        if let Some(w) = &self.window {
+                            w.focus_window();
+                        }
+                    }
                     need_redraw = true;
                 }
                 if refresh_requested {
                     self.trigger_drawer_refresh();
+                    need_redraw = true;
+                }
+                if let Some(url) = preview_url_target {
+                    self.pending_browser_url = Some(url);
                     need_redraw = true;
                 }
                 if let Some(url) = open_url_target {
@@ -1234,6 +1393,7 @@ fn render_github_section(
     selected_idx: usize,
     scroll_to_selected: bool,
     open_url_target: &mut Option<String>,
+    preview_url_target: &mut Option<String>,
     send_to_pane_text: &mut Option<String>,
 ) {
     let filtered: Vec<&GitHubItem> = items.iter().filter(|i| i.kind == kind).collect();
@@ -1285,6 +1445,9 @@ fn render_github_section(
                     .selectable(true),
                 );
                 ui.horizontal(|ui| {
+                    if ui.small_button("Preview").clicked() {
+                        *preview_url_target = Some(item.url.clone());
+                    }
                     if ui.small_button("Open").clicked() {
                         *open_url_target = Some(item.url.clone());
                     }
@@ -1674,6 +1837,9 @@ fn main() {
         selection: None,
         selecting: false,
         clipboard: arboard::Clipboard::new().ok(),
+        browser: None,
+        pending_browser_url: None,
+        browser_error: None,
         kitty_textures: HashMap::new(),
         router: InputRouter::default(),
         modifiers: ModifiersState::empty(),
