@@ -1,0 +1,60 @@
+# conductty 設定ファイル
+# 配置優先順位:
+#   1. ~/.config/conductty/config.conductty
+#   2. ~/.config/config.conductty
+#   3. ~/.conductty/config.conductty
+#   4. ~/.config.conductty
+#   5. デフォルト設定 (組み込み)
+
+[features]
+multiplexer_mode = false
+# 左Drawerの表示モード: "always" (常時表示) / "collapsed" (折りたたみ) / "hidden" (非表示)
+left_drawer_mode = "collapsed"
+right_drawer = true
+right_drawer_default_open = false
+embedded_browser = true
+kitty_graphics = true
+copy_on_select = true
+
+[appearance]
+font_families = ["Cica", "FiraCode Nerd Font", "Fira Code"]
+font_size = 18.0
+font_thicken = true
+adjust_cell_height = 2.0
+# プリセット: "TokyoNight Moon" / "TokyoNight" / "Solarized Dark"
+theme = "TokyoNight Moon"
+background_opacity = 0.85
+window_padding_x = 10.0
+window_padding_y = 10.0
+window_padding_balance = true
+
+# テーマ色を個別に上書きしたい場合のみ指定
+# [theme]
+# background = "#222436"
+# foreground = "#c8d3f5"
+# accent = "#7aa2f7"
+
+[keybinds]
+new_tab = "ctrl+t"
+split_right = "alt+d"
+split_down = "alt+shift+d"
+toggle_zoom = "ctrl+shift+z"
+pane_mode = "ctrl+shift+h"
+goto_left = "performable:ctrl+h"
+goto_down = "performable:ctrl+j"
+goto_up = "performable:ctrl+k"
+goto_right = "performable:ctrl+l"
+toggle_left_drawer = "ctrl+shift+e"
+toggle_right_drawer = "ctrl+shift+g"
+go_to = "ctrl+shift+space"
+copy = "ctrl+shift+c"
+paste = "ctrl+v"
+reload_config = "ctrl+shift+r"
+
+[shell]
+windows_default_prog = ["wsl.exe", "--cd", "~"]
+
+[window]
+save_state = "always"
+split_preserve_zoom = "navigation"
+macos_option_as_alt = "left"

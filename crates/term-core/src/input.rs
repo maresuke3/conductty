@@ -1,3 +1,4 @@
+use crate::config::AppConfig;
 use crate::layout::NavDirection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,7 @@ pub enum Action {
     DrawerRefresh,
     Copy,
     Paste,
+    ReloadConfig,
     OpenGoTo,
 }
 
@@ -83,18 +85,136 @@ pub trait PerformableContext {
     fn can_goto_split(&self, dir: NavDirection) -> bool;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBinding {
+    pub code: KeyCode,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub logo: bool,
+    pub performable: bool,
+    pub action: Action,
+}
+
+impl KeyBinding {
+    pub fn parse(spec: &str, action: Action) -> Option<Self> {
+        let trimmed = spec.trim();
+        let (performable, rest) = if let Some(r) = trimmed.strip_prefix("performable:") {
+            (true, r)
+        } else {
+            (false, trimmed)
+        };
+
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut logo = false;
+        let mut key_part: Option<&str> = None;
+
+        for token in rest.split('+') {
+            let t = token.trim().to_lowercase();
+            match t.as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "alt" | "option" => alt = true,
+                "shift" => shift = true,
+                "cmd" | "super" | "logo" | "meta" => logo = true,
+                _ => key_part = Some(token.trim()),
+            }
+        }
+
+        let code = match key_part?.to_lowercase().as_str() {
+            "enter" | "return" => KeyCode::Enter,
+            "escape" | "esc" => KeyCode::Escape,
+            "backspace" => KeyCode::Backspace,
+            "tab" => KeyCode::Tab,
+            "space" => KeyCode::Space,
+            "backquote" | "`" => KeyCode::Backquote,
+            "up" => KeyCode::Up,
+            "down" => KeyCode::Down,
+            "left" => KeyCode::Left,
+            "right" => KeyCode::Right,
+            s if s.chars().count() == 1 => KeyCode::Char(s.chars().next()?),
+            _ => return None,
+        };
+
+        Some(Self {
+            code,
+            ctrl,
+            alt,
+            shift,
+            logo,
+            performable,
+            action,
+        })
+    }
+
+    fn matches(&self, event: &KeyEvent) -> bool {
+        let code_matches = match (&self.code, &event.code) {
+            (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(b),
+            _ => self.code == event.code,
+        };
+        code_matches
+            && self.ctrl == event.mods.ctrl
+            && self.alt == event.mods.alt
+            && self.shift == event.mods.shift
+            && self.logo == event.mods.logo
+    }
+}
+
 /// 状態遷移型の純粋入力ルーター
 #[derive(Debug, Clone)]
 pub struct InputRouter {
     pub mode: InputMode,
     pub macos_left_option_as_alt: bool,
+    pub normal_bindings: Vec<KeyBinding>,
 }
 
 impl Default for InputRouter {
     fn default() -> Self {
+        Self::from_config(&AppConfig::default())
+    }
+}
+
+impl InputRouter {
+    pub fn from_config(config: &AppConfig) -> Self {
+        let kb = &config.keybinds;
+        let specs = [
+            (&kb.pane_mode, Action::EnterPaneMode),
+            (&kb.toggle_zoom, Action::ToggleZoom),
+            (&kb.toggle_left_drawer, Action::ToggleLeftDrawer),
+            (&kb.toggle_right_drawer, Action::ToggleRightDrawer),
+            (&kb.go_to, Action::OpenGoTo),
+            (&kb.new_tab, Action::NewTab),
+            (&kb.split_right, Action::SplitRight),
+            (&kb.split_down, Action::SplitDown),
+            (&kb.goto_left, Action::GotoSplit(NavDirection::Left)),
+            (&kb.goto_down, Action::GotoSplit(NavDirection::Down)),
+            (&kb.goto_up, Action::GotoSplit(NavDirection::Up)),
+            (&kb.goto_right, Action::GotoSplit(NavDirection::Right)),
+            (&kb.copy, Action::Copy),
+            (&kb.paste, Action::Paste),
+            (&kb.reload_config, Action::ReloadConfig),
+        ];
+
+        let mut normal_bindings = Vec::new();
+        for (spec, action) in specs {
+            if let Some(b) = KeyBinding::parse(spec, action) {
+                normal_bindings.push(b);
+            }
+        }
+
+        // macOS では Cmd+C / Cmd+V も標準で使えるようにする
+        if let Some(b) = KeyBinding::parse("cmd+c", Action::Copy) {
+            normal_bindings.push(b);
+        }
+        if let Some(b) = KeyBinding::parse("cmd+v", Action::Paste) {
+            normal_bindings.push(b);
+        }
+
         Self {
             mode: InputMode::Normal,
-            macos_left_option_as_alt: true,
+            macos_left_option_as_alt: config.window.macos_option_as_alt == "left",
+            normal_bindings,
         }
     }
 }
@@ -218,77 +338,22 @@ impl InputRouter {
         event: &KeyEvent,
         ctx: &impl PerformableContext,
     ) -> InputDecision {
-        let m = event.mods;
-
-        // Ctrl+Shift+H -> KeyTable: pane
-        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('h') | KeyCode::Char('H')) {
-            self.mode = InputMode::Pane;
-            return InputDecision::Execute(Action::EnterPaneMode);
-        }
-
-        // Ctrl+Shift+Z -> ToggleZoom
-        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
-            return InputDecision::Execute(Action::ToggleZoom);
-        }
-
-        // Ctrl+Shift+C / Cmd+C -> Copy, Ctrl+V / Ctrl+Shift+V / Cmd+V -> Paste
-        if ((m.ctrl && m.shift) || m.logo)
-            && !m.alt
-            && matches!(event.code, KeyCode::Char('c') | KeyCode::Char('C'))
-        {
-            return InputDecision::Execute(Action::Copy);
-        }
-        if (m.ctrl || m.logo)
-            && !m.alt
-            && matches!(event.code, KeyCode::Char('v') | KeyCode::Char('V'))
-        {
-            return InputDecision::Execute(Action::Paste);
-        }
-
-        // Ctrl+Shift+E -> ToggleLeftDrawer (Workspace 一覧)
-        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('e') | KeyCode::Char('E')) {
-            self.mode = InputMode::LeftDrawer;
-            return InputDecision::Execute(Action::ToggleLeftDrawer);
-        }
-
-        // Ctrl+Shift+G -> ToggleRightDrawer (開きつつ操作モードへ)
-        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('g') | KeyCode::Char('G')) {
-            self.mode = InputMode::RightDrawer;
-            return InputDecision::Execute(Action::ToggleRightDrawer);
-        }
-
-        // Ctrl+Shift+Space -> go_to
-        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Space) {
-            return InputDecision::Execute(Action::OpenGoTo);
-        }
-
-        // Ctrl+T -> NewTab
-        if m.ctrl && !m.shift && !m.alt && matches!(event.code, KeyCode::Char('t')) {
-            return InputDecision::Execute(Action::NewTab);
-        }
-
-        // Alt+d / Alt+Shift+d -> Split
-        if m.alt && !m.ctrl && matches!(event.code, KeyCode::Char('d') | KeyCode::Char('D')) {
-            return if m.shift {
-                InputDecision::Execute(Action::SplitDown)
-            } else {
-                InputDecision::Execute(Action::SplitRight)
-            };
-        }
-
-        // performable:ctrl+h/j/k/l
-        if m.ctrl && !m.shift && !m.alt {
-            let nav = match event.code {
-                KeyCode::Char('h') => Some(NavDirection::Left),
-                KeyCode::Char('j') => Some(NavDirection::Down),
-                KeyCode::Char('k') => Some(NavDirection::Up),
-                KeyCode::Char('l') => Some(NavDirection::Right),
-                _ => None,
-            };
-            if let Some(dir) = nav {
-                if ctx.can_goto_split(dir) {
-                    return InputDecision::Execute(Action::GotoSplit(dir));
+        for binding in &self.normal_bindings {
+            if binding.matches(event) {
+                if binding.performable {
+                    if let Action::GotoSplit(dir) = binding.action {
+                        if !ctx.can_goto_split(dir) {
+                            continue;
+                        }
+                    }
                 }
+                match binding.action {
+                    Action::EnterPaneMode => self.mode = InputMode::Pane,
+                    Action::ToggleLeftDrawer => self.mode = InputMode::LeftDrawer,
+                    Action::ToggleRightDrawer => self.mode = InputMode::RightDrawer,
+                    _ => {}
+                }
+                return InputDecision::Execute(binding.action);
             }
         }
 
@@ -442,5 +507,20 @@ mod tests {
             InputDecision::Execute(Action::CloseRightDrawer)
         );
         assert_eq!(router.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn custom_keybind_overrides_default_from_config() {
+        let mut cfg = AppConfig::default();
+        cfg.keybinds.new_tab = "ctrl+shift+t".to_string();
+        let mut router = InputRouter::from_config(&cfg);
+        let ctx = MockCtx { has_right: false };
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('t'),
+            mods: mods(true, false, true),
+            left_alt: false,
+        };
+        assert_eq!(router.route(&ev, &ctx), InputDecision::Execute(Action::NewTab));
     }
 }
