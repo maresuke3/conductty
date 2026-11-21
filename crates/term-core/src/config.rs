@@ -45,7 +45,7 @@ impl Default for AppConfig {
                 font_thicken: true,
                 adjust_cell_height: 2.0,
                 theme: "TokyoNight Moon".to_string(),
-                background_opacity: 0.8,
+                background_opacity: 1.0,
                 window_padding_x: 10.0,
                 window_padding_y: 10.0,
                 window_padding_balance: true,

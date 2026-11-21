@@ -1,13 +1,21 @@
 use cosmic_text::{Attrs, Family, FontSystem};
 use term_core::config::AppearanceConfig;
 
-/// TokyoNight Moon の背景色 (RGBA 0.0..1.0)
+fn srgb_to_linear(c: u8) -> f64 {
+    let s = c as f64 / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// TokyoNight Moon の背景色 (#222436) を wgpu の Linear 色空間へ正確に変換して返す
 pub fn tokyonight_moon_bg(opacity: f32) -> wgpu::Color {
-    // #222436
     wgpu::Color {
-        r: 0x22 as f64 / 255.0,
-        g: 0x24 as f64 / 255.0,
-        b: 0x36 as f64 / 255.0,
+        r: srgb_to_linear(0x22),
+        g: srgb_to_linear(0x24),
+        b: srgb_to_linear(0x36),
         a: opacity as f64,
     }
 }
