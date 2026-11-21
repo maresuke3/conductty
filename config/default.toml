@@ -1,0 +1,34 @@
+[appearance]
+font_families = ["Cica", "FiraCode Nerd Font", "Fira Code"]
+font_size = 18.0
+font_thicken = true
+adjust_cell_height = 2.0
+theme = "TokyoNight Moon"
+background_opacity = 0.8
+window_padding_x = 10.0
+window_padding_y = 10.0
+window_padding_balance = true
+
+[shell]
+# macOS / Linux ではログインシェル、Windows では WSL2 を起動する想定
+windows_default_prog = ["wsl.exe", "--cd", "~"]
+
+[window]
+save_state = "always"
+split_preserve_zoom = "navigation"
+macos_option_as_alt = "left"
+
+[keybinds]
+# Ghostty 互換の基本キーバインド
+new_tab = "ctrl+t"
+split_right = "alt+d"
+split_down = "alt+shift+d"
+toggle_zoom = "ctrl+shift+z"
+pane_mode = "ctrl+shift+h"
+goto_left = "performable:ctrl+h"
+goto_down = "performable:ctrl+j"
+goto_up = "performable:ctrl+k"
+goto_right = "performable:ctrl+l"
+toggle_quick_terminal = "global:ctrl+backquote"
+toggle_right_drawer = "ctrl+shift+g"
+go_to = "ctrl+shift+space"
