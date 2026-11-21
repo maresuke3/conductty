@@ -1,0 +1,10 @@
+[package]
+name = "term-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+cosmic-text.workspace = true
+term-core = { path = "../term-core" }
+wgpu.workspace = true
