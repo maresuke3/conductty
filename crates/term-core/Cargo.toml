@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+base64.workspace = true
+image.workspace = true
 portable-pty.workspace = true
 serde.workspace = true
 thiserror.workspace = true

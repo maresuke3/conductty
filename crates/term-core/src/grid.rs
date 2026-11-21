@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use vte::{Params, Parser, Perform};
 
+use crate::kitty::KittyState;
+
 const MAX_SCROLLBACK: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,14 +88,17 @@ pub struct TerminalGrid {
     pub rows: usize,
     pub cursor_col: usize,
     pub cursor_row: usize,
+    pub cursor_visible: bool,
     pub cells: Vec<Cell>,
     pub scrollback: VecDeque<Vec<Cell>>,
     pub scroll_offset: usize,
     pub pending_replies: Vec<Vec<u8>>,
+    pub kitty: KittyState,
     current_fg: Rgb,
     current_bg: Option<Rgb>,
     current_bold: bool,
     current_reverse: bool,
+    alt_screen: Option<(Vec<Cell>, usize, usize)>,
     parser: Parser,
 }
 
@@ -106,21 +111,33 @@ impl TerminalGrid {
             rows,
             cursor_col: 0,
             cursor_row: 0,
+            cursor_visible: true,
             cells: vec![Cell::default(); cols * rows],
             scrollback: VecDeque::new(),
             scroll_offset: 0,
             pending_replies: Vec::new(),
+            kitty: KittyState::new(),
             current_fg: Cell::default().fg,
             current_bg: None,
             current_bold: false,
             current_reverse: false,
+            alt_screen: None,
             parser: Parser::new(),
         }
     }
 
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
+        let mut replies = Vec::new();
+        let normal_bytes = self.kitty.filter_and_process(
+            bytes,
+            self.cursor_col,
+            self.cursor_row,
+            &mut replies,
+        );
+        self.pending_replies.extend(replies);
+
         let mut parser = std::mem::replace(&mut self.parser, Parser::new());
-        parser.advance(self, bytes);
+        parser.advance(self, &normal_bytes);
         self.parser = parser;
     }
 
@@ -164,6 +181,32 @@ impl TerminalGrid {
         } else {
             None
         }
+    }
+
+    /// 選択範囲 `(start_col, start_row)..=(end_col, end_row)` の文字列を抽出する。
+    pub fn extract_text(&self, a: (usize, usize), b: (usize, usize)) -> String {
+        let ((sc, sr), (ec, er)) = if (a.1, a.0) <= (b.1, b.0) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let mut lines = Vec::new();
+        for row in sr..=er.min(self.rows.saturating_sub(1)) {
+            let c_start = if row == sr { sc } else { 0 };
+            let c_end = if row == er {
+                ec.min(self.cols.saturating_sub(1))
+            } else {
+                self.cols.saturating_sub(1)
+            };
+            let mut line = String::new();
+            for col in c_start..=c_end {
+                if let Some(cell) = self.visible_cell(col, row) {
+                    line.push(cell.ch);
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
     }
 
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
@@ -318,12 +361,13 @@ impl Perform for TerminalGrid {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let first = params
             .iter()
             .next()
             .and_then(|p| p.first().copied())
             .unwrap_or(0) as usize;
+        let is_private = intermediates.contains(&b'?');
         match action {
             'A' => self.cursor_row = self.cursor_row.saturating_sub(first.max(1)),
             'B' => self.cursor_row = (self.cursor_row + first.max(1)).min(self.rows - 1),
@@ -346,12 +390,97 @@ impl Perform for TerminalGrid {
                 self.cursor_row = (r - 1).min(self.rows - 1);
                 self.cursor_col = (c - 1).min(self.cols - 1);
             }
-            'J' if first == 2 => self.clear_all(),
+            'J' => match first {
+                0 => {
+                    let start = self.cursor_row * self.cols + self.cursor_col;
+                    for c in &mut self.cells[start..] {
+                        *c = Cell::default();
+                    }
+                }
+                1 => {
+                    let end = (self.cursor_row * self.cols + self.cursor_col + 1).min(self.cells.len());
+                    for c in &mut self.cells[..end] {
+                        *c = Cell::default();
+                    }
+                }
+                2 | 3 => self.clear_all(),
+                _ => {}
+            },
             'K' => {
+                let row_start = self.cursor_row * self.cols;
+                let row_end = (self.cursor_row + 1) * self.cols;
+                match first {
+                    0 => {
+                        for c in &mut self.cells[row_start + self.cursor_col..row_end] {
+                            *c = Cell::default();
+                        }
+                    }
+                    1 => {
+                        let end = (row_start + self.cursor_col + 1).min(row_end);
+                        for c in &mut self.cells[row_start..end] {
+                            *c = Cell::default();
+                        }
+                    }
+                    2 => {
+                        for c in &mut self.cells[row_start..row_end] {
+                            *c = Cell::default();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            'X' => {
+                // ECH: Erase N characters
+                let count = first.max(1);
                 let start = self.cursor_row * self.cols + self.cursor_col;
-                let end = (self.cursor_row + 1) * self.cols;
+                let end = (start + count).min((self.cursor_row + 1) * self.cols);
                 for c in &mut self.cells[start..end] {
                     *c = Cell::default();
+                }
+            }
+            'L' => {
+                // IL: Insert N blank lines at cursor_row
+                let n = first.max(1).min(self.rows - self.cursor_row);
+                let start = self.cursor_row * self.cols;
+                self.cells[start..].rotate_right(n * self.cols);
+                for c in &mut self.cells[start..start + n * self.cols] {
+                    *c = Cell::default();
+                }
+            }
+            'M' => {
+                // DL: Delete N lines at cursor_row
+                let n = first.max(1).min(self.rows - self.cursor_row);
+                let start = self.cursor_row * self.cols;
+                self.cells[start..].rotate_left(n * self.cols);
+                let clear_start = self.cells.len() - n * self.cols;
+                for c in &mut self.cells[clear_start..] {
+                    *c = Cell::default();
+                }
+            }
+            'h' if is_private && first == 25 => {
+                self.cursor_visible = true;
+            }
+            'l' if is_private && first == 25 => {
+                self.cursor_visible = false;
+            }
+            'h' if is_private && first == 1049 => {
+                if self.alt_screen.is_none() {
+                    let saved = std::mem::replace(
+                        &mut self.cells,
+                        vec![Cell::default(); self.cols * self.rows],
+                    );
+                    self.alt_screen = Some((saved, self.cursor_col, self.cursor_row));
+                    self.cursor_col = 0;
+                    self.cursor_row = 0;
+                }
+            }
+            'l' if is_private && first == 1049 => {
+                if let Some((saved, col, row)) = self.alt_screen.take() {
+                    if saved.len() == self.cols * self.rows {
+                        self.cells = saved;
+                    }
+                    self.cursor_col = col.min(self.cols - 1);
+                    self.cursor_row = row.min(self.rows - 1);
                 }
             }
             'n' if first == 6 => {
@@ -405,5 +534,12 @@ mod tests {
         assert_eq!(grid.visible_cell(0, 0).unwrap().ch, 'A');
         grid.scroll_down(1);
         assert_eq!(grid.visible_cell(0, 0).unwrap().ch, 'B');
+    }
+
+    #[test]
+    fn extracts_selected_text_across_lines() {
+        let mut grid = TerminalGrid::new(10, 3);
+        grid.feed_bytes(b"hello\r\nworld");
+        assert_eq!(grid.extract_text((1, 0), (3, 1)), "ello\nworl");
     }
 }

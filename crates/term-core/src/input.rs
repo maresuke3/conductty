@@ -54,6 +54,8 @@ pub enum Action {
     DrawerOpen,
     DrawerSendToPane,
     DrawerRefresh,
+    Copy,
+    Paste,
     OpenGoTo,
 }
 
@@ -168,6 +170,20 @@ impl InputRouter {
         // Ctrl+Shift+Z -> ToggleZoom
         if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
             return InputDecision::Execute(Action::ToggleZoom);
+        }
+
+        // Ctrl+Shift+C / Cmd+C -> Copy, Ctrl+V / Ctrl+Shift+V / Cmd+V -> Paste
+        if ((m.ctrl && m.shift) || m.logo)
+            && !m.alt
+            && matches!(event.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            return InputDecision::Execute(Action::Copy);
+        }
+        if (m.ctrl || m.logo)
+            && !m.alt
+            && matches!(event.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            return InputDecision::Execute(Action::Paste);
         }
 
         // Ctrl+Shift+G -> ToggleRightDrawer (開きつつ操作モードへ)
