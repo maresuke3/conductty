@@ -3664,6 +3664,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "serde_json",
  "term-core",
  "term-drawer",
  "term-render",

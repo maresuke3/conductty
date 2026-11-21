@@ -14,7 +14,7 @@ use term_core::input::{
     Action, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode, KeyEvent as CoreKeyEvent,
     Modifiers, PerformableContext,
 };
-use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, Tab};
+use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_drawer::{DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot};
 use term_render::tokyonight_moon_bg;
@@ -24,6 +24,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+const LEFT_DRAWER_WIDTH: f32 = 240.0;
+const LEFT_RAIL_WIDTH: f32 = 32.0;
+const TAB_BAR_HEIGHT: f32 = 32.0;
 const RIGHT_DRAWER_WIDTH: f32 = 340.0;
 const RIGHT_BROWSER_WIDTH: f32 = 560.0;
 
@@ -200,13 +203,13 @@ impl GpuState {
 }
 
 struct TabNavCtx<'a> {
-    tab: &'a Tab,
+    manager: &'a WorkspaceManager,
     area: CoreRect,
 }
 
 impl PerformableContext for TabNavCtx<'_> {
     fn can_goto_split(&self, dir: NavDirection) -> bool {
-        self.tab.can_goto_split(dir, self.area)
+        self.manager.active_tab().can_goto_split(dir, self.area)
     }
 }
 
@@ -218,10 +221,14 @@ struct App {
     gpu: Option<GpuState>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
-    tab: Tab,
+    manager: WorkspaceManager,
     panes: HashMap<PaneId, PaneRuntime>,
     next_pane_id: PaneId,
     go_to_active: bool,
+    left_drawer_open: bool,
+    left_drawer_selected_idx: usize,
+    renaming_workspace_idx: Option<usize>,
+    rename_buf: String,
     right_drawer_open: bool,
     drawer_snapshot: DrawerSnapshot,
     drawer_selected_idx: usize,
@@ -252,7 +259,13 @@ impl App {
             (1200.0, 800.0)
         };
 
-        let drawer_w = if self.right_drawer_open {
+        let left_w = if self.left_drawer_open {
+            LEFT_DRAWER_WIDTH.min(w * 0.30)
+        } else {
+            LEFT_RAIL_WIDTH
+        };
+
+        let right_w = if self.right_drawer_open {
             if self.browser.is_some() {
                 RIGHT_BROWSER_WIDTH.min(w * 0.55)
             } else {
@@ -262,11 +275,17 @@ impl App {
             0.0
         };
 
+        let top_y = if self.manager.active_workspace().tabs.len() > 1 {
+            TAB_BAR_HEIGHT
+        } else {
+            0.0
+        };
+
         CoreRect {
-            x: 0.0,
-            y: 0.0,
-            width: (w - drawer_w).max(100.0),
-            height: h,
+            x: left_w,
+            y: top_y,
+            width: (w - left_w - right_w).max(100.0),
+            height: (h - top_y).max(80.0),
         }
     }
 
@@ -350,13 +369,13 @@ impl App {
 
     fn hit_test_cell(&self, pos: Pos2) -> Option<(PaneId, usize, usize)> {
         let area = self.terminal_area();
-        if pos.x >= area.width {
+        if pos.x < area.x || pos.x >= area.x + area.width {
             return None;
         }
         let (char_w, row_h) = self.cell_size;
         let pad_x = self.config.appearance.window_padding_x;
         let pad_y = self.config.appearance.window_padding_y;
-        for (pane_id, rect) in self.tab.visible_rects(area) {
+        for (pane_id, rect) in self.manager.active_tab().visible_rects(area) {
             if pos.x >= rect.x
                 && pos.x <= rect.x + rect.width
                 && pos.y >= rect.y
@@ -399,7 +418,8 @@ impl App {
         };
         if let Ok(text) = cb.get_text() {
             if !text.is_empty() {
-                if let Some(pane) = self.panes.get_mut(&self.tab.focused_pane) {
+                let focused = self.manager.active_tab().focused_pane;
+                if let Some(pane) = self.panes.get_mut(&focused) {
                     if let Ok(mut g) = pane.grid.lock() {
                         g.reset_scroll();
                     }
@@ -436,27 +456,103 @@ impl App {
         }
     }
 
+    fn save_session(&self) {
+        if let Some(path) = session_file_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let names: Vec<String> = self
+                .manager
+                .workspaces
+                .iter()
+                .map(|w| w.name.clone())
+                .collect();
+            if let Ok(json) = serde_json::to_string_pretty(&names) {
+                let _ = std::fs::write(path, json);
+            }
+        }
+    }
+
     fn handle_action(&mut self, action: Action) {
         let area = self.terminal_area();
         match action {
             Action::SplitRight => {
                 if let Some(new_id) = self.spawn_pane() {
-                    self.tab.split_focused(new_id, SplitDirection::Horizontal);
+                    self.manager
+                        .active_tab_mut()
+                        .split_focused(new_id, SplitDirection::Horizontal);
                 }
             }
             Action::SplitDown => {
                 if let Some(new_id) = self.spawn_pane() {
-                    self.tab.split_focused(new_id, SplitDirection::Vertical);
+                    self.manager
+                        .active_tab_mut()
+                        .split_focused(new_id, SplitDirection::Vertical);
                 }
             }
             Action::GotoSplit(dir) => {
-                self.tab.goto_split(dir, area);
+                self.manager.active_tab_mut().goto_split(dir, area);
             }
             Action::ToggleZoom => {
-                self.tab.toggle_zoom();
+                self.manager.active_tab_mut().toggle_zoom();
             }
             Action::OpenGoTo => {
                 self.go_to_active = !self.go_to_active;
+            }
+            Action::ToggleLeftDrawer => {
+                self.left_drawer_open = true;
+                self.left_drawer_selected_idx = self.manager.active_workspace;
+            }
+            Action::ToggleLeftDrawerCollapse => {
+                self.left_drawer_open = !self.left_drawer_open;
+                self.router.mode = InputMode::Normal;
+            }
+            Action::ExitLeftDrawerMode => {
+                self.router.mode = InputMode::Normal;
+            }
+            Action::LeftDrawerNext => {
+                let len = self.manager.workspaces.len();
+                if len > 0 {
+                    self.left_drawer_selected_idx =
+                        (self.left_drawer_selected_idx + 1).min(len - 1);
+                }
+            }
+            Action::LeftDrawerPrev => {
+                self.left_drawer_selected_idx = self.left_drawer_selected_idx.saturating_sub(1);
+            }
+            Action::LeftDrawerSelect => {
+                self.manager.switch_workspace(self.left_drawer_selected_idx);
+                self.router.mode = InputMode::Normal;
+            }
+            Action::NewWorkspace => {
+                if let Some(new_id) = self.spawn_pane() {
+                    let num = self.manager.workspaces.len();
+                    let idx = self.manager.add_workspace(format!("Dev {num}"), new_id);
+                    self.left_drawer_selected_idx = idx;
+                    self.router.mode = InputMode::Normal;
+                }
+            }
+            Action::LeftDrawerRename => {
+                let idx = self.left_drawer_selected_idx;
+                if let Some(ws) = self.manager.workspaces.get(idx) {
+                    self.rename_buf = ws.name.clone();
+                    self.renaming_workspace_idx = Some(idx);
+                }
+            }
+            Action::LeftDrawerCloseWorkspace => {
+                let idx = self.left_drawer_selected_idx;
+                let closed = self.manager.close_workspace(idx);
+                for pid in closed {
+                    self.panes.remove(&pid);
+                }
+                if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
+                    self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
+                }
+            }
+            Action::NewTab => {
+                if let Some(new_id) = self.spawn_pane() {
+                    self.manager.add_tab(new_id);
+                }
             }
             Action::ToggleRightDrawer => {
                 self.right_drawer_open = true;
@@ -500,7 +596,8 @@ impl App {
             Action::DrawerSendToPane => {
                 if let Some(item) = self.selected_drawer_item() {
                     let text = format!("[{} #{}] {} ({})", item.repo, item.number, item.title, item.url);
-                    if let Some(pane) = self.panes.get_mut(&self.tab.focused_pane) {
+                    let focused = self.manager.active_tab().focused_pane;
+                    if let Some(pane) = self.panes.get_mut(&focused) {
                         let _ = pane.pty.write_bytes(text.as_bytes());
                     }
                     self.right_drawer_open = false;
@@ -518,9 +615,6 @@ impl App {
                 self.paste_clipboard();
             }
             Action::EnterPaneMode | Action::ExitPaneMode => {}
-            Action::NewTab => {
-                eprintln!("NewTab will be wired in Step 4");
-            }
         }
     }
 }
@@ -560,7 +654,16 @@ impl ApplicationHandler<UserEvent> for App {
 
         if self.panes.is_empty() {
             if let Some(first_id) = self.spawn_pane() {
-                self.tab = Tab::new(1, first_id);
+                self.manager = WorkspaceManager::new(first_id);
+                // 前回セッションの Workspace 名を復元する (index 0 は Master Space 固定)
+                if let Some(names) = load_saved_workspace_names() {
+                    for name in names.into_iter().skip(1) {
+                        if let Some(pid) = self.spawn_pane() {
+                            self.manager.add_workspace(name, pid);
+                        }
+                    }
+                    self.manager.switch_workspace(0);
+                }
             }
         }
         if let Some(window) = &self.window {
@@ -588,7 +691,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::PaneExited(id) => {
                 self.panes.remove(&id);
-                if !self.tab.close_pane(id) {
+                if !self.manager.close_pane(id) {
+                    self.save_session();
                     event_loop.exit();
                     return;
                 }
@@ -654,7 +758,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_session();
+                event_loop.exit();
+            }
             WindowEvent::Focused(false) => {
                 self.modifiers = ModifiersState::empty();
             }
@@ -696,7 +803,7 @@ impl ApplicationHandler<UserEvent> for App {
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
                         if let Some((pane_id, col, row)) = self.hit_test_cell(self.cursor_pos) {
-                            self.tab.focused_pane = pane_id;
+                            self.manager.active_tab_mut().focused_pane = pane_id;
                             self.selection = Some((pane_id, (col, row), (col, row)));
                             self.selecting = true;
                             if let Some(window) = &self.window {
@@ -718,13 +825,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let area = self.terminal_area();
-                if self.cursor_pos.x < area.width {
+                if self.cursor_pos.x >= area.x && self.cursor_pos.x < area.x + area.width {
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y.round() as i32 * 3,
                         MouseScrollDelta::PixelDelta(pos) => (pos.y / 16.0).round() as i32,
                     };
                     if lines != 0 {
-                        if let Some(pane) = self.panes.get(&self.tab.focused_pane) {
+                        let focused = self.manager.active_tab().focused_pane;
+                        if let Some(pane) = self.panes.get(&focused) {
                             if let Ok(mut g) = pane.grid.lock() {
                                 if lines > 0 {
                                     g.scroll_up(lines as usize);
@@ -741,17 +849,26 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 if self.router.mode == InputMode::Normal && !self.go_to_active {
-                    if let Some(pane) = self.panes.get_mut(&self.tab.focused_pane) {
+                    let focused = self.manager.active_tab().focused_pane;
+                    if let Some(pane) = self.panes.get_mut(&focused) {
                         let _ = pane.pty.write_bytes(text.as_bytes());
                     }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // Workspace 名のリネーム入力中は egui TextEdit にキー入力を委ねる
+                if self.renaming_workspace_idx.is_some() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
                 if self.go_to_active {
                     if let Key::Character(s) = &event.logical_key {
                         if let Ok(num) = s.parse::<PaneId>() {
                             if self.panes.contains_key(&num) {
-                                self.tab.focused_pane = num;
+                                self.manager.active_tab_mut().focused_pane = num;
                                 self.go_to_active = false;
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
@@ -773,7 +890,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let area = self.terminal_area();
                     let decision = {
                         let ctx = TabNavCtx {
-                            tab: &self.tab,
+                            manager: &self.manager,
                             area,
                         };
                         self.router.route(&core_ev, &ctx)
@@ -781,7 +898,8 @@ impl ApplicationHandler<UserEvent> for App {
 
                     match decision {
                         InputDecision::SendToPty(bytes) => {
-                            if let Some(pane) = self.panes.get_mut(&self.tab.focused_pane) {
+                            let focused = self.manager.active_tab().focused_pane;
+                            if let Some(pane) = self.panes.get_mut(&focused) {
                                 if let Ok(mut g) = pane.grid.lock() {
                                     g.reset_scroll();
                                 }
@@ -800,11 +918,34 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 let area = self.terminal_area();
-                let visible_panes = self.tab.visible_rects(area);
-                let focused_pane = self.tab.focused_pane;
+                let visible_panes = self.manager.active_tab().visible_rects(area);
+                let focused_pane = self.manager.active_tab().focused_pane;
                 let pane_mode = self.router.mode == InputMode::Pane;
-                let zoomed = self.tab.zoomed;
+                let zoomed = self.manager.active_tab().zoomed;
                 let go_to_active = self.go_to_active;
+                let left_drawer_open = self.left_drawer_open;
+                let left_selected = self.left_drawer_selected_idx;
+                let active_ws_idx = self.manager.active_workspace;
+                let active_tab_idx = self.manager.active_workspace().active_tab;
+                let active_tabs: Vec<(u64, String)> = self
+                    .manager
+                    .active_workspace()
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        (
+                            t.id,
+                            t.name.clone().unwrap_or_else(|| format!("Tab {}", i + 1)),
+                        )
+                    })
+                    .collect();
+                let ws_summaries: Vec<(String, usize, usize, usize)> = self
+                    .manager
+                    .workspaces
+                    .iter()
+                    .map(|ws| (ws.name.clone(), ws.tabs.len(), ws.active_tab, ws.pane_count()))
+                    .collect();
                 let right_drawer_open = self.right_drawer_open;
                 let drawer_snapshot = self.drawer_snapshot.clone();
 
@@ -821,6 +962,19 @@ impl ApplicationHandler<UserEvent> for App {
                 let cell_extra_h = self.config.appearance.adjust_cell_height;
 
                 let mut refresh_requested = false;
+                let mut toggle_left_collapse = false;
+                let mut switch_ws_target: Option<usize> = None;
+                let mut switch_tab_target: Option<(usize, usize)> = None;
+                let mut new_ws_requested = false;
+                let mut start_rename_idx: Option<usize> = None;
+                let mut commit_rename: Option<(usize, String)> = None;
+                let mut cancel_rename = false;
+                let mut close_ws_idx: Option<usize> = None;
+                let mut renaming_idx = self.renaming_workspace_idx;
+                let mut rename_buf = self.rename_buf.clone();
+                let mut select_tab_idx: Option<usize> = None;
+                let mut close_tab_idx: Option<usize> = None;
+                let mut new_tab_requested = false;
                 let mut close_drawer_requested = false;
                 let mut close_browser_requested = false;
                 let mut open_url_target: Option<String> = None;
@@ -842,6 +996,186 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut computed_cell_size = self.cell_size;
 
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                    if left_drawer_open {
+                        egui::SidePanel::left("conductty_left_drawer")
+                            .exact_width(LEFT_DRAWER_WIDTH)
+                            .resizable(false)
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .inner_margin(12.0),
+                            )
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.heading(
+                                        egui::RichText::new("Workspaces")
+                                            .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("<<").clicked() {
+                                                toggle_left_collapse = true;
+                                            }
+                                            if ui.button("+ New").clicked() {
+                                                new_ws_requested = true;
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.separator();
+
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    for (idx, (name, tab_count, active_t, pane_count)) in
+                                        ws_summaries.iter().enumerate()
+                                    {
+                                        let is_active = idx == active_ws_idx;
+                                        let is_selected = idx == left_selected;
+                                        let is_master = idx == 0;
+                                        let accent = if is_master {
+                                            Color32::from_rgb(0xff, 0xc7, 0x77)
+                                        } else {
+                                            Color32::from_rgb(0x7a, 0xa2, 0xf7)
+                                        };
+                                        let fill = if is_active {
+                                            Color32::from_rgb(0x3b, 0x42, 0x61)
+                                        } else {
+                                            Color32::from_rgb(0x2f, 0x33, 0x4d)
+                                        };
+                                        let stroke = if is_selected {
+                                            Stroke::new(1.5_f32, accent)
+                                        } else {
+                                            Stroke::NONE
+                                        };
+
+                                        egui::Frame::new()
+                                            .fill(fill)
+                                            .stroke(stroke)
+                                            .corner_radius(4.0)
+                                            .inner_margin(8.0)
+                                            .show(ui, |ui| {
+                                                let prefix = if is_master { "★ " } else { "" };
+                                                if renaming_idx == Some(idx) {
+                                                    let resp = ui.add(
+                                                        egui::TextEdit::singleline(&mut rename_buf)
+                                                            .desired_width(f32::INFINITY),
+                                                    );
+                                                    resp.request_focus();
+                                                    if ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                                    {
+                                                        commit_rename =
+                                                            Some((idx, rename_buf.clone()));
+                                                        renaming_idx = None;
+                                                    } else if ui
+                                                        .input(|i| i.key_pressed(egui::Key::Escape))
+                                                    {
+                                                        cancel_rename = true;
+                                                        renaming_idx = None;
+                                                    }
+                                                } else {
+                                                    ui.horizontal(|ui| {
+                                                        if ui
+                                                            .selectable_label(
+                                                                is_active,
+                                                                egui::RichText::new(format!(
+                                                                    "{prefix}{name}"
+                                                                ))
+                                                                .strong()
+                                                                .color(accent),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            switch_ws_target = Some(idx);
+                                                        }
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                if !is_master
+                                                                    && ui.small_button("x").clicked()
+                                                                {
+                                                                    close_ws_idx = Some(idx);
+                                                                }
+                                                                if ui.small_button("Edit").clicked()
+                                                                {
+                                                                    start_rename_idx = Some(idx);
+                                                                }
+                                                            },
+                                                        );
+                                                    });
+                                                }
+
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{tab_count} tabs · {pane_count} panes"
+                                                    ))
+                                                    .small()
+                                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                );
+
+                                                if *tab_count > 1 {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        for t_idx in 0..*tab_count {
+                                                            let t_active =
+                                                                is_active && t_idx == *active_t;
+                                                            if ui
+                                                                .selectable_label(
+                                                                    t_active,
+                                                                    format!("Tab {}", t_idx + 1),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                switch_tab_target =
+                                                                    Some((idx, t_idx));
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                        ui.add_space(4.0);
+                                    }
+                                });
+
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(
+                                        "j/k: select | Enter: switch | n: new | r: rename | d: close",
+                                    )
+                                    .small()
+                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                );
+                            });
+                    } else {
+                        egui::SidePanel::left("conductty_left_rail")
+                            .exact_width(LEFT_RAIL_WIDTH)
+                            .resizable(false)
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .inner_margin(4.0),
+                            )
+                            .show(ctx, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    if ui.button(">").clicked() {
+                                        toggle_left_collapse = true;
+                                    }
+                                    ui.add_space(6.0);
+                                    for (idx, (_, _, _, _)) in ws_summaries.iter().enumerate() {
+                                        let is_active = idx == active_ws_idx;
+                                        let label = if idx == 0 {
+                                            "★".to_string()
+                                        } else {
+                                            format!("{idx}")
+                                        };
+                                        if ui.selectable_label(is_active, label).clicked() {
+                                            switch_ws_target = Some(idx);
+                                        }
+                                    }
+                                });
+                            });
+                    }
+
                     if right_drawer_open {
                         egui::SidePanel::right("conductty_right_drawer")
                             .exact_width(drawer_panel_w)
@@ -982,6 +1316,89 @@ impl ApplicationHandler<UserEvent> for App {
                                     .small()
                                     .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
                                 );
+                            });
+                    }
+
+                    if active_tabs.len() > 1 {
+                        egui::TopBottomPanel::top("conductty_tab_bar")
+                            .exact_height(TAB_BAR_HEIGHT)
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x18, 0x1a, 0x28))
+                                    .inner_margin(egui::Margin::symmetric(8, 4)),
+                            )
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (t_idx, (_tab_id, title)) in active_tabs.iter().enumerate() {
+                                        let is_active = t_idx == active_tab_idx;
+                                        let fill = if is_active {
+                                            Color32::from_rgb(0x3b, 0x42, 0x61)
+                                        } else {
+                                            Color32::from_rgb(0x24, 0x28, 0x3b)
+                                        };
+                                        let stroke = if is_active {
+                                            Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0xa2, 0xf7))
+                                        } else {
+                                            Stroke::NONE
+                                        };
+
+                                        egui::Frame::new()
+                                            .fill(fill)
+                                            .stroke(stroke)
+                                            .corner_radius(4.0)
+                                            .inner_margin(egui::Margin::symmetric(8, 2))
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    let label_color = if is_active {
+                                                        Color32::from_rgb(0xc8, 0xd3, 0xf5)
+                                                    } else {
+                                                        Color32::from_rgb(0x82, 0x8b, 0xb8)
+                                                    };
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new(title)
+                                                                    .small()
+                                                                    .color(label_color),
+                                                            )
+                                                            .frame(false),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        select_tab_idx = Some(t_idx);
+                                                    }
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new("x")
+                                                                    .small()
+                                                                    .color(Color32::from_rgb(
+                                                                        0x82, 0x8b, 0xb8,
+                                                                    )),
+                                                            )
+                                                            .frame(false),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        close_tab_idx = Some(t_idx);
+                                                    }
+                                                });
+                                            });
+                                    }
+
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("+")
+                                                    .color(Color32::from_rgb(0x7a, 0xa2, 0xf7)),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        new_tab_requested = true;
+                                    }
+                                });
                             });
                     }
 
@@ -1281,12 +1698,15 @@ impl ApplicationHandler<UserEvent> for App {
                             if go_to_active {
                                 status_parts.push("GO_TO (press pane number)");
                             }
+                            if !left_drawer_open {
+                                status_parts.push("Ctrl+Shift+E: Spaces");
+                            }
                             if !right_drawer_open {
                                 status_parts.push("Ctrl+Shift+G: GitHub");
                             }
                             if !status_parts.is_empty() {
                                 let label = status_parts.join(" | ");
-                                let top_right = Pos2::new(area.width - 14.0, 10.0);
+                                let top_right = Pos2::new(area.x + area.width - 14.0, area.y + 10.0);
                                 ui.painter().text(
                                     top_right,
                                     egui::Align2::RIGHT_TOP,
@@ -1328,6 +1748,73 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 let mut need_redraw = egui_wants_repaint;
+                self.rename_buf = rename_buf;
+                if cancel_rename {
+                    self.renaming_workspace_idx = None;
+                    need_redraw = true;
+                }
+                if let Some((idx, new_name)) = commit_rename {
+                    self.manager.rename_workspace(idx, new_name);
+                    self.renaming_workspace_idx = None;
+                    need_redraw = true;
+                }
+                if let Some(idx) = start_rename_idx {
+                    if let Some(ws) = self.manager.workspaces.get(idx) {
+                        self.rename_buf = ws.name.clone();
+                        self.renaming_workspace_idx = Some(idx);
+                        need_redraw = true;
+                    }
+                }
+                if let Some(idx) = close_ws_idx {
+                    let closed = self.manager.close_workspace(idx);
+                    for pid in closed {
+                        self.panes.remove(&pid);
+                    }
+                    if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
+                        self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
+                    }
+                    need_redraw = true;
+                }
+                if toggle_left_collapse {
+                    self.left_drawer_open = !self.left_drawer_open;
+                    self.router.mode = InputMode::Normal;
+                    need_redraw = true;
+                }
+                if new_ws_requested {
+                    self.handle_action(Action::NewWorkspace);
+                    need_redraw = true;
+                }
+                if let Some(ws_idx) = switch_ws_target {
+                    self.manager.switch_workspace(ws_idx);
+                    self.left_drawer_selected_idx = ws_idx;
+                    need_redraw = true;
+                }
+                if let Some((ws_idx, tab_idx)) = switch_tab_target {
+                    self.manager.switch_workspace(ws_idx);
+                    self.manager.switch_tab(tab_idx);
+                    self.left_drawer_selected_idx = ws_idx;
+                    need_redraw = true;
+                }
+                if new_tab_requested {
+                    self.handle_action(Action::NewTab);
+                    need_redraw = true;
+                }
+                if let Some(t_idx) = select_tab_idx {
+                    self.manager.switch_tab(t_idx);
+                    need_redraw = true;
+                }
+                if let Some(t_idx) = close_tab_idx {
+                    let (closed_panes, keep_running) = self.manager.close_tab(t_idx);
+                    for pid in closed_panes {
+                        self.panes.remove(&pid);
+                    }
+                    if !keep_running {
+                        self.save_session();
+                        event_loop.exit();
+                        return;
+                    }
+                    need_redraw = true;
+                }
                 if close_drawer_requested {
                     self.right_drawer_open = false;
                     if self.browser.take().is_some() {
@@ -1358,7 +1845,8 @@ impl ApplicationHandler<UserEvent> for App {
                     open_url(&url);
                 }
                 if let Some(text) = send_to_pane_text {
-                    if let Some(pane) = self.panes.get_mut(&self.tab.focused_pane) {
+                    let focused = self.manager.active_tab().focused_pane;
+                    if let Some(pane) = self.panes.get_mut(&focused) {
                         let _ = pane.pty.write_bytes(text.as_bytes());
                     }
                 }
@@ -1616,6 +2104,22 @@ fn draw_box_drawing(painter: &egui::Painter, ch: char, rect: Rect, color: Color3
     true
 }
 
+fn session_file_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return Some(PathBuf::from(appdata).join("conductty").join("session.json"));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/conductty/session.json"))
+}
+
+fn load_saved_workspace_names() -> Option<Vec<String>> {
+    let path = session_file_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = Command::new("open").arg(url).spawn();
@@ -1824,10 +2328,14 @@ fn main() {
         gpu: None,
         egui_ctx: egui::Context::default(),
         egui_state: None,
-        tab: Tab::new(1, 1),
+        manager: WorkspaceManager::new(1),
         panes: HashMap::new(),
         next_pane_id: 1,
         go_to_active: false,
+        left_drawer_open: true,
+        left_drawer_selected_idx: 0,
+        renaming_workspace_idx: None,
+        rename_buf: String::new(),
         right_drawer_open: false,
         drawer_snapshot: DrawerSnapshot::default(),
         drawer_selected_idx: 0,
