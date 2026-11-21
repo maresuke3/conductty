@@ -52,6 +52,7 @@ pub enum Action {
     DrawerNext,
     DrawerPrev,
     DrawerOpen,
+    DrawerPreview,
     DrawerSendToPane,
     DrawerRefresh,
     Copy,
@@ -117,6 +118,9 @@ impl InputRouter {
             }
             (KeyCode::Enter, false, false, false) | (KeyCode::Char('o') | KeyCode::Char('O'), false, false, false) => {
                 InputDecision::Execute(Action::DrawerOpen)
+            }
+            (KeyCode::Char('b') | KeyCode::Char('B'), false, false, false) => {
+                InputDecision::Execute(Action::DrawerPreview)
             }
             (KeyCode::Char('s') | KeyCode::Char('S'), false, false, false) => {
                 InputDecision::Execute(Action::DrawerSendToPane)
