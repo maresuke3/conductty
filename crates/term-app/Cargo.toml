@@ -1,0 +1,19 @@
+[package]
+name = "term-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "conductty"
+path = "src/main.rs"
+
+[dependencies]
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+term-core = { path = "../term-core" }
+term-drawer = { path = "../term-drawer" }
+term-render = { path = "../term-render" }
+tokio.workspace = true
+wgpu.workspace = true
+winit.workspace = true
