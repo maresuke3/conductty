@@ -93,6 +93,16 @@ impl Tab {
         }
     }
 
+    pub fn contains_pane(&self, target: PaneId) -> bool {
+        self.layout.contains_pane(target)
+    }
+
+    pub fn all_panes(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        self.layout.collect_panes(&mut out);
+        out
+    }
+
     /// 指定ペインを閉じる。タブ内に残りペインがあれば `true`、最後の1枚だったら `false` を返す。
     pub fn close_pane(&mut self, target: PaneId) -> bool {
         if matches!(self.layout, LayoutNode::Pane(id) if id == target) {
@@ -114,6 +124,167 @@ pub struct Workspace {
     pub name: String,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+}
+
+impl Workspace {
+    pub fn pane_count(&self) -> usize {
+        self.tabs.iter().map(|t| t.all_panes().len()).sum()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceManager {
+    pub workspaces: Vec<Workspace>,
+    pub active_workspace: usize,
+}
+
+impl WorkspaceManager {
+    pub fn new(first_pane: PaneId) -> Self {
+        Self {
+            workspaces: vec![Workspace {
+                id: "master".to_string(),
+                name: "Master Space".to_string(),
+                tabs: vec![Tab::new(1, first_pane)],
+                active_tab: 0,
+            }],
+            active_workspace: 0,
+        }
+    }
+
+    pub fn active_workspace(&self) -> &Workspace {
+        &self.workspaces[self.active_workspace]
+    }
+
+    pub fn active_workspace_mut(&mut self) -> &mut Workspace {
+        &mut self.workspaces[self.active_workspace]
+    }
+
+    pub fn active_tab(&self) -> &Tab {
+        let ws = self.active_workspace();
+        &ws.tabs[ws.active_tab]
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
+        let ws = self.active_workspace_mut();
+        &mut ws.tabs[ws.active_tab]
+    }
+
+    pub fn add_workspace(&mut self, name: String, first_pane: PaneId) -> usize {
+        let idx = self.workspaces.len();
+        self.workspaces.push(Workspace {
+            id: format!("ws-{idx}"),
+            name,
+            tabs: vec![Tab::new(1, first_pane)],
+            active_tab: 0,
+        });
+        self.active_workspace = idx;
+        idx
+    }
+
+    pub fn add_tab(&mut self, first_pane: PaneId) -> usize {
+        let ws = self.active_workspace_mut();
+        let next_id = ws.tabs.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        ws.tabs.push(Tab::new(next_id, first_pane));
+        ws.active_tab = ws.tabs.len() - 1;
+        ws.active_tab
+    }
+
+    pub fn switch_workspace(&mut self, idx: usize) {
+        if idx < self.workspaces.len() {
+            self.active_workspace = idx;
+        }
+    }
+
+    pub fn rename_workspace(&mut self, idx: usize, new_name: String) -> bool {
+        let trimmed = new_name.trim();
+        if idx < self.workspaces.len() && !trimmed.is_empty() {
+            self.workspaces[idx].name = trimmed.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 指定 Workspace を閉じて配下の全 PaneId を返す（index 0 の Master Space は保護する）。
+    pub fn close_workspace(&mut self, idx: usize) -> Vec<PaneId> {
+        if idx == 0 || idx >= self.workspaces.len() {
+            return Vec::new();
+        }
+        let removed = self.workspaces.remove(idx);
+        let mut panes = Vec::new();
+        for tab in &removed.tabs {
+            panes.extend(tab.all_panes());
+        }
+        if self.active_workspace >= self.workspaces.len() {
+            self.active_workspace = self.workspaces.len() - 1;
+        } else if self.active_workspace > idx {
+            self.active_workspace -= 1;
+        }
+        panes
+    }
+
+    pub fn switch_tab(&mut self, idx: usize) {
+        let ws = self.active_workspace_mut();
+        if idx < ws.tabs.len() {
+            ws.active_tab = idx;
+        }
+    }
+
+    /// 指定インデックスのタブを閉じる。閉じたタブ内の全 PaneId と、アプリを継続するか (`true`) を返す。
+    pub fn close_tab(&mut self, tab_idx: usize) -> (Vec<PaneId>, bool) {
+        let ws_idx = self.active_workspace;
+        if tab_idx >= self.workspaces[ws_idx].tabs.len() {
+            return (Vec::new(), true);
+        }
+        let removed = self.workspaces[ws_idx].tabs.remove(tab_idx);
+        let panes = removed.all_panes();
+
+        if self.workspaces[ws_idx].tabs.is_empty() {
+            if self.workspaces.len() == 1 {
+                return (panes, false);
+            }
+            self.workspaces.remove(ws_idx);
+            if self.active_workspace >= self.workspaces.len() {
+                self.active_workspace = self.workspaces.len() - 1;
+            }
+        } else if self.workspaces[ws_idx].active_tab >= self.workspaces[ws_idx].tabs.len() {
+            self.workspaces[ws_idx].active_tab = self.workspaces[ws_idx].tabs.len() - 1;
+        }
+        (panes, true)
+    }
+
+    /// 指定ペインが属する Workspace/Tab からペインを閉じる。
+    /// アプリ全体で残りペインが無くなったら `false` を返す。
+    pub fn close_pane(&mut self, target: PaneId) -> bool {
+        for ws_idx in 0..self.workspaces.len() {
+            let mut empty_tab_idx = None;
+            for tab_idx in 0..self.workspaces[ws_idx].tabs.len() {
+                let tab = &mut self.workspaces[ws_idx].tabs[tab_idx];
+                if tab.contains_pane(target) {
+                    if !tab.close_pane(target) {
+                        empty_tab_idx = Some(tab_idx);
+                    }
+                    break;
+                }
+            }
+            if let Some(t_idx) = empty_tab_idx {
+                self.workspaces[ws_idx].tabs.remove(t_idx);
+                if self.workspaces[ws_idx].tabs.is_empty() {
+                    if self.workspaces.len() == 1 {
+                        return false;
+                    }
+                    self.workspaces.remove(ws_idx);
+                    if self.active_workspace >= self.workspaces.len() {
+                        self.active_workspace = self.workspaces.len() - 1;
+                    }
+                } else if self.workspaces[ws_idx].active_tab >= self.workspaces[ws_idx].tabs.len() {
+                    self.workspaces[ws_idx].active_tab = self.workspaces[ws_idx].tabs.len() - 1;
+                }
+                return true;
+            }
+        }
+        true
+    }
 }
 
 impl LayoutNode {
@@ -148,6 +319,25 @@ impl LayoutNode {
         match self {
             LayoutNode::Pane(id) => *id,
             LayoutNode::Split { first, .. } => first.first_pane(),
+        }
+    }
+
+    pub fn contains_pane(&self, target: PaneId) -> bool {
+        match self {
+            LayoutNode::Pane(id) => *id == target,
+            LayoutNode::Split { first, second, .. } => {
+                first.contains_pane(target) || second.contains_pane(target)
+            }
+        }
+    }
+
+    pub fn collect_panes(&self, out: &mut Vec<PaneId>) {
+        match self {
+            LayoutNode::Pane(id) => out.push(*id),
+            LayoutNode::Split { first, second, .. } => {
+                first.collect_panes(out);
+                second.collect_panes(out);
+            }
         }
     }
 
@@ -285,5 +475,51 @@ mod tests {
 
         // 最後のペイン1を閉じると false（タブ終了）
         assert!(!tab.close_pane(1));
+    }
+
+    #[test]
+    fn workspace_manager_creates_master_and_dev_spaces() {
+        let mut mgr = WorkspaceManager::new(1);
+        assert_eq!(mgr.workspaces[0].name, "Master Space");
+        let idx = mgr.add_workspace("conductty".to_string(), 2);
+        assert_eq!(idx, 1);
+        assert_eq!(mgr.active_workspace().name, "conductty");
+
+        // Dev Workspace の最後のペインを閉じると Master Space に戻る
+        assert!(mgr.close_pane(2));
+        assert_eq!(mgr.workspaces.len(), 1);
+        assert_eq!(mgr.active_workspace().name, "Master Space");
+    }
+
+    #[test]
+    fn close_tab_returns_panes_and_updates_active_tab() {
+        let mut mgr = WorkspaceManager::new(1);
+        mgr.add_tab(2);
+        assert_eq!(mgr.active_workspace().tabs.len(), 2);
+        assert_eq!(mgr.active_workspace().active_tab, 1);
+
+        let (closed_panes, keep_running) = mgr.close_tab(1);
+        assert!(keep_running);
+        assert_eq!(closed_panes, vec![2]);
+        assert_eq!(mgr.active_workspace().tabs.len(), 1);
+        assert_eq!(mgr.active_workspace().active_tab, 0);
+    }
+
+    #[test]
+    fn rename_and_close_workspace_protects_master_space() {
+        let mut mgr = WorkspaceManager::new(1);
+        let idx = mgr.add_workspace("Dev 1".to_string(), 2);
+        assert!(mgr.rename_workspace(idx, "omni-desk".to_string()));
+        assert_eq!(mgr.workspaces[idx].name, "omni-desk");
+
+        // Master Space (index 0) は削除されない
+        assert!(mgr.close_workspace(0).is_empty());
+        assert_eq!(mgr.workspaces.len(), 2);
+
+        // Dev Workspace を閉じると配下のペインIDが返る
+        let closed = mgr.close_workspace(idx);
+        assert_eq!(closed, vec![2]);
+        assert_eq!(mgr.workspaces.len(), 1);
+        assert_eq!(mgr.active_workspace, 0);
     }
 }

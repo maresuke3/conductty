@@ -4,6 +4,7 @@ use crate::layout::NavDirection;
 pub enum InputMode {
     Normal,
     Pane,
+    LeftDrawer,
     RightDrawer,
 }
 
@@ -47,6 +48,15 @@ pub enum Action {
     EnterPaneMode,
     ExitPaneMode,
     GotoSplit(NavDirection),
+    ToggleLeftDrawer,
+    ToggleLeftDrawerCollapse,
+    ExitLeftDrawerMode,
+    LeftDrawerNext,
+    LeftDrawerPrev,
+    LeftDrawerSelect,
+    LeftDrawerRename,
+    LeftDrawerCloseWorkspace,
+    NewWorkspace,
     ToggleRightDrawer,
     CloseRightDrawer,
     DrawerNext,
@@ -93,8 +103,53 @@ impl InputRouter {
     pub fn route(&mut self, event: &KeyEvent, ctx: &impl PerformableContext) -> InputDecision {
         match self.mode {
             InputMode::Pane => self.route_pane_mode(event),
+            InputMode::LeftDrawer => self.route_left_drawer_mode(event),
             InputMode::RightDrawer => self.route_right_drawer_mode(event),
             InputMode::Normal => self.route_normal_mode(event, ctx),
+        }
+    }
+
+    fn route_left_drawer_mode(&mut self, event: &KeyEvent) -> InputDecision {
+        let m = event.mods;
+        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('e') | KeyCode::Char('E')) {
+            self.mode = InputMode::Normal;
+            return InputDecision::Execute(Action::ExitLeftDrawerMode);
+        }
+
+        match (&event.code, m.ctrl, m.shift, m.alt) {
+            (KeyCode::Escape, _, _, _)
+            | (KeyCode::Char('q') | KeyCode::Char('Q'), false, false, false) => {
+                self.mode = InputMode::Normal;
+                InputDecision::Execute(Action::ExitLeftDrawerMode)
+            }
+            (KeyCode::Char('c') | KeyCode::Char('C'), false, false, false) => {
+                self.mode = InputMode::Normal;
+                InputDecision::Execute(Action::ToggleLeftDrawerCollapse)
+            }
+            (KeyCode::Char('j') | KeyCode::Char('J'), false, false, false)
+            | (KeyCode::Down, false, false, false) => {
+                InputDecision::Execute(Action::LeftDrawerNext)
+            }
+            (KeyCode::Char('k') | KeyCode::Char('K'), false, false, false)
+            | (KeyCode::Up, false, false, false) => {
+                InputDecision::Execute(Action::LeftDrawerPrev)
+            }
+            (KeyCode::Enter, false, false, false) | (KeyCode::Space, false, false, false) => {
+                self.mode = InputMode::Normal;
+                InputDecision::Execute(Action::LeftDrawerSelect)
+            }
+            (KeyCode::Char('n') | KeyCode::Char('N'), false, false, false) => {
+                self.mode = InputMode::Normal;
+                InputDecision::Execute(Action::NewWorkspace)
+            }
+            (KeyCode::Char('r') | KeyCode::Char('R'), false, false, false) => {
+                self.mode = InputMode::Normal;
+                InputDecision::Execute(Action::LeftDrawerRename)
+            }
+            (KeyCode::Char('d') | KeyCode::Char('D'), false, false, false) => {
+                InputDecision::Execute(Action::LeftDrawerCloseWorkspace)
+            }
+            _ => InputDecision::Ignore,
         }
     }
 
@@ -188,6 +243,12 @@ impl InputRouter {
             && matches!(event.code, KeyCode::Char('v') | KeyCode::Char('V'))
         {
             return InputDecision::Execute(Action::Paste);
+        }
+
+        // Ctrl+Shift+E -> ToggleLeftDrawer (Workspace 一覧)
+        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('e') | KeyCode::Char('E')) {
+            self.mode = InputMode::LeftDrawer;
+            return InputDecision::Execute(Action::ToggleLeftDrawer);
         }
 
         // Ctrl+Shift+G -> ToggleRightDrawer (開きつつ操作モードへ)
