@@ -4,6 +4,7 @@ use crate::layout::NavDirection;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
+    Prefix,
     Pane,
     LeftDrawer,
     RightDrawer,
@@ -153,10 +154,14 @@ impl KeyBinding {
             (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(b),
             _ => self.code == event.code,
         };
+        let shift_matches = match self.code {
+            KeyCode::Char(c) if !c.is_ascii_alphabetic() && !self.shift => true,
+            _ => self.shift == event.mods.shift,
+        };
         code_matches
             && self.ctrl == event.mods.ctrl
             && self.alt == event.mods.alt
-            && self.shift == event.mods.shift
+            && shift_matches
             && self.logo == event.mods.logo
     }
 }
@@ -167,6 +172,8 @@ pub struct InputRouter {
     pub mode: InputMode,
     pub macos_left_option_as_alt: bool,
     pub normal_bindings: Vec<KeyBinding>,
+    pub prefix_trigger: Option<KeyBinding>,
+    pub prefix_bindings: Vec<KeyBinding>,
 }
 
 impl Default for InputRouter {
@@ -196,10 +203,32 @@ impl InputRouter {
             (&kb.reload_config, Action::ReloadConfig),
         ];
 
+        let prefix_trigger = if kb.prefix.trim().is_empty() {
+            None
+        } else {
+            KeyBinding::parse(&kb.prefix, Action::NewTab)
+        };
+
         let mut normal_bindings = Vec::new();
+        let mut prefix_bindings = Vec::new();
         for (spec, action) in specs {
-            if let Some(b) = KeyBinding::parse(spec, action) {
-                normal_bindings.push(b);
+            let parts: Vec<&str> = if spec.trim() == "," {
+                vec![","]
+            } else {
+                spec.split(',').collect()
+            };
+            for part in parts {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some(rest) = strip_leader_prefix(p) {
+                    if let Some(b) = KeyBinding::parse(rest, action) {
+                        prefix_bindings.push(b);
+                    }
+                } else if let Some(b) = KeyBinding::parse(p, action) {
+                    normal_bindings.push(b);
+                }
             }
         }
 
@@ -215,18 +244,68 @@ impl InputRouter {
             mode: InputMode::Normal,
             macos_left_option_as_alt: config.window.macos_option_as_alt == "left",
             normal_bindings,
+            prefix_trigger,
+            prefix_bindings,
         }
     }
+}
+
+fn strip_leader_prefix(spec: &str) -> Option<&str> {
+    let lower = spec.to_ascii_lowercase();
+    for pfx in ["prefix+", "leader+"] {
+        if lower.starts_with(pfx) {
+            return Some(&spec[pfx.len()..]);
+        }
+    }
+    None
 }
 
 impl InputRouter {
     pub fn route(&mut self, event: &KeyEvent, ctx: &impl PerformableContext) -> InputDecision {
         match self.mode {
+            InputMode::Prefix => self.route_prefix_mode(event, ctx),
             InputMode::Pane => self.route_pane_mode(event),
             InputMode::LeftDrawer => self.route_left_drawer_mode(event),
             InputMode::RightDrawer => self.route_right_drawer_mode(event),
             InputMode::Normal => self.route_normal_mode(event, ctx),
         }
+    }
+
+    fn route_prefix_mode(
+        &mut self,
+        event: &KeyEvent,
+        ctx: &impl PerformableContext,
+    ) -> InputDecision {
+        self.mode = InputMode::Normal;
+        for binding in &self.prefix_bindings {
+            if binding.matches(event) {
+                if binding.performable {
+                    if let Action::GotoSplit(dir) = binding.action {
+                        if !ctx.can_goto_split(dir) {
+                            continue;
+                        }
+                    }
+                }
+                match binding.action {
+                    Action::EnterPaneMode => self.mode = InputMode::Pane,
+                    Action::ToggleLeftDrawer => self.mode = InputMode::LeftDrawer,
+                    Action::ToggleRightDrawer => self.mode = InputMode::RightDrawer,
+                    _ => {}
+                }
+                return InputDecision::Execute(binding.action);
+            }
+        }
+        if self
+            .prefix_trigger
+            .as_ref()
+            .is_some_and(|t| t.matches(event))
+        {
+            return match self.encode_vt_bytes(event) {
+                Some(bytes) => InputDecision::SendToPty(bytes),
+                None => InputDecision::Ignore,
+            };
+        }
+        InputDecision::Ignore
     }
 
     fn route_left_drawer_mode(&mut self, event: &KeyEvent) -> InputDecision {
@@ -355,6 +434,15 @@ impl InputRouter {
                 }
                 return InputDecision::Execute(binding.action);
             }
+        }
+
+        if self
+            .prefix_trigger
+            .as_ref()
+            .is_some_and(|t| t.matches(event))
+        {
+            self.mode = InputMode::Prefix;
+            return InputDecision::Ignore;
         }
 
         // 通常キーは VT バイト列へエンコード
@@ -522,5 +610,77 @@ mod tests {
             left_alt: false,
         };
         assert_eq!(router.route(&ev, &ctx), InputDecision::Execute(Action::NewTab));
+    }
+
+    #[test]
+    fn prefix_and_direct_bindings_work_together() {
+        let mut cfg = AppConfig::default();
+        cfg.keybinds.prefix = "ctrl+a".to_string();
+        cfg.keybinds.new_tab = "ctrl+t, prefix+c".to_string();
+        cfg.keybinds.split_right = "leader+%".to_string();
+        let mut router = InputRouter::from_config(&cfg);
+        let ctx = MockCtx { has_right: false };
+
+        // ダイレクトバインド (ctrl+t)
+        let ctrl_t = KeyEvent {
+            code: KeyCode::Char('t'),
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&ctrl_t, &ctx),
+            InputDecision::Execute(Action::NewTab)
+        );
+
+        // prefix 起動 (ctrl+a) -> c で NewTab
+        let ctrl_a = KeyEvent {
+            code: KeyCode::Char('a'),
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+        assert_eq!(router.route(&ctrl_a, &ctx), InputDecision::Ignore);
+        assert_eq!(router.mode, InputMode::Prefix);
+
+        let key_c = KeyEvent {
+            code: KeyCode::Char('c'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&key_c, &ctx),
+            InputDecision::Execute(Action::NewTab)
+        );
+        assert_eq!(router.mode, InputMode::Normal);
+
+        // prefix 起動 -> % (Shift 込み) で SplitRight
+        assert_eq!(router.route(&ctrl_a, &ctx), InputDecision::Ignore);
+        let pct = KeyEvent {
+            code: KeyCode::Char('%'),
+            mods: mods(false, false, true),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&pct, &ctx),
+            InputDecision::Execute(Action::SplitRight)
+        );
+        assert_eq!(router.mode, InputMode::Normal);
+
+        // prefix 2 回押しで PTY へ 0x01 (Ctrl+A) パススルー
+        assert_eq!(router.route(&ctrl_a, &ctx), InputDecision::Ignore);
+        assert_eq!(
+            router.route(&ctrl_a, &ctx),
+            InputDecision::SendToPty(vec![0x01])
+        );
+        assert_eq!(router.mode, InputMode::Normal);
+
+        // 未割り当てキー (Esc) でキャンセル
+        assert_eq!(router.route(&ctrl_a, &ctx), InputDecision::Ignore);
+        let esc = KeyEvent {
+            code: KeyCode::Escape,
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(router.route(&esc, &ctx), InputDecision::Ignore);
+        assert_eq!(router.mode, InputMode::Normal);
     }
 }

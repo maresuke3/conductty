@@ -1249,6 +1249,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let visible_panes = self.manager.active_tab().visible_rects(area);
                 let focused_pane = self.manager.active_tab().focused_pane;
                 let pane_mode = self.router.mode == InputMode::Pane;
+                let prefix_mode = self.router.mode == InputMode::Prefix;
                 let zoomed = self.manager.active_tab().zoomed;
                 let go_to_active = self.go_to_active;
                 let left_drawer_mode = self.left_drawer_mode;
@@ -1752,18 +1753,24 @@ impl ApplicationHandler<UserEvent> for App {
                                 let is_focused = *pane_id == focused_pane;
                                 let painter = ui.painter().with_clip_rect(egui_rect);
 
-                                let border_color = if is_focused {
+                                let border_color = if is_focused && prefix_mode {
+                                    Color32::from_rgb(0xff, 0x9e, 0x64)
+                                } else if is_focused {
                                     Color32::from_rgb(0x7a, 0xa2, 0xf7)
                                 } else {
                                     Color32::from_rgb(0x3b, 0x42, 0x61)
                                 };
+                                let border_width = if is_focused && prefix_mode {
+                                    2.5_f32
+                                } else if is_focused {
+                                    1.5_f32
+                                } else {
+                                    1.0_f32
+                                };
                                 painter.rect_stroke(
                                     egui_rect.shrink(1.0),
                                     2.0,
-                                    Stroke::new(
-                                        if is_focused { 1.5_f32 } else { 1.0_f32 },
-                                        border_color,
-                                    ),
+                                    Stroke::new(border_width, border_color),
                                     egui::StrokeKind::Inside,
                                 );
 
@@ -1914,9 +1921,31 @@ impl ApplicationHandler<UserEvent> for App {
                             if self.config.features.right_drawer && !right_drawer_open {
                                 status_parts.push("Ctrl+Shift+G: GitHub");
                             }
+                            let mut right_edge = area.x + area.width - 14.0;
+                            if prefix_mode {
+                                let badge_w = 64.0;
+                                let badge_h = 22.0;
+                                let badge_rect = Rect::from_min_size(
+                                    Pos2::new(right_edge - badge_w, area.y + 8.0),
+                                    Vec2::new(badge_w, badge_h),
+                                );
+                                ui.painter().rect_filled(
+                                    badge_rect,
+                                    4.0,
+                                    Color32::from_rgb(0xff, 0x9e, 0x64),
+                                );
+                                ui.painter().text(
+                                    badge_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "PREFIX",
+                                    FontId::new(12.0, FontFamily::Monospace),
+                                    Color32::from_rgb(0x1e, 0x20, 0x30),
+                                );
+                                right_edge = badge_rect.left() - 10.0;
+                            }
                             if !status_parts.is_empty() {
                                 let label = status_parts.join(" | ");
-                                let top_right = Pos2::new(area.x + area.width - 14.0, area.y + 10.0);
+                                let top_right = Pos2::new(right_edge, area.y + 10.0);
                                 ui.painter().text(
                                     top_right,
                                     egui::Align2::RIGHT_TOP,

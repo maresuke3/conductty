@@ -68,6 +68,7 @@ pub struct ThemeColorsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeybindsConfig {
+    pub prefix: String,
     pub new_tab: String,
     pub split_right: String,
     pub split_down: String,
@@ -159,6 +160,7 @@ impl Default for ThemeColorsConfig {
 impl Default for KeybindsConfig {
     fn default() -> Self {
         Self {
+            prefix: String::new(),
             new_tab: "ctrl+t".to_string(),
             split_right: "alt+d".to_string(),
             split_down: "alt+shift+d".to_string(),
