@@ -13,7 +13,7 @@ run-wsl:
 
 build-win:
 	cargo build --target x86_64-pc-windows-gnu --bin conductty --bin conductty-server
-	cp -f target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2Loader.dll target/x86_64-pc-windows-gnu/debug/
+	cp -f "$$(ls -t target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2Loader.dll | head -n 1)" target/x86_64-pc-windows-gnu/debug/
 
 run-win: build-win
 	./target/x86_64-pc-windows-gnu/debug/conductty.exe
