@@ -24,7 +24,7 @@ Ghostty 互換の操作感に加え、**左Drawer（`Master Space` / Workspace �
   - 右Drawer（GitHub 連携）を使う場合: [GitHub CLI (`gh`)](https://cli.github.com/) がインストールされ、`gh auth login` 済みであること
 - **Windows**:
   - WebView2 ランタイム（内蔵ブラウザ用、Windows 10 / 11 は標準搭載）
-  - デフォルトシェル設定で WSL2 を使用する場合は `wsl.exe` が利用可能であること
+  - デフォルトシェル設定で WSL2 を使用する場合は `wsl.exe` が利用可能であること（任意）
 - **ソースからビルドする場合**:
   - Rust（`stable` / Edition 2024、`mise.toml` あり）
   - Linux の場合は `pkg-config`, `libx11-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libfontconfig1-dev` などの開発用ライブラリ
@@ -114,8 +114,9 @@ window_padding_balance = true
 # card_background = "#292e42"
 # cursor = "#c8d3f5"
 
-[shell]
-windows_default_prog = ["wsl.exe", "--cd", "~"]
+# Windows でデフォルトシェルに WSL2 を使いたい場合のみコメントアウトを外す
+# [os.windows.shell]
+# windows_default_prog = ["wsl.exe", "--cd", "~"]
 
 [window]
 save_state = "always"

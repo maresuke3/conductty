@@ -23,7 +23,7 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    /// OS に応じたデフォルトシェル（Windows は wsl.exe 等）を PTY 上で起動する。
+    /// OS に応じたデフォルトシェル（Windows は powershell.exe 等）を PTY 上で起動する。
     pub fn spawn(cols: u16, rows: u16, windows_prog: &[String]) -> Result<Self, PtyError> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -39,7 +39,7 @@ impl PtySession {
             let prog = windows_prog
                 .first()
                 .map(String::as_str)
-                .unwrap_or("wsl.exe");
+                .unwrap_or("powershell.exe");
             let mut c = CommandBuilder::new(prog);
             for arg in windows_prog.iter().skip(1) {
                 c.arg(arg);

@@ -9,9 +9,10 @@ window_padding_x = 10.0
 window_padding_y = 10.0
 window_padding_balance = true
 
-[shell]
-# macOS / Linux ではログインシェル、Windows では WSL2 を起動する想定
-windows_default_prog = ["wsl.exe", "--cd", "~"]
+# Windows でのデフォルトシェルは powershell.exe
+# WSL2 を直接起動したい場合はコメントアウトを外してください
+# [os.windows.shell]
+# windows_default_prog = ["wsl.exe", "--cd", "~"]
 
 [window]
 save_state = "always"

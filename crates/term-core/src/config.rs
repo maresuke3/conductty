@@ -76,6 +76,7 @@ pub struct KeybindsConfig {
     pub toggle_zoom: String,
     pub pane_mode: String,
     pub pane_move_mode: String,
+    pub pane_resize_mode: String,
     pub goto_left: String,
     pub goto_down: String,
     pub goto_up: String,
@@ -176,6 +177,7 @@ impl Default for KeybindsConfig {
             toggle_zoom: "ctrl+shift+z".to_string(),
             pane_mode: "prefix+h".to_string(),
             pane_move_mode: "ctrl+shift+h".to_string(),
+            pane_resize_mode: "prefix+r".to_string(),
             goto_left: "performable:ctrl+h".to_string(),
             goto_down: "performable:ctrl+j".to_string(),
             goto_up: "performable:ctrl+k".to_string(),
@@ -199,7 +201,7 @@ impl Default for KeybindsConfig {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            windows_default_prog: vec!["wsl.exe".into(), "--cd".into(), "~".into()],
+            windows_default_prog: vec!["powershell.exe".into()],
         }
     }
 }
@@ -684,5 +686,23 @@ background_opacity = 1.0
         assert!((wsl.appearance.font_size - 17.0).abs() < f32::EPSILON);
         assert!((wsl.appearance.background_opacity - 1.0).abs() < f32::EPSILON);
         assert!(!wsl.features.embedded_browser);
+    }
+
+    #[test]
+    fn windows_default_shell_is_powershell_and_os_windows_shell_overrides_it() {
+        assert_eq!(
+            AppConfig::default().shell.windows_default_prog,
+            vec!["powershell.exe"]
+        );
+
+        let raw = r#"
+[os.windows.shell]
+windows_default_prog = ["wsl.exe", "--cd", "~"]
+"#;
+        let win = AppConfig::from_toml_str_for_os(raw, TargetOs::Windows).unwrap();
+        assert_eq!(win.shell.windows_default_prog, vec!["wsl.exe", "--cd", "~"]);
+
+        let mac = AppConfig::from_toml_str_for_os(raw, TargetOs::MacOs).unwrap();
+        assert_eq!(mac.shell.windows_default_prog, vec!["powershell.exe"]);
     }
 }
