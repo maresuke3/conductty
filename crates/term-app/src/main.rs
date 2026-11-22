@@ -180,20 +180,40 @@ impl GpuState {
         &mut self,
         window: &Window,
         egui_ctx: &egui::Context,
-        full_output: egui::FullOutput,
+        mut full_output: egui::FullOutput,
         bg: wgpu::Color,
     ) -> RenderStatus {
+        let mut textures_delta = std::mem::take(&mut full_output.textures_delta);
+        for (id, image_deltas) in &textures_delta.set {
+            for image_delta in image_deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, image_delta);
+            }
+        }
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                for id in &textures_delta.free {
+                    self.egui_renderer.free_texture(id);
+                }
+                textures_delta.clear();
                 return RenderStatus::Reconfigure;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                for id in &textures_delta.free {
+                    self.egui_renderer.free_texture(id);
+                }
+                textures_delta.clear();
                 return RenderStatus::Ok;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 eprintln!("wgpu surface validation error");
+                for id in &textures_delta.free {
+                    self.egui_renderer.free_texture(id);
+                }
+                textures_delta.clear();
                 return RenderStatus::Ok;
             }
         };
@@ -208,13 +228,6 @@ impl GpuState {
 
         let clipped_primitives =
             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-
-        for (id, image_deltas) in &full_output.textures_delta.set {
-            for image_delta in image_deltas {
-                self.egui_renderer
-                    .update_texture(&self.device, &self.queue, *id, image_delta);
-            }
-        }
 
         let mut encoder = self
             .device
@@ -257,9 +270,10 @@ impl GpuState {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
 
-        for id in &full_output.textures_delta.free {
+        for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+        textures_delta.clear();
         RenderStatus::Ok
     }
 }
