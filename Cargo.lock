@@ -3667,6 +3667,7 @@ dependencies = [
  "serde_json",
  "term-core",
  "term-drawer",
+ "term-mux",
  "term-render",
  "tokio",
  "wgpu",
@@ -3693,6 +3694,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "term-mux"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "term-core",
  "tokio",
 ]
 

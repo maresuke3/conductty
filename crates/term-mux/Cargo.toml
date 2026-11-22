@@ -1,0 +1,10 @@
+[package]
+name = "term-mux"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+term-core = { path = "../term-core" }
+tokio.workspace = true

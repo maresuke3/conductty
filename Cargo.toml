@@ -4,6 +4,7 @@ members = [
     "crates/term-core",
     "crates/term-render",
     "crates/term-drawer",
+    "crates/term-mux",
     "crates/term-app",
 ]
 
