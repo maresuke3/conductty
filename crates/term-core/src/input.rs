@@ -67,6 +67,8 @@ pub enum Action {
     CloseRightDrawer,
     DrawerNext,
     DrawerPrev,
+    DrawerNextPlugin,
+    DrawerPrevPlugin,
     DrawerOpen,
     DrawerPreview,
     DrawerSendToPane,
@@ -438,6 +440,16 @@ impl InputRouter {
             | (KeyCode::Down, false, false, false) => InputDecision::Execute(Action::DrawerNext),
             (KeyCode::Char('k') | KeyCode::Char('K'), false, false, false)
             | (KeyCode::Up, false, false, false) => InputDecision::Execute(Action::DrawerPrev),
+            (KeyCode::Char('h') | KeyCode::Char('H'), false, false, false)
+            | (KeyCode::Left, false, false, false)
+            | (KeyCode::Tab, false, true, false) => {
+                InputDecision::Execute(Action::DrawerPrevPlugin)
+            }
+            (KeyCode::Char('l') | KeyCode::Char('L'), false, false, false)
+            | (KeyCode::Right, false, false, false)
+            | (KeyCode::Tab, false, false, false) => {
+                InputDecision::Execute(Action::DrawerNextPlugin)
+            }
             (KeyCode::Enter, false, false, false)
             | (KeyCode::Char('o') | KeyCode::Char('O'), false, false, false) => {
                 InputDecision::Execute(Action::DrawerOpen)
@@ -748,6 +760,26 @@ mod tests {
         assert_eq!(
             router.route(&j, &ctx),
             InputDecision::Execute(Action::DrawerNext)
+        );
+
+        let l = KeyEvent {
+            code: KeyCode::Char('l'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&l, &ctx),
+            InputDecision::Execute(Action::DrawerNextPlugin)
+        );
+
+        let h = KeyEvent {
+            code: KeyCode::Char('h'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&h, &ctx),
+            InputDecision::Execute(Action::DrawerPrevPlugin)
         );
 
         let q = KeyEvent {

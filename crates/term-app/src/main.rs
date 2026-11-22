@@ -21,7 +21,7 @@ use term_core::input::{
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_drawer::{
-    DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot, format_item_for_pane,
+    DrawerItem, DrawerSection, DrawerSnapshot, fetch_plugin_snapshot, format_item_for_pane,
     validate_http_url,
 };
 use term_mux::{
@@ -321,6 +321,7 @@ struct App {
     renaming_workspace_idx: Option<usize>,
     rename_buf: String,
     right_drawer_open: bool,
+    active_plugin_idx: usize,
     drawer_snapshot: DrawerSnapshot,
     drawer_selected_idx: usize,
     drawer_scroll_to_selected: bool,
@@ -697,34 +698,54 @@ impl App {
         }
     }
 
+    fn enabled_plugins(&self) -> Vec<term_core::config::DrawerPluginConfig> {
+        self.config
+            .plugins
+            .iter()
+            .filter(|p| p.enabled && !p.command.trim().is_empty())
+            .cloned()
+            .collect()
+    }
+
     fn trigger_drawer_refresh(&mut self) {
+        let plugins = self.enabled_plugins();
+        if plugins.is_empty() {
+            self.drawer_snapshot = DrawerSnapshot {
+                plugin_id: String::new(),
+                title: "Drawer".to_string(),
+                sections: Vec::new(),
+                is_loading: false,
+                last_error: None,
+            };
+            return;
+        }
+        if self.active_plugin_idx >= plugins.len() {
+            self.active_plugin_idx = 0;
+        }
+        let plugin = plugins[self.active_plugin_idx].clone();
+        self.drawer_snapshot.plugin_id = plugin.id.clone();
+        self.drawer_snapshot.title = plugin.name.clone();
         self.drawer_snapshot.is_loading = true;
         let proxy = self.proxy.clone();
+        let cfg_json = serde_json::to_value(&plugin.config).unwrap_or(serde_json::Value::Null);
         self.rt.spawn(async move {
-            let snapshot = fetch_github_snapshot().await;
+            let snapshot = fetch_plugin_snapshot(
+                &plugin.id,
+                &plugin.name,
+                &plugin.command,
+                &plugin.args,
+                cfg_json,
+            )
+            .await;
             let _ = proxy.send_event(UserEvent::DrawerUpdated(snapshot));
         });
     }
 
-    fn ordered_drawer_items(&self) -> Vec<GitHubItem> {
-        let mut ordered = Vec::with_capacity(self.drawer_snapshot.items.len());
-        for kind in [
-            GitHubItemKind::ReviewRequestedPr,
-            GitHubItemKind::AssignedPr,
-            GitHubItemKind::AssignedIssue,
-        ] {
-            ordered.extend(
-                self.drawer_snapshot
-                    .items
-                    .iter()
-                    .filter(|i| i.kind == kind)
-                    .cloned(),
-            );
-        }
-        ordered
+    fn ordered_drawer_items(&self) -> Vec<DrawerItem> {
+        self.drawer_snapshot.ordered_items()
     }
 
-    fn selected_drawer_item(&self) -> Option<GitHubItem> {
+    fn selected_drawer_item(&self) -> Option<DrawerItem> {
         let ordered = self.ordered_drawer_items();
         ordered.get(self.drawer_selected_idx).cloned()
     }
@@ -1206,7 +1227,7 @@ impl App {
                 self.right_drawer_open = true;
                 self.drawer_selected_idx = 0;
                 self.drawer_scroll_to_selected = true;
-                if self.drawer_snapshot.items.is_empty() && !self.drawer_snapshot.is_loading {
+                if self.drawer_snapshot.sections.is_empty() && !self.drawer_snapshot.is_loading {
                     self.trigger_drawer_refresh();
                 }
             }
@@ -1220,7 +1241,7 @@ impl App {
                 self.router.mode = InputMode::Normal;
             }
             Action::DrawerNext => {
-                let len = self.drawer_snapshot.items.len();
+                let len = self.drawer_snapshot.total_items();
                 if len > 0 {
                     self.drawer_selected_idx = (self.drawer_selected_idx + 1).min(len - 1);
                     self.drawer_scroll_to_selected = true;
@@ -1230,14 +1251,36 @@ impl App {
                 self.drawer_selected_idx = self.drawer_selected_idx.saturating_sub(1);
                 self.drawer_scroll_to_selected = true;
             }
+            Action::DrawerNextPlugin => {
+                let plugins = self.enabled_plugins();
+                if plugins.len() > 1 {
+                    self.active_plugin_idx = (self.active_plugin_idx + 1) % plugins.len();
+                    self.drawer_selected_idx = 0;
+                    self.drawer_scroll_to_selected = true;
+                    self.trigger_drawer_refresh();
+                }
+            }
+            Action::DrawerPrevPlugin => {
+                let plugins = self.enabled_plugins();
+                if plugins.len() > 1 {
+                    self.active_plugin_idx =
+                        (self.active_plugin_idx + plugins.len() - 1) % plugins.len();
+                    self.drawer_selected_idx = 0;
+                    self.drawer_scroll_to_selected = true;
+                    self.trigger_drawer_refresh();
+                }
+            }
             Action::DrawerOpen => {
-                if let Some(item) = self.selected_drawer_item() {
+                if let Some(item) = self.selected_drawer_item()
+                    && !item.url.is_empty()
+                {
                     open_url(&item.url);
                 }
             }
             Action::DrawerPreview => {
                 if self.config.features.embedded_browser
                     && let Some(item) = self.selected_drawer_item()
+                    && !item.url.is_empty()
                 {
                     self.right_drawer_open = true;
                     self.pending_browser_url = Some(item.url);
@@ -1394,9 +1437,21 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(err) = &snapshot.last_error {
                     eprintln!("[conductty drawer error] {err}");
                 }
-                self.drawer_snapshot = snapshot;
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                let matches_active = self
+                    .enabled_plugins()
+                    .get(self.active_plugin_idx)
+                    .is_none_or(|p| p.id == snapshot.plugin_id);
+                if matches_active {
+                    self.drawer_snapshot = snapshot;
+                    let total = self.drawer_snapshot.total_items();
+                    if total == 0 {
+                        self.drawer_selected_idx = 0;
+                    } else if self.drawer_selected_idx >= total {
+                        self.drawer_selected_idx = total - 1;
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
             UserEvent::MuxStateUpdated(manager, snapshots) => {
@@ -1863,6 +1918,12 @@ impl ApplicationHandler<UserEvent> for App {
                     .any(|(_, _, _, _, _, st)| st.status == AgentStatus::Ask);
                 let mut jump_agent_target: Option<(usize, usize, PaneId)> = None;
                 let right_drawer_open = self.right_drawer_open;
+                let enabled_plugins = if right_drawer_open {
+                    self.enabled_plugins()
+                } else {
+                    Vec::new()
+                };
+                let active_plugin_idx = self.active_plugin_idx;
                 let drawer_snapshot = if right_drawer_open {
                     self.drawer_snapshot.clone()
                 } else {
@@ -1882,6 +1943,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let cell_extra_h = self.config.appearance.adjust_cell_height;
 
                 let mut refresh_requested = false;
+                let mut switch_plugin_idx: Option<usize> = None;
                 let mut toggle_left_collapse = false;
                 let can_collapse_left =
                     self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed;
@@ -2265,11 +2327,45 @@ impl ApplicationHandler<UserEvent> for App {
                                     return;
                                 }
 
+                                if enabled_plugins.len() > 1 {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (p_idx, p_cfg) in enabled_plugins.iter().enumerate() {
+                                            let is_active = p_idx == active_plugin_idx;
+                                            let label = if p_cfg.category.is_empty() {
+                                                p_cfg.name.clone()
+                                            } else {
+                                                format!("{} ({})", p_cfg.name, p_cfg.category)
+                                            };
+                                            if ui.selectable_label(is_active, label).clicked() {
+                                                switch_plugin_idx = Some(p_idx);
+                                            }
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+
+                                let header_title = if !drawer_snapshot.title.is_empty() {
+                                    drawer_snapshot.title.as_str()
+                                } else if let Some(p) = enabled_plugins.get(active_plugin_idx) {
+                                    p.name.as_str()
+                                } else {
+                                    "Drawer"
+                                };
+
                                 ui.horizontal(|ui| {
                                     ui.heading(
-                                        egui::RichText::new("GitHub")
+                                        egui::RichText::new(header_title)
                                             .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
                                     );
+                                    if let Some(p) = enabled_plugins.get(active_plugin_idx)
+                                        && !p.category.is_empty()
+                                    {
+                                        ui.label(
+                                            egui::RichText::new(format!("[{}]", p.category))
+                                                .small()
+                                                .color(Color32::from_rgb(0x7a, 0xa2, 0xf7)),
+                                        );
+                                    }
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
@@ -2294,7 +2390,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                                 if drawer_snapshot.is_loading {
                                     ui.label(
-                                        egui::RichText::new("Fetching via gh CLI...")
+                                        egui::RichText::new("Loading plugin view...")
                                             .color(Color32::from_rgb(0x82, 0xaa, 0xff)),
                                     );
                                 }
@@ -2308,6 +2404,16 @@ impl ApplicationHandler<UserEvent> for App {
                                         egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                                     )
                                     .show(ui, |ui| {
+                                        if enabled_plugins.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "No drawer plugins enabled in config.conductty",
+                                                )
+                                                .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                            );
+                                            return;
+                                        }
+
                                         if let Some(err) = &drawer_snapshot.last_error {
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.add(
@@ -2325,51 +2431,24 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
 
                                         let mut global_idx = 0usize;
-                                        render_github_section(
-                                            ui,
-                                            "Review Requested",
-                                            Color32::from_rgb(0xff, 0x9e, 0x64),
-                                            &drawer_snapshot.items,
-                                            GitHubItemKind::ReviewRequestedPr,
-                                            &mut global_idx,
-                                            self.drawer_selected_idx,
-                                            scroll_to_selected,
-                                            &mut open_url_target,
-                                            &mut preview_url_target,
-                                            &mut send_to_pane_text,
-                                        );
-                                        render_github_section(
-                                            ui,
-                                            "Assigned PRs",
-                                            Color32::from_rgb(0x7a, 0xa2, 0xf7),
-                                            &drawer_snapshot.items,
-                                            GitHubItemKind::AssignedPr,
-                                            &mut global_idx,
-                                            self.drawer_selected_idx,
-                                            scroll_to_selected,
-                                            &mut open_url_target,
-                                            &mut preview_url_target,
-                                            &mut send_to_pane_text,
-                                        );
-                                        render_github_section(
-                                            ui,
-                                            "Assigned Issues",
-                                            Color32::from_rgb(0xc3, 0xe8, 0x8d),
-                                            &drawer_snapshot.items,
-                                            GitHubItemKind::AssignedIssue,
-                                            &mut global_idx,
-                                            self.drawer_selected_idx,
-                                            scroll_to_selected,
-                                            &mut open_url_target,
-                                            &mut preview_url_target,
-                                            &mut send_to_pane_text,
-                                        );
+                                        for section in &drawer_snapshot.sections {
+                                            render_drawer_section(
+                                                ui,
+                                                section,
+                                                &mut global_idx,
+                                                self.drawer_selected_idx,
+                                                scroll_to_selected,
+                                                &mut open_url_target,
+                                                &mut preview_url_target,
+                                                &mut send_to_pane_text,
+                                            );
+                                        }
                                     });
 
                                 ui.separator();
                                 ui.label(
                                     egui::RichText::new(
-                                        "j/k: select | b: preview | o: open | s: send | r: refresh | q/Esc: close",
+                                        "h/l: plugin | j/k: select | b: preview | o: open | s: send | r: refresh | q/Esc: close",
                                     )
                                     .small()
                                     .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
@@ -2920,7 +2999,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 vec![
                                     ("Go To (Space/Pane)", kb_snapshot.go_to.clone()),
                                     ("Left Drawer (Spaces/AI)", kb_snapshot.toggle_left_drawer.clone()),
-                                    ("Right Drawer (GitHub)", kb_snapshot.toggle_right_drawer.clone()),
+                                    ("Right Drawer (Plugins)", kb_snapshot.toggle_right_drawer.clone()),
                                 ],
                             ),
                             (
@@ -3170,6 +3249,15 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     need_redraw = true;
                 }
+                if let Some(p_idx) = switch_plugin_idx
+                    && p_idx != self.active_plugin_idx
+                {
+                    self.active_plugin_idx = p_idx;
+                    self.drawer_selected_idx = 0;
+                    self.drawer_scroll_to_selected = true;
+                    self.trigger_drawer_refresh();
+                    need_redraw = true;
+                }
                 if refresh_requested {
                     self.trigger_drawer_refresh();
                     need_redraw = true;
@@ -3213,13 +3301,26 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+fn parse_drawer_accent(hex: Option<&str>) -> Color32 {
+    if let Some(s) = hex {
+        let h = s.trim().trim_start_matches('#');
+        if h.len() == 6
+            && let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&h[0..2], 16),
+                u8::from_str_radix(&h[2..4], 16),
+                u8::from_str_radix(&h[4..6], 16),
+            )
+        {
+            return Color32::from_rgb(r, g, b);
+        }
+    }
+    Color32::from_rgb(0x7a, 0xa2, 0xf7)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn render_github_section(
+fn render_drawer_section(
     ui: &mut egui::Ui,
-    heading: &str,
-    accent: Color32,
-    items: &[GitHubItem],
-    kind: GitHubItemKind,
+    section: &DrawerSection,
     global_idx: &mut usize,
     selected_idx: usize,
     scroll_to_selected: bool,
@@ -3227,14 +3328,14 @@ fn render_github_section(
     preview_url_target: &mut Option<String>,
     send_to_pane_text: &mut Option<String>,
 ) {
-    let filtered: Vec<&GitHubItem> = items.iter().filter(|i| i.kind == kind).collect();
+    let accent = parse_drawer_accent(section.accent.as_deref());
     ui.add_space(8.0);
     ui.label(
-        egui::RichText::new(format!("{heading} ({})", filtered.len()))
+        egui::RichText::new(format!("{} ({})", section.title, section.items.len()))
             .strong()
             .color(accent),
     );
-    if filtered.is_empty() {
+    if section.items.is_empty() {
         ui.label(
             egui::RichText::new("  None")
                 .small()
@@ -3243,7 +3344,7 @@ fn render_github_section(
         return;
     }
 
-    for item in filtered {
+    for item in &section.items {
         let is_selected = *global_idx == selected_idx;
         *global_idx += 1;
 
@@ -3264,11 +3365,23 @@ fn render_github_section(
             .corner_radius(4.0)
             .inner_margin(8.0)
             .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(format!("{} #{}", item.repo, item.number))
-                        .small()
-                        .color(accent),
-                );
+                if !item.subtitle.is_empty() || item.badge.is_some() {
+                    ui.horizontal(|ui| {
+                        if let Some(badge) = &item.badge
+                            && !badge.is_empty()
+                        {
+                            ui.label(
+                                egui::RichText::new(format!("[{badge}]"))
+                                    .small()
+                                    .strong()
+                                    .color(accent),
+                            );
+                        }
+                        if !item.subtitle.is_empty() {
+                            ui.label(egui::RichText::new(&item.subtitle).small().color(accent));
+                        }
+                    });
+                }
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&item.title).color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
@@ -3276,11 +3389,13 @@ fn render_github_section(
                     .selectable(true),
                 );
                 ui.horizontal(|ui| {
-                    if ui.small_button("Preview").clicked() {
-                        *preview_url_target = Some(item.url.clone());
-                    }
-                    if ui.small_button("Open").clicked() {
-                        *open_url_target = Some(item.url.clone());
+                    if !item.url.is_empty() {
+                        if ui.small_button("Preview").clicked() {
+                            *preview_url_target = Some(item.url.clone());
+                        }
+                        if ui.small_button("Open").clicked() {
+                            *open_url_target = Some(item.url.clone());
+                        }
                     }
                     if ui.small_button("Send to Pane").clicked() {
                         *send_to_pane_text = Some(format_item_for_pane(item));
@@ -4407,6 +4522,7 @@ fn main() {
         renaming_workspace_idx: None,
         rename_buf: String::new(),
         right_drawer_open,
+        active_plugin_idx: 0,
         drawer_snapshot: DrawerSnapshot::default(),
         drawer_selected_idx: 0,
         drawer_scroll_to_selected: false,

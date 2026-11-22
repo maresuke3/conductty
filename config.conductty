@@ -65,6 +65,19 @@ save_state = "always"
 split_preserve_zoom = "navigation"
 macos_option_as_alt = "left"
 
+# 右Drawer プラグイン設定（Rust / Go / Zig 等のシングルバイナリを stdio JSON で呼び出す）
+# category: "tasks" | "docs" | "chat" | "calendar" | "other"
+[[plugins]]
+id = "github"
+name = "GitHub"
+category = "tasks"
+command = "conductty-plugin-github"
+args = []
+enabled = true
+
+[plugins.config]
+limit = 15
+
 # OS 別の条件分岐上書き（config.conductty 内で OS ごとに一部だけ変えたい場合）
 # [os.macos.appearance]
 # font_size = 16.0

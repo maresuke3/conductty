@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct AppConfig {
     pub include: Option<String>,
     pub features: FeaturesConfig,
@@ -14,6 +13,53 @@ pub struct AppConfig {
     pub keybinds: KeybindsConfig,
     pub shell: ShellConfig,
     pub window: WindowConfig,
+    #[serde(default = "default_plugins")]
+    pub plugins: Vec<DrawerPluginConfig>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            include: None,
+            features: FeaturesConfig::default(),
+            appearance: AppearanceConfig::default(),
+            theme: ThemeColorsConfig::default(),
+            keybinds: KeybindsConfig::default(),
+            shell: ShellConfig::default(),
+            window: WindowConfig::default(),
+            plugins: default_plugins(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DrawerPluginConfig {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+    pub config: toml::Value,
+}
+
+impl Default for DrawerPluginConfig {
+    fn default() -> Self {
+        Self {
+            id: "github".to_string(),
+            name: "GitHub".to_string(),
+            category: "tasks".to_string(),
+            command: "conductty-plugin-github".to_string(),
+            args: Vec::new(),
+            enabled: true,
+            config: toml::Value::Table(toml::map::Map::new()),
+        }
+    }
+}
+
+pub fn default_plugins() -> Vec<DrawerPluginConfig> {
+    vec![DrawerPluginConfig::default()]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
