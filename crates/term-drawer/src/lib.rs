@@ -55,8 +55,20 @@ pub fn parse_gh_search_json(
         .collect())
 }
 
+fn apply_no_window(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = cmd;
+}
+
 async fn run_gh_search(args: &[&str], kind: GitHubItemKind) -> Result<Vec<GitHubItem>, String> {
-    let output = match Command::new("gh").args(args).output().await {
+    let mut gh_cmd = Command::new("gh");
+    gh_cmd.args(args);
+    apply_no_window(&mut gh_cmd);
+    let output = match gh_cmd.output().await {
         Ok(out) => out,
         Err(e) if cfg!(target_os = "windows") && e.kind() == std::io::ErrorKind::NotFound => {
             // Windows 側に gh.exe が無ければ、引数クォート崩れを防ぐため `wsl.exe sh -s` の stdin 経由で実行する
@@ -69,11 +81,14 @@ async fn run_gh_search(args: &[&str], kind: GitHubItemKind) -> Result<Vec<GitHub
                 "PATH=\"$HOME/.local/share/mise/shims:/home/linuxbrew/.linuxbrew/bin:$PATH\" exec gh {}\n",
                 escaped_args.join(" ")
             );
-            let mut child = Command::new("wsl.exe")
+            let mut wsl_cmd = Command::new("wsl.exe");
+            wsl_cmd
                 .args(["sh", "-s"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            apply_no_window(&mut wsl_cmd);
+            let mut child = wsl_cmd
                 .spawn()
                 .map_err(|we| format!("wsl gh 起動失敗: {we}"))?;
 

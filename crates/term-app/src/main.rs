@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod browser;
 mod win_backdrop;
 
@@ -810,7 +812,13 @@ impl App {
                     .filter(|p| p.is_file())
                     .unwrap_or_else(|| PathBuf::from("conductty-server"))
             };
-            match Command::new(&server_bin).spawn() {
+            let mut server_cmd = Command::new(&server_bin);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                server_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            match server_cmd.spawn() {
                 Ok(_) => {
                     for _ in 0..20 {
                         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1188,6 +1196,10 @@ impl ApplicationHandler<UserEvent> for App {
             let mut attrs = WindowAttributes::default()
                 .with_title("conductty")
                 .with_transparent(transparent);
+            #[cfg(not(target_os = "windows"))]
+            {
+                attrs = attrs.with_window_icon(load_window_icon(Some(32)));
+            }
             #[cfg(target_os = "windows")]
             if transparent {
                 use winit::platform::windows::WindowAttributesExtWindows;
@@ -3471,12 +3483,30 @@ fn load_saved_workspace_names() -> Option<Vec<String>> {
     serde_json::from_str(&raw).ok()
 }
 
+#[cfg(not(target_os = "windows"))]
+fn load_window_icon(size: Option<u32>) -> Option<winit::window::Icon> {
+    let bytes = include_bytes!("../../../assets/app-icon-256.png");
+    let mut img = image::load_from_memory(bytes).ok()?;
+    if let Some(sz) = size {
+        img = img.resize_exact(sz, sz, image::imageops::FilterType::Lanczos3);
+    }
+    let rgba = img.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+}
+
 fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = Command::new("open").arg(url).spawn();
 
     #[cfg(target_os = "windows")]
-    let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -4161,8 +4191,22 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
     }
 }
 
+#[cfg(target_os = "windows")]
+fn attach_parent_console_for_cli(args: &[String]) {
+    if args.get(1).is_some_and(|s| s != "--mux") {
+        unsafe extern "system" {
+            fn AttachConsole(dw_process_id: u32) -> i32;
+        }
+        unsafe {
+            let _ = AttachConsole(u32::MAX);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(target_os = "windows")]
+    attach_parent_console_for_cli(&args);
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     if let Some(code) = run_cli_subcommand(&args, &rt) {
         std::process::exit(code);
