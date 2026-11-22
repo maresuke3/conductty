@@ -67,6 +67,7 @@ macos_option_as_alt = "left"
 
 # 右Drawer プラグイン設定（Rust / Go / Zig 等のシングルバイナリを stdio JSON で呼び出す）
 # category: "tasks" | "docs" | "chat" | "calendar" | "other"
+# バイナリ探索順: conductty と同フォルダ -> ~/.config/conductty/plugins/ -> ~/.local/bin -> ~/.cargo/bin -> PATH
 [[plugins]]
 id = "github"
 name = "GitHub"
@@ -77,6 +78,18 @@ enabled = true
 
 [plugins.config]
 limit = 15
+
+[[plugins]]
+id = "docs"
+name = "Docs"
+category = "docs"
+command = "conductty-plugin-docs"
+args = []
+enabled = true
+
+[plugins.config]
+dirs = ["~/notes", "./docs"]
+limit = 30
 
 # OS 別の条件分岐上書き（config.conductty 内で OS ごとに一部だけ変えたい場合）
 # [os.macos.appearance]

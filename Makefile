@@ -14,8 +14,8 @@ run-wsl:
 build-win:
 	cargo build --target x86_64-pc-windows-gnu --bin conductty --bin conductty-server
 	if [ -f ../conductty-plugins/Cargo.toml ]; then \
-		cargo build --manifest-path ../conductty-plugins/Cargo.toml --target x86_64-pc-windows-gnu --bin conductty-plugin-github && \
-		cp -f ../conductty-plugins/target/x86_64-pc-windows-gnu/debug/conductty-plugin-github.exe target/x86_64-pc-windows-gnu/debug/ ; \
+		cargo build --manifest-path ../conductty-plugins/Cargo.toml --target x86_64-pc-windows-gnu --bin conductty-plugin-github --bin conductty-plugin-docs && \
+		cp -f ../conductty-plugins/target/x86_64-pc-windows-gnu/debug/conductty-plugin-github.exe ../conductty-plugins/target/x86_64-pc-windows-gnu/debug/conductty-plugin-docs.exe target/x86_64-pc-windows-gnu/debug/ ; \
 	fi
 	cp -f "$$(ls -t target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2Loader.dll | head -n 1)" target/x86_64-pc-windows-gnu/debug/
 

@@ -17,6 +17,8 @@ pub struct PluginRequest {
     pub action_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
     #[serde(default)]
     pub config: serde_json::Value,
 }
@@ -28,9 +30,45 @@ impl PluginRequest {
             method: "fetch".to_string(),
             action_id: None,
             item_id: None,
+            input: None,
             config,
         }
     }
+
+    pub fn action(
+        action_id: impl Into<String>,
+        item_id: Option<String>,
+        input: Option<String>,
+        config: serde_json::Value,
+    ) -> Self {
+        Self {
+            protocol_version: PLUGIN_PROTOCOL_VERSION,
+            method: "action".to_string(),
+            action_id: Some(action_id.into()),
+            item_id,
+            input,
+            config,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DrawerCustomAction {
+    pub id: String,
+    pub label: String,
+    pub key: Option<String>,
+    pub needs_input: bool,
+    pub input_placeholder: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DrawerEffect {
+    OpenUrl { url: String },
+    PreviewUrl { url: String },
+    SendToPane { text: String },
+    CopyToClipboard { text: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,7 +79,9 @@ pub struct DrawerItem {
     pub subtitle: String,
     pub badge: Option<String>,
     pub url: String,
+    pub body: Option<String>,
     pub send_text: Option<String>,
+    pub actions: Vec<DrawerCustomAction>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +98,8 @@ pub struct DrawerSection {
 pub struct DrawerPluginView {
     pub title: String,
     pub sections: Vec<DrawerSection>,
+    pub actions: Vec<DrawerCustomAction>,
+    pub effects: Vec<DrawerEffect>,
     pub error: Option<String>,
 }
 
@@ -66,6 +108,8 @@ pub struct DrawerSnapshot {
     pub plugin_id: String,
     pub title: String,
     pub sections: Vec<DrawerSection>,
+    pub actions: Vec<DrawerCustomAction>,
+    pub effects: Vec<DrawerEffect>,
     pub is_loading: bool,
     pub last_error: Option<String>,
 }
@@ -131,6 +175,8 @@ pub fn format_item_for_pane(item: &DrawerItem) -> String {
         format!("[{sub}] {title} ({url})")
     } else if !url.is_empty() {
         format!("{title} ({url})")
+    } else if !sub.is_empty() {
+        format!("[{sub}] {title}")
     } else {
         title
     }
@@ -147,6 +193,21 @@ pub fn sanitize_plugin_view(mut view: DrawerPluginView) -> DrawerPluginView {
             }
         }
     }
+    view.effects.retain_mut(|eff| match eff {
+        DrawerEffect::OpenUrl { url } | DrawerEffect::PreviewUrl { url } => {
+            if let Ok(valid) = validate_http_url(url) {
+                *url = valid.to_string();
+                true
+            } else {
+                false
+            }
+        }
+        DrawerEffect::SendToPane { text } => {
+            *text = sanitize_terminal_text(text);
+            !text.is_empty()
+        }
+        DrawerEffect::CopyToClipboard { text } => !text.is_empty(),
+    });
     view
 }
 
@@ -165,28 +226,83 @@ fn apply_no_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
-/// 実行ファイルと同じディレクトリにプラグインバイナリが存在すればそのパスを返す。
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    }
+}
+
+pub fn expand_tilde(path_str: &str) -> PathBuf {
+    if let Some(rest) = path_str
+        .strip_prefix("~/")
+        .or_else(|| path_str.strip_prefix("~\\"))
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    if path_str == "~"
+        && let Some(home) = home_dir()
+    {
+        return home;
+    }
+    PathBuf::from(path_str)
+}
+
+fn check_dir_for_binary(dir: &Path, command: &str) -> Option<PathBuf> {
+    let candidate = dir.join(command);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    #[cfg(target_os = "windows")]
+    if !command.ends_with(".exe") {
+        let exe_candidate = dir.join(format!("{command}.exe"));
+        if exe_candidate.is_file() {
+            return Some(exe_candidate);
+        }
+    }
+    None
+}
+
+/// プラグインコマンドを解決する。
+/// 1. `~/` を展開し、パス区切りを含む場合はそのパスを返す
+/// 2. `conductty` 実行ファイルと同じディレクトリ
+/// 3. `~/.config/conductty/plugins/`（サードパーティ・自作プラグインの標準配置先）
+/// 4. `~/.local/bin/` および `~/.cargo/bin/`
+/// 5. OS の `PATH`
 pub fn resolve_plugin_command(command: &str) -> PathBuf {
-    let cmd_path = Path::new(command);
-    if cmd_path.is_absolute() || command.contains('/') || command.contains('\\') {
-        return cmd_path.to_path_buf();
+    let expanded = expand_tilde(command);
+    if expanded.is_absolute() || command.contains('/') || command.contains('\\') {
+        return expanded;
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
+        && let Some(found) = check_dir_for_binary(dir, command)
     {
-        let candidate = dir.join(command);
-        if candidate.is_file() {
-            return candidate;
-        }
-        #[cfg(target_os = "windows")]
-        if !command.ends_with(".exe") {
-            let exe_candidate = dir.join(format!("{command}.exe"));
-            if exe_candidate.is_file() {
-                return exe_candidate;
+        return found;
+    }
+    if let Some(home) = home_dir() {
+        let search_dirs = [
+            home.join(".config").join("conductty").join("plugins"),
+            home.join(".conductty").join("plugins"),
+            home.join(".local").join("bin"),
+            home.join(".cargo").join("bin"),
+        ];
+        for dir in &search_dirs {
+            if let Some(found) = check_dir_for_binary(dir, command) {
+                return found;
             }
         }
     }
-    cmd_path.to_path_buf()
+    expanded
 }
 
 async fn run_plugin_process(
@@ -271,7 +387,7 @@ async fn run_plugin_via_wsl(
         .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
         .collect();
     let script = format!(
-        "PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.local/share/mise/shims:/home/linuxbrew/.linuxbrew/bin:$PATH\" exec {}",
+        "PATH=\"$HOME/.config/conductty/plugins:$HOME/.conductty/plugins:$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.local/share/mise/shims:/home/linuxbrew/.linuxbrew/bin:$PATH\" exec {}",
         escaped.join(" ")
     );
 
@@ -311,16 +427,14 @@ async fn run_plugin_via_wsl(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// 外部プラグインバイナリを stdio (JSON Lines) で呼び出し、右 Drawer 用のスナップショットを取得する。
-pub async fn fetch_plugin_snapshot(
+async fn execute_plugin_request(
     plugin_id: &str,
     fallback_title: &str,
     command: &str,
     args: &[String],
-    config: serde_json::Value,
+    req: &PluginRequest,
 ) -> DrawerSnapshot {
-    let req = PluginRequest::fetch(config);
-    let mut req_bytes = serde_json::to_vec(&req).unwrap_or_default();
+    let mut req_bytes = serde_json::to_vec(req).unwrap_or_default();
     req_bytes.push(b'\n');
 
     match run_plugin_process(command, args, &req_bytes).await {
@@ -333,6 +447,8 @@ pub async fn fetch_plugin_snapshot(
                     view.title
                 },
                 sections: view.sections,
+                actions: view.actions,
+                effects: view.effects,
                 is_loading: false,
                 last_error: view.error,
             },
@@ -340,6 +456,8 @@ pub async fn fetch_plugin_snapshot(
                 plugin_id: plugin_id.to_string(),
                 title: fallback_title.to_string(),
                 sections: Vec::new(),
+                actions: Vec::new(),
+                effects: Vec::new(),
                 is_loading: false,
                 last_error: Some(parse_err),
             },
@@ -348,10 +466,40 @@ pub async fn fetch_plugin_snapshot(
             plugin_id: plugin_id.to_string(),
             title: fallback_title.to_string(),
             sections: Vec::new(),
+            actions: Vec::new(),
+            effects: Vec::new(),
             is_loading: false,
             last_error: Some(err),
         },
     }
+}
+
+/// 外部プラグインバイナリを stdio (JSON Lines) で呼び出し、右 Drawer 用のスナップショットを取得する。
+pub async fn fetch_plugin_snapshot(
+    plugin_id: &str,
+    fallback_title: &str,
+    command: &str,
+    args: &[String],
+    config: serde_json::Value,
+) -> DrawerSnapshot {
+    let req = PluginRequest::fetch(config);
+    execute_plugin_request(plugin_id, fallback_title, command, args, &req).await
+}
+
+/// プラグイン定義のカスタムアクション (`method = "action"`) を呼び出し、更新後の View と Effect を返す。
+#[allow(clippy::too_many_arguments)]
+pub async fn invoke_plugin_action(
+    plugin_id: &str,
+    fallback_title: &str,
+    command: &str,
+    args: &[String],
+    action_id: &str,
+    item_id: Option<String>,
+    input: Option<String>,
+    config: serde_json::Value,
+) -> DrawerSnapshot {
+    let req = PluginRequest::action(action_id, item_id, input, config);
+    execute_plugin_request(plugin_id, fallback_title, command, args, &req).await
 }
 
 #[cfg(test)]
@@ -359,21 +507,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_sanitizes_plugin_view_json() {
+    fn parses_and_sanitizes_plugin_view_json_with_body_actions_and_effects() {
         let raw = r##"{
-            "title": "GitHub",
+            "title": "Docs",
+            "actions": [
+                {
+                    "id": "new_note",
+                    "label": "+ New Note",
+                    "needs_input": true,
+                    "input_placeholder": "note-title.md"
+                }
+            ],
+            "effects": [
+                { "type": "send_to_pane", "text": "nvim note.md\r\n" },
+                { "type": "open_url", "url": "javascript:alert(1)" },
+                { "type": "open_url", "url": "https://example.com/doc" }
+            ],
             "sections": [
                 {
-                    "id": "assigned_prs",
-                    "title": "Assigned PRs",
+                    "id": "notes",
+                    "title": "Local Notes",
                     "accent": "#7aa2f7",
                     "items": [
                         {
-                            "id": "maresuke3/conductty#42",
-                            "title": "Add right drawer plugin host",
-                            "subtitle": "maresuke3/conductty #42",
-                            "badge": "PR",
-                            "url": "https://github.com/maresuke3/conductty/pull/42"
+                            "id": "todo.md",
+                            "title": "TODO List",
+                            "subtitle": "notes/todo.md",
+                            "badge": "MD",
+                            "body": "# TODO\n- Item 1",
+                            "url": "",
+                            "actions": [
+                                { "id": "open_editor", "label": "Edit" }
+                            ]
                         },
                         {
                             "id": "bad",
@@ -387,14 +552,39 @@ mod tests {
         }"##;
 
         let view = parse_plugin_view_json(raw).unwrap();
-        assert_eq!(view.title, "GitHub");
-        assert_eq!(view.sections.len(), 1);
-        assert_eq!(view.sections[0].items.len(), 2);
+        assert_eq!(view.title, "Docs");
+        assert_eq!(view.actions.len(), 1);
+        assert!(view.actions[0].needs_input);
+        assert_eq!(view.effects.len(), 2);
         assert_eq!(
-            view.sections[0].items[0].url,
-            "https://github.com/maresuke3/conductty/pull/42"
+            view.effects[0],
+            DrawerEffect::SendToPane {
+                text: "nvim note.md  ".to_string()
+            }
         );
+        assert_eq!(
+            view.effects[1],
+            DrawerEffect::OpenUrl {
+                url: "https://example.com/doc".to_string()
+            }
+        );
+        assert_eq!(
+            view.sections[0].items[0].body.as_deref(),
+            Some("# TODO\n- Item 1")
+        );
+        assert_eq!(view.sections[0].items[0].actions.len(), 1);
         assert_eq!(view.sections[0].items[1].url, "");
+    }
+
+    #[test]
+    fn expands_tilde_paths() {
+        let expanded = expand_tilde("~/my-plugins/custom-bin");
+        assert!(
+            expanded
+                .to_string_lossy()
+                .ends_with("my-plugins/custom-bin")
+        );
+        assert!(!expanded.to_string_lossy().starts_with('~'));
     }
 
     #[test]
@@ -412,7 +602,9 @@ mod tests {
             subtitle: "org/repo #99\x07".to_string(),
             badge: Some("PR".to_string()),
             url: "https://github.com/org/repo/pull/99".to_string(),
+            body: None,
             send_text: None,
+            actions: Vec::new(),
         };
         let formatted = format_item_for_pane(&item);
         assert!(!formatted.contains('\n'));

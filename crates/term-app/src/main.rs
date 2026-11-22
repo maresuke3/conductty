@@ -21,8 +21,8 @@ use term_core::input::{
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_drawer::{
-    DrawerItem, DrawerSection, DrawerSnapshot, fetch_plugin_snapshot, format_item_for_pane,
-    validate_http_url,
+    DrawerEffect, DrawerItem, DrawerSection, DrawerSnapshot, fetch_plugin_snapshot,
+    format_item_for_pane, invoke_plugin_action, validate_http_url,
 };
 use term_mux::{
     AgentInfo, DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MAX_IPC_REQUEST_BYTES, MuxRequest,
@@ -325,6 +325,9 @@ struct App {
     drawer_snapshot: DrawerSnapshot,
     drawer_selected_idx: usize,
     drawer_scroll_to_selected: bool,
+    drawer_preview_item: Option<DrawerItem>,
+    drawer_input_action: Option<(String, Option<String>, String)>,
+    drawer_input_buf: String,
     cursor_pos: Pos2,
     cell_size: (f32, f32),
     selection: Option<PaneSelection>,
@@ -716,6 +719,7 @@ impl App {
                 sections: Vec::new(),
                 is_loading: false,
                 last_error: None,
+                ..Default::default()
             };
             return;
         }
@@ -734,6 +738,35 @@ impl App {
                 &plugin.name,
                 &plugin.command,
                 &plugin.args,
+                cfg_json,
+            )
+            .await;
+            let _ = proxy.send_event(UserEvent::DrawerUpdated(snapshot));
+        });
+    }
+
+    fn trigger_drawer_action(
+        &mut self,
+        action_id: String,
+        item_id: Option<String>,
+        input: Option<String>,
+    ) {
+        let plugins = self.enabled_plugins();
+        let Some(plugin) = plugins.get(self.active_plugin_idx).cloned() else {
+            return;
+        };
+        self.drawer_snapshot.is_loading = true;
+        let proxy = self.proxy.clone();
+        let cfg_json = serde_json::to_value(&plugin.config).unwrap_or(serde_json::Value::Null);
+        self.rt.spawn(async move {
+            let snapshot = invoke_plugin_action(
+                &plugin.id,
+                &plugin.name,
+                &plugin.command,
+                &plugin.args,
+                &action_id,
+                item_id,
+                input,
                 cfg_json,
             )
             .await;
@@ -1232,6 +1265,11 @@ impl App {
                 }
             }
             Action::CloseRightDrawer => {
+                if self.drawer_preview_item.take().is_some()
+                    || self.drawer_input_action.take().is_some()
+                {
+                    return;
+                }
                 self.right_drawer_open = false;
                 if self.browser.take().is_some()
                     && let Some(window) = &self.window
@@ -1257,6 +1295,8 @@ impl App {
                     self.active_plugin_idx = (self.active_plugin_idx + 1) % plugins.len();
                     self.drawer_selected_idx = 0;
                     self.drawer_scroll_to_selected = true;
+                    self.drawer_preview_item = None;
+                    self.drawer_input_action = None;
                     self.trigger_drawer_refresh();
                 }
             }
@@ -1267,23 +1307,33 @@ impl App {
                         (self.active_plugin_idx + plugins.len() - 1) % plugins.len();
                     self.drawer_selected_idx = 0;
                     self.drawer_scroll_to_selected = true;
+                    self.drawer_preview_item = None;
+                    self.drawer_input_action = None;
                     self.trigger_drawer_refresh();
                 }
             }
             Action::DrawerOpen => {
-                if let Some(item) = self.selected_drawer_item()
-                    && !item.url.is_empty()
-                {
-                    open_url(&item.url);
+                if let Some(item) = self.selected_drawer_item() {
+                    if !item.url.is_empty() {
+                        open_url(&item.url);
+                    } else if item.body.as_ref().is_some_and(|b| !b.is_empty()) {
+                        self.right_drawer_open = true;
+                        self.drawer_preview_item = Some(item);
+                    }
                 }
             }
             Action::DrawerPreview => {
-                if self.config.features.embedded_browser
-                    && let Some(item) = self.selected_drawer_item()
-                    && !item.url.is_empty()
-                {
-                    self.right_drawer_open = true;
-                    self.pending_browser_url = Some(item.url);
+                if self.drawer_preview_item.take().is_some() {
+                    return;
+                }
+                if let Some(item) = self.selected_drawer_item() {
+                    if item.body.as_ref().is_some_and(|b| !b.is_empty()) {
+                        self.right_drawer_open = true;
+                        self.drawer_preview_item = Some(item);
+                    } else if self.config.features.embedded_browser && !item.url.is_empty() {
+                        self.right_drawer_open = true;
+                        self.pending_browser_url = Some(item.url);
+                    }
                 }
             }
             Action::DrawerSendToPane => {
@@ -1433,7 +1483,7 @@ impl ApplicationHandler<UserEvent> for App {
                     window.request_redraw();
                 }
             }
-            UserEvent::DrawerUpdated(snapshot) => {
+            UserEvent::DrawerUpdated(mut snapshot) => {
                 if let Some(err) = &snapshot.last_error {
                     eprintln!("[conductty drawer error] {err}");
                 }
@@ -1442,12 +1492,32 @@ impl ApplicationHandler<UserEvent> for App {
                     .get(self.active_plugin_idx)
                     .is_none_or(|p| p.id == snapshot.plugin_id);
                 if matches_active {
+                    let effects = std::mem::take(&mut snapshot.effects);
                     self.drawer_snapshot = snapshot;
                     let total = self.drawer_snapshot.total_items();
                     if total == 0 {
                         self.drawer_selected_idx = 0;
                     } else if self.drawer_selected_idx >= total {
                         self.drawer_selected_idx = total - 1;
+                    }
+                    for eff in effects {
+                        match eff {
+                            DrawerEffect::OpenUrl { url } => open_url(&url),
+                            DrawerEffect::PreviewUrl { url } => {
+                                if self.config.features.embedded_browser {
+                                    self.right_drawer_open = true;
+                                    self.pending_browser_url = Some(url);
+                                }
+                            }
+                            DrawerEffect::SendToPane { text } => {
+                                self.send_text_to_focused_pane(&text);
+                            }
+                            DrawerEffect::CopyToClipboard { text } => {
+                                if let Some(cb) = &mut self.clipboard {
+                                    let _ = cb.set_text(text);
+                                }
+                            }
+                        }
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -1944,6 +2014,15 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let mut refresh_requested = false;
                 let mut switch_plugin_idx: Option<usize> = None;
+                let mut preview_body_item: Option<DrawerItem> = None;
+                let mut close_body_preview = false;
+                let mut invoke_action_target: Option<(String, Option<String>, Option<String>)> =
+                    None;
+                let mut prompt_action_target: Option<(String, Option<String>, String)> = None;
+                let mut cancel_action_prompt = false;
+                let mut drawer_input_buf = self.drawer_input_buf.clone();
+                let drawer_input_action = self.drawer_input_action.clone();
+                let drawer_preview_item = self.drawer_preview_item.clone();
                 let mut toggle_left_collapse = false;
                 let can_collapse_left =
                     self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed;
@@ -2327,6 +2406,89 @@ impl ApplicationHandler<UserEvent> for App {
                                     return;
                                 }
 
+                                if let Some(item) = &drawer_preview_item {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("<- List").clicked() {
+                                            close_body_preview = true;
+                                        }
+                                        if ui.small_button("Send to Pane").clicked() {
+                                            send_to_pane_text = Some(format_item_for_pane(item));
+                                        }
+                                        if let Some(body) = &item.body
+                                            && ui.small_button("Copy Body").clicked()
+                                        {
+                                            ui.ctx().copy_text(body.clone());
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("x").clicked() {
+                                                    close_drawer_requested = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.separator();
+                                    if !item.subtitle.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&item.subtitle)
+                                                .small()
+                                                .color(Color32::from_rgb(0x7a, 0xa2, 0xf7)),
+                                        );
+                                    }
+                                    ui.heading(
+                                        egui::RichText::new(&item.title)
+                                            .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
+                                    );
+                                    if !item.actions.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for act in &item.actions {
+                                                if ui.small_button(&act.label).clicked() {
+                                                    if act.needs_input {
+                                                        prompt_action_target = Some((
+                                                            act.id.clone(),
+                                                            Some(item.id.clone()),
+                                                            act.input_placeholder
+                                                                .clone()
+                                                                .unwrap_or_default(),
+                                                        ));
+                                                    } else {
+                                                        invoke_action_target = Some((
+                                                            act.id.clone(),
+                                                            Some(item.id.clone()),
+                                                            None,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    ui.separator();
+                                    let avail_h = (ui.available_height() - 28.0).max(80.0);
+                                    egui::ScrollArea::vertical()
+                                        .max_height(avail_h)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(
+                                                        item.body.as_deref().unwrap_or(""),
+                                                    )
+                                                    .monospace()
+                                                    .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
+                                                )
+                                                .selectable(true),
+                                            );
+                                        });
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("b/Esc: back to list | s: send to pane")
+                                            .small()
+                                            .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                    );
+                                    return;
+                                }
+
                                 if enabled_plugins.len() > 1 {
                                     ui.horizontal_wrapped(|ui| {
                                         for (p_idx, p_cfg) in enabled_plugins.iter().enumerate() {
@@ -2378,6 +2540,49 @@ impl ApplicationHandler<UserEvent> for App {
                                         },
                                     );
                                 });
+                                if !drawer_snapshot.actions.is_empty() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for act in &drawer_snapshot.actions {
+                                            if ui.small_button(&act.label).clicked() {
+                                                if act.needs_input {
+                                                    prompt_action_target = Some((
+                                                        act.id.clone(),
+                                                        None,
+                                                        act.input_placeholder
+                                                            .clone()
+                                                            .unwrap_or_default(),
+                                                    ));
+                                                } else {
+                                                    invoke_action_target =
+                                                        Some((act.id.clone(), None, None));
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                if let Some((act_id, item_id, placeholder)) = &drawer_input_action {
+                                    ui.horizontal(|ui| {
+                                        let edit = egui::TextEdit::singleline(&mut drawer_input_buf)
+                                            .hint_text(placeholder)
+                                            .desired_width(170.0);
+                                        let resp = ui.add(edit);
+                                        resp.request_focus();
+                                        let submit = ui.small_button("OK").clicked()
+                                            || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        let cancel = ui.small_button("Cancel").clicked()
+                                            || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                        if submit && !drawer_input_buf.trim().is_empty() {
+                                            invoke_action_target = Some((
+                                                act_id.clone(),
+                                                item_id.clone(),
+                                                Some(drawer_input_buf.trim().to_string()),
+                                            ));
+                                            cancel_action_prompt = true;
+                                        } else if cancel {
+                                            cancel_action_prompt = true;
+                                        }
+                                    });
+                                }
                                 ui.separator();
 
                                 if let Some(err) = &browser_error {
@@ -2440,7 +2645,10 @@ impl ApplicationHandler<UserEvent> for App {
                                                 scroll_to_selected,
                                                 &mut open_url_target,
                                                 &mut preview_url_target,
+                                                &mut preview_body_item,
                                                 &mut send_to_pane_text,
+                                                &mut invoke_action_target,
+                                                &mut prompt_action_target,
                                             );
                                         }
                                     });
@@ -3249,12 +3457,37 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     need_redraw = true;
                 }
+                self.drawer_input_buf = drawer_input_buf;
+                if close_body_preview {
+                    self.drawer_preview_item = None;
+                    need_redraw = true;
+                }
+                if let Some(item) = preview_body_item {
+                    self.drawer_preview_item = Some(item);
+                    need_redraw = true;
+                }
+                if cancel_action_prompt {
+                    self.drawer_input_action = None;
+                    self.drawer_input_buf.clear();
+                    need_redraw = true;
+                }
+                if let Some(prompt) = prompt_action_target {
+                    self.drawer_input_action = Some(prompt);
+                    self.drawer_input_buf.clear();
+                    need_redraw = true;
+                }
+                if let Some((act_id, item_id, input)) = invoke_action_target {
+                    self.trigger_drawer_action(act_id, item_id, input);
+                    need_redraw = true;
+                }
                 if let Some(p_idx) = switch_plugin_idx
                     && p_idx != self.active_plugin_idx
                 {
                     self.active_plugin_idx = p_idx;
                     self.drawer_selected_idx = 0;
                     self.drawer_scroll_to_selected = true;
+                    self.drawer_preview_item = None;
+                    self.drawer_input_action = None;
                     self.trigger_drawer_refresh();
                     need_redraw = true;
                 }
@@ -3326,7 +3559,10 @@ fn render_drawer_section(
     scroll_to_selected: bool,
     open_url_target: &mut Option<String>,
     preview_url_target: &mut Option<String>,
+    preview_body_item: &mut Option<DrawerItem>,
     send_to_pane_text: &mut Option<String>,
+    invoke_action_target: &mut Option<(String, Option<String>, Option<String>)>,
+    prompt_action_target: &mut Option<(String, Option<String>, String)>,
 ) {
     let accent = parse_drawer_accent(section.accent.as_deref());
     ui.add_space(8.0);
@@ -3388,17 +3624,33 @@ fn render_drawer_section(
                     )
                     .selectable(true),
                 );
-                ui.horizontal(|ui| {
-                    if !item.url.is_empty() {
-                        if ui.small_button("Preview").clicked() {
-                            *preview_url_target = Some(item.url.clone());
+                ui.horizontal_wrapped(|ui| {
+                    if item.body.as_ref().is_some_and(|b| !b.is_empty()) {
+                        if ui.small_button("View").clicked() {
+                            *preview_body_item = Some(item.clone());
                         }
-                        if ui.small_button("Open").clicked() {
-                            *open_url_target = Some(item.url.clone());
-                        }
+                    } else if !item.url.is_empty() && ui.small_button("Preview").clicked() {
+                        *preview_url_target = Some(item.url.clone());
+                    }
+                    if !item.url.is_empty() && ui.small_button("Open").clicked() {
+                        *open_url_target = Some(item.url.clone());
                     }
                     if ui.small_button("Send to Pane").clicked() {
                         *send_to_pane_text = Some(format_item_for_pane(item));
+                    }
+                    for act in &item.actions {
+                        if ui.small_button(&act.label).clicked() {
+                            if act.needs_input {
+                                *prompt_action_target = Some((
+                                    act.id.clone(),
+                                    Some(item.id.clone()),
+                                    act.input_placeholder.clone().unwrap_or_default(),
+                                ));
+                            } else {
+                                *invoke_action_target =
+                                    Some((act.id.clone(), Some(item.id.clone()), None));
+                            }
+                        }
                     }
                 });
             });
@@ -4526,6 +4778,9 @@ fn main() {
         drawer_snapshot: DrawerSnapshot::default(),
         drawer_selected_idx: 0,
         drawer_scroll_to_selected: false,
+        drawer_preview_item: None,
+        drawer_input_action: None,
+        drawer_input_buf: String::new(),
         cursor_pos: Pos2::ZERO,
         cell_size: (10.0, 22.0),
         selection: None,

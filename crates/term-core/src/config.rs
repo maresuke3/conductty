@@ -59,7 +59,18 @@ impl Default for DrawerPluginConfig {
 }
 
 pub fn default_plugins() -> Vec<DrawerPluginConfig> {
-    vec![DrawerPluginConfig::default()]
+    vec![
+        DrawerPluginConfig::default(),
+        DrawerPluginConfig {
+            id: "docs".to_string(),
+            name: "Docs".to_string(),
+            category: "docs".to_string(),
+            command: "conductty-plugin-docs".to_string(),
+            args: Vec::new(),
+            enabled: true,
+            config: toml::Value::Table(toml::map::Map::new()),
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
