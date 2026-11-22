@@ -43,9 +43,10 @@ pub fn validate_http_url(url: &str) -> Result<&str, String> {
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
         return Err("URL must use http:// or https://".to_string());
     }
-    if trimmed.chars().any(|c| {
-        c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')
-    }) {
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
+    {
         return Err("URL contains invalid characters".to_string());
     }
     let after_scheme = trimmed

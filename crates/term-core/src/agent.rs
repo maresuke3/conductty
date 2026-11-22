@@ -302,7 +302,10 @@ pub fn detect_pane_agent(
     }
 
     let kind = detect_explicit_agent_kind(active_lines)
-        .or_else(|| prev.filter(|_| has_active_agent_ui(active_lines)).map(|p| p.kind))
+        .or_else(|| {
+            prev.filter(|_| has_active_agent_ui(active_lines))
+                .map(|p| p.kind)
+        })
         .or_else(|| detect_fallback_agent_kind(active_lines))?;
 
     let last_changed_ms = match prev {
@@ -336,14 +339,14 @@ pub fn detect_pane_agent(
         }
     }
 
-    if status.is_none() {
-        if let Some(last) = active_tail.last() {
-            let lower = last.to_lowercase();
-            if is_done_line(&lower) {
-                status = Some(AgentStatus::Done);
-            } else if is_agent_prompt(last) {
-                status = Some(AgentStatus::Waiting);
-            }
+    if status.is_none()
+        && let Some(last) = active_tail.last()
+    {
+        let lower = last.to_lowercase();
+        if is_done_line(&lower) {
+            status = Some(AgentStatus::Done);
+        } else if is_agent_prompt(last) {
+            status = Some(AgentStatus::Waiting);
         }
     }
 
@@ -417,7 +420,10 @@ mod tests {
             "/quit".to_string(),
             "~/work $".to_string(),
         ];
-        assert_eq!(detect_pane_agent(&exited_lines, 201, 5000, Some(&running)), None);
+        assert_eq!(
+            detect_pane_agent(&exited_lines, 201, 5000, Some(&running)),
+            None
+        );
     }
 
     #[test]

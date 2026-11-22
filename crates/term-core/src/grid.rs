@@ -52,22 +52,86 @@ impl Default for Cell {
 /// TokyoNight Moon 準拠の ANSI 16色パレット
 fn ansi_color(idx: u8) -> Rgb {
     match idx {
-        0 => Rgb { r: 0x1b, g: 0x1d, b: 0x2b }, // Black
-        1 => Rgb { r: 0xff, g: 0x75, b: 0x7f }, // Red
-        2 => Rgb { r: 0xc3, g: 0xe8, b: 0x8d }, // Green
-        3 => Rgb { r: 0xff, g: 0xc7, b: 0x77 }, // Yellow
-        4 => Rgb { r: 0x82, g: 0xaa, b: 0xff }, // Blue
-        5 => Rgb { r: 0xc0, g: 0x99, b: 0xff }, // Magenta
-        6 => Rgb { r: 0x86, g: 0xe1, b: 0xfc }, // Cyan
-        7 => Rgb { r: 0x82, g: 0x8b, b: 0xb8 }, // White
-        8 => Rgb { r: 0x44, g: 0x4a, b: 0x73 }, // Bright Black
-        9 => Rgb { r: 0xff, g: 0x8d, b: 0x94 }, // Bright Red
-        10 => Rgb { r: 0xc7, g: 0xfb, b: 0x6d }, // Bright Green
-        11 => Rgb { r: 0xff, g: 0xd8, b: 0xab }, // Bright Yellow
-        12 => Rgb { r: 0x9a, g: 0xb8, b: 0xff }, // Bright Blue
-        13 => Rgb { r: 0xca, g: 0xab, b: 0xff }, // Bright Magenta
-        14 => Rgb { r: 0xb2, g: 0xeb, b: 0xff }, // Bright Cyan
-        _ => Rgb { r: 0xc8, g: 0xd3, b: 0xf5 }, // Bright White
+        0 => Rgb {
+            r: 0x1b,
+            g: 0x1d,
+            b: 0x2b,
+        }, // Black
+        1 => Rgb {
+            r: 0xff,
+            g: 0x75,
+            b: 0x7f,
+        }, // Red
+        2 => Rgb {
+            r: 0xc3,
+            g: 0xe8,
+            b: 0x8d,
+        }, // Green
+        3 => Rgb {
+            r: 0xff,
+            g: 0xc7,
+            b: 0x77,
+        }, // Yellow
+        4 => Rgb {
+            r: 0x82,
+            g: 0xaa,
+            b: 0xff,
+        }, // Blue
+        5 => Rgb {
+            r: 0xc0,
+            g: 0x99,
+            b: 0xff,
+        }, // Magenta
+        6 => Rgb {
+            r: 0x86,
+            g: 0xe1,
+            b: 0xfc,
+        }, // Cyan
+        7 => Rgb {
+            r: 0x82,
+            g: 0x8b,
+            b: 0xb8,
+        }, // White
+        8 => Rgb {
+            r: 0x44,
+            g: 0x4a,
+            b: 0x73,
+        }, // Bright Black
+        9 => Rgb {
+            r: 0xff,
+            g: 0x8d,
+            b: 0x94,
+        }, // Bright Red
+        10 => Rgb {
+            r: 0xc7,
+            g: 0xfb,
+            b: 0x6d,
+        }, // Bright Green
+        11 => Rgb {
+            r: 0xff,
+            g: 0xd8,
+            b: 0xab,
+        }, // Bright Yellow
+        12 => Rgb {
+            r: 0x9a,
+            g: 0xb8,
+            b: 0xff,
+        }, // Bright Blue
+        13 => Rgb {
+            r: 0xca,
+            g: 0xab,
+            b: 0xff,
+        }, // Bright Magenta
+        14 => Rgb {
+            r: 0xb2,
+            g: 0xeb,
+            b: 0xff,
+        }, // Bright Cyan
+        _ => Rgb {
+            r: 0xc8,
+            g: 0xd3,
+            b: 0xf5,
+        }, // Bright White
     }
 }
 
@@ -146,12 +210,9 @@ impl TerminalGrid {
 
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         let mut replies = Vec::new();
-        let normal_bytes = self.kitty.filter_and_process(
-            bytes,
-            self.cursor_col,
-            self.cursor_row,
-            &mut replies,
-        );
+        let normal_bytes =
+            self.kitty
+                .filter_and_process(bytes, self.cursor_col, self.cursor_row, &mut replies);
         const MAX_PENDING_REPLIES: usize = 256;
         if !replies.is_empty() {
             self.pending_replies.extend(replies);
@@ -243,10 +304,10 @@ impl TerminalGrid {
             };
             let mut line = String::new();
             for col in c_start..=c_end {
-                if let Some(cell) = self.visible_cell(col, row) {
-                    if cell.ch != '\0' {
-                        line.push(cell.ch);
-                    }
+                if let Some(cell) = self.visible_cell(col, row)
+                    && cell.ch != '\0'
+                {
+                    line.push(cell.ch);
                 }
             }
             lines.push(line.trim_end().to_string());
@@ -322,7 +383,10 @@ impl TerminalGrid {
     }
 
     fn apply_sgr(&mut self, params: &Params) {
-        let list: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
+        let list: Vec<u16> = params
+            .iter()
+            .map(|p| p.first().copied().unwrap_or(0))
+            .collect();
         if list.is_empty() {
             self.reset_sgr();
             return;
@@ -615,7 +679,8 @@ impl Perform for TerminalGrid {
                     }
                 }
                 1 => {
-                    let end = (self.cursor_row * self.cols + self.cursor_col + 1).min(self.cells.len());
+                    let end =
+                        (self.cursor_row * self.cols + self.cursor_col + 1).min(self.cells.len());
                     for c in &mut self.cells[..end] {
                         *c = Cell::default();
                     }

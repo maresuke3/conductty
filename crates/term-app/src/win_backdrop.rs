@@ -54,7 +54,8 @@ mod imp {
             let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
             unsafe {
                 let device: IDCompositionDevice =
-                    DCompositionCreateDevice2::<Option<&IUnknown>, IDCompositionDevice>(None).ok()?;
+                    DCompositionCreateDevice2::<Option<&IUnknown>, IDCompositionDevice>(None)
+                        .ok()?;
                 let target = device.CreateTargetForHwnd(hwnd, true).ok()?;
                 let visual = device.CreateVisual().ok()?;
                 target.SetRoot(&visual).ok()?;

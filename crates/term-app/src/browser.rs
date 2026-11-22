@@ -82,9 +82,10 @@ mod imp {
                 );
                 self.window.set_outer_position(pos);
             }
-            let _ = self
-                .window
-                .request_inner_size(LogicalSize::new(bounds.width.max(100.0), bounds.height.max(100.0)));
+            let _ = self.window.request_inner_size(LogicalSize::new(
+                bounds.width.max(100.0),
+                bounds.height.max(100.0),
+            ));
         }
 
         pub fn load_url(&mut self, url: &str) {

@@ -15,8 +15,8 @@ use term_core::agent::{AgentStatus, PaneAgentState, detect_pane_agent, snapshot_
 use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme};
 use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::input::{
-    Action, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode, KeyEvent as CoreKeyEvent,
-    GoToCommand, Modifiers, PerformableContext,
+    Action, GoToCommand, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode,
+    KeyEvent as CoreKeyEvent, Modifiers, PerformableContext,
 };
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
@@ -275,6 +275,8 @@ impl PerformableContext for TabNavCtx<'_> {
     }
 }
 
+type PaneSelection = (PaneId, (usize, usize), (usize, usize));
+
 struct App {
     config: AppConfig,
     theme: ResolvedTheme,
@@ -310,7 +312,7 @@ struct App {
     drawer_scroll_to_selected: bool,
     cursor_pos: Pos2,
     cell_size: (f32, f32),
-    selection: Option<(PaneId, (usize, usize), (usize, usize))>,
+    selection: Option<PaneSelection>,
     selecting: bool,
     clipboard: Option<arboard::Clipboard>,
     browser: Option<EmbeddedBrowser>,
@@ -463,7 +465,9 @@ impl App {
                             match parse_authenticated_request(&line, &ipc_token) {
                                 Ok(req) => {
                                     let (tx, rx) = tokio::sync::oneshot::channel();
-                                    let r = if proxy.send_event(UserEvent::IpcRequest(req, tx)).is_err()
+                                    let r = if proxy
+                                        .send_event(UserEvent::IpcRequest(req, tx))
+                                        .is_err()
                                     {
                                         MuxResponse::Error {
                                             message: "GUI event loop closed".to_string(),
@@ -555,14 +559,14 @@ impl App {
                 MuxResponse::Agents { agents }
             }
             MuxRequest::CapturePane { pane_id } => {
-                if let Some(pane) = self.panes.get(&pane_id) {
-                    if let Ok(g) = pane.grid.lock() {
-                        let (lines, _) = snapshot_visible_lines(&g.snapshot());
-                        return MuxResponse::Captured {
-                            pane_id,
-                            text: lines.join("\n"),
-                        };
-                    }
+                if let Some(pane) = self.panes.get(&pane_id)
+                    && let Ok(g) = pane.grid.lock()
+                {
+                    let (lines, _) = snapshot_visible_lines(&g.snapshot());
+                    return MuxResponse::Captured {
+                        pane_id,
+                        text: lines.join("\n"),
+                    };
                 }
                 MuxResponse::Error {
                     message: format!("pane {pane_id} not found"),
@@ -749,10 +753,10 @@ impl App {
         } else {
             String::new()
         };
-        if !text.is_empty() {
-            if let Some(cb) = &mut self.clipboard {
-                let _ = cb.set_text(text);
-            }
+        if !text.is_empty()
+            && let Some(cb) = &mut self.clipboard
+        {
+            let _ = cb.set_text(text);
         }
     }
 
@@ -760,26 +764,26 @@ impl App {
         let Some(cb) = &mut self.clipboard else {
             return;
         };
-        if let Ok(text) = cb.get_text() {
-            if !text.is_empty() {
-                let normalized = text.replace("\r\n", "\n");
-                let focused = self.manager.active_tab().focused_pane;
-                if let Some(pane) = self.panes.get_mut(&focused) {
-                    let bracketed = if let Ok(mut g) = pane.grid.lock() {
-                        g.reset_scroll();
-                        g.bracketed_paste
-                    } else {
-                        false
-                    };
-                    if bracketed {
-                        let mut payload = Vec::with_capacity(normalized.len() + 12);
-                        payload.extend_from_slice(b"\x1b[200~");
-                        payload.extend_from_slice(normalized.as_bytes());
-                        payload.extend_from_slice(b"\x1b[201~");
-                        let _ = pane.pty.write_bytes(&payload);
-                    } else {
-                        let _ = pane.pty.write_bytes(normalized.as_bytes());
-                    }
+        if let Ok(text) = cb.get_text()
+            && !text.is_empty()
+        {
+            let normalized = text.replace("\r\n", "\n");
+            let focused = self.manager.active_tab().focused_pane;
+            if let Some(pane) = self.panes.get_mut(&focused) {
+                let bracketed = if let Ok(mut g) = pane.grid.lock() {
+                    g.reset_scroll();
+                    g.bracketed_paste
+                } else {
+                    false
+                };
+                if bracketed {
+                    let mut payload = Vec::with_capacity(normalized.len() + 12);
+                    payload.extend_from_slice(b"\x1b[200~");
+                    payload.extend_from_slice(normalized.as_bytes());
+                    payload.extend_from_slice(b"\x1b[201~");
+                    let _ = pane.pty.write_bytes(&payload);
+                } else {
+                    let _ = pane.pty.write_bytes(normalized.as_bytes());
                 }
             }
         }
@@ -830,8 +834,9 @@ impl App {
     }
 
     fn ensure_mux_server_and_attach(&mut self) {
-        if let Ok(MuxResponse::State { manager, snapshots }) =
-            self.rt.block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Attach))
+        if let Ok(MuxResponse::State { manager, snapshots }) = self
+            .rt
+            .block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Attach))
         {
             self.manager = manager;
             self.mux_snapshots = snapshots.into_iter().collect();
@@ -860,8 +865,9 @@ impl App {
                 Ok(_) => {
                     for _ in 0..20 {
                         std::thread::sleep(std::time::Duration::from_millis(100));
-                        if let Ok(MuxResponse::State { manager, snapshots }) =
-                            self.rt.block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Attach))
+                        if let Ok(MuxResponse::State { manager, snapshots }) = self
+                            .rt
+                            .block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Attach))
                         {
                             self.manager = manager;
                             self.mux_snapshots = snapshots.into_iter().collect();
@@ -912,8 +918,9 @@ impl App {
     }
 
     fn send_mux_action(&mut self, req: MuxRequest) {
-        if let Ok(MuxResponse::State { manager, snapshots }) =
-            self.rt.block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &req))
+        if let Ok(MuxResponse::State { manager, snapshots }) = self
+            .rt
+            .block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &req))
         {
             self.manager = manager;
             self.mux_snapshots = snapshots.into_iter().collect();
@@ -957,11 +964,7 @@ impl App {
                 bytes: payload.into_bytes(),
             });
         } else if let Some(pane) = self.panes.get_mut(&focused) {
-            let bracketed = pane
-                .grid
-                .lock()
-                .map(|g| g.bracketed_paste)
-                .unwrap_or(false);
+            let bracketed = pane.grid.lock().map(|g| g.bracketed_paste).unwrap_or(false);
             if bracketed {
                 let wrapped = format!("\x1b[200~{text}\x1b[201~");
                 let _ = pane.pty.write_bytes(wrapped.as_bytes());
@@ -1127,7 +1130,9 @@ impl App {
                 if self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed {
                     self.left_drawer_mode = match self.left_drawer_mode {
                         LeftDrawerMode::Always => LeftDrawerMode::Collapsed,
-                        LeftDrawerMode::Collapsed | LeftDrawerMode::Hidden => LeftDrawerMode::Always,
+                        LeftDrawerMode::Collapsed | LeftDrawerMode::Hidden => {
+                            LeftDrawerMode::Always
+                        }
                     };
                 }
                 self.router.mode = InputMode::Normal;
@@ -1193,10 +1198,10 @@ impl App {
             }
             Action::CloseRightDrawer => {
                 self.right_drawer_open = false;
-                if self.browser.take().is_some() {
-                    if let Some(window) = &self.window {
-                        window.focus_window();
-                    }
+                if self.browser.take().is_some()
+                    && let Some(window) = &self.window
+                {
+                    window.focus_window();
                 }
                 self.router.mode = InputMode::Normal;
             }
@@ -1217,11 +1222,11 @@ impl App {
                 }
             }
             Action::DrawerPreview => {
-                if self.config.features.embedded_browser {
-                    if let Some(item) = self.selected_drawer_item() {
-                        self.right_drawer_open = true;
-                        self.pending_browser_url = Some(item.url);
-                    }
+                if self.config.features.embedded_browser
+                    && let Some(item) = self.selected_drawer_item()
+                {
+                    self.right_drawer_open = true;
+                    self.pending_browser_url = Some(item.url);
                 }
             }
             Action::DrawerSendToPane => {
@@ -1274,7 +1279,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             // 全 OS で背景・UI パネルのみをピクセル単位透過させる（Windows は DirectComposition + patched wgpu-hal を使用）
-            let is_wslg = cfg!(target_os = "linux") && std::env::var_os("WSL_DISTRO_NAME").is_some();
+            let is_wslg =
+                cfg!(target_os = "linux") && std::env::var_os("WSL_DISTRO_NAME").is_some();
             let transparent = self.config.appearance.background_opacity < 0.999 && !is_wslg;
             #[allow(unused_mut)]
             let mut attrs = WindowAttributes::default()
@@ -1322,18 +1328,18 @@ impl ApplicationHandler<UserEvent> for App {
             if self.mux_snapshots.is_empty() {
                 self.ensure_mux_server_and_attach();
             }
-        } else if self.panes.is_empty() {
-            if let Some(first_id) = self.spawn_pane() {
-                self.manager = WorkspaceManager::new(first_id);
-                // 前回セッションの Workspace 名を復元する (index 0 は Master Space 固定)
-                if let Some(names) = load_saved_workspace_names() {
-                    for name in names.into_iter().skip(1) {
-                        if let Some(pid) = self.spawn_pane() {
-                            self.manager.add_workspace(name, pid);
-                        }
+        } else if self.panes.is_empty()
+            && let Some(first_id) = self.spawn_pane()
+        {
+            self.manager = WorkspaceManager::new(first_id);
+            // 前回セッションの Workspace 名を復元する (index 0 は Master Space 固定)
+            if let Some(names) = load_saved_workspace_names() {
+                for name in names.into_iter().skip(1) {
+                    if let Some(pid) = self.spawn_pane() {
+                        self.manager.add_workspace(name, pid);
                     }
-                    self.manager.switch_workspace(0);
                 }
+                self.manager.switch_workspace(0);
             }
         }
         if let Some(window) = &self.window {
@@ -1419,11 +1425,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if self
-            .browser
-            .as_ref()
-            .is_some_and(|b| b.window_id() == id)
-        {
+        if self.browser.as_ref().is_some_and(|b| b.window_id() == id) {
             if matches!(event, WindowEvent::CloseRequested) {
                 self.browser = None;
                 if let Some(window) = &self.window {
@@ -1471,16 +1473,14 @@ impl ApplicationHandler<UserEvent> for App {
                     self.cursor_pos =
                         Pos2::new(position.x as f32 / scale, position.y as f32 / scale);
                 }
-                if self.selecting {
-                    if let Some((pane_id, col, row)) = self.hit_test_cell(self.cursor_pos) {
-                        if let Some((sel_pane, start, _)) = self.selection {
-                            if sel_pane == pane_id {
-                                self.selection = Some((sel_pane, start, (col, row)));
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
-                            }
-                        }
+                if self.selecting
+                    && let Some((pane_id, col, row)) = self.hit_test_cell(self.cursor_pos)
+                    && let Some((sel_pane, start, _)) = self.selection
+                    && sel_pane == pane_id
+                {
+                    self.selection = Some((sel_pane, start, (col, row)));
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
                     }
                 }
             }
@@ -1498,12 +1498,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
-                    (MouseButton::Left, ElementState::Released) => {
-                        if self.selecting {
-                            self.selecting = false;
-                            if self.config.features.copy_on_select {
-                                self.copy_selection();
-                            }
+                    (MouseButton::Left, ElementState::Released) if self.selecting => {
+                        self.selecting = false;
+                        if self.config.features.copy_on_select {
+                            self.copy_selection();
                         }
                     }
                     _ => {}
@@ -1518,13 +1516,13 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     if lines != 0 {
                         let focused = self.manager.active_tab().focused_pane;
-                        if let Some(pane) = self.panes.get(&focused) {
-                            if let Ok(mut g) = pane.grid.lock() {
-                                if lines > 0 {
-                                    g.scroll_up(lines as usize);
-                                } else {
-                                    g.scroll_down((-lines) as usize);
-                                }
+                        if let Some(pane) = self.panes.get(&focused)
+                            && let Ok(mut g) = pane.grid.lock()
+                        {
+                            if lines > 0 {
+                                g.scroll_up(lines as usize);
+                            } else {
+                                g.scroll_down((-lines) as usize);
                             }
                         }
                         if let Some(window) = &self.window {
@@ -1619,9 +1617,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.go_to_query.pop();
                                 self.go_to_selected_idx = 0;
                             }
-                            Key::Named(NamedKey::Space)
-                                if !ctrl && !self.modifiers.alt_key() =>
-                            {
+                            Key::Named(NamedKey::Space) if !ctrl && !self.modifiers.alt_key() => {
                                 self.go_to_query.push(' ');
                                 self.go_to_selected_idx = 0;
                             }
@@ -1649,9 +1645,9 @@ impl ApplicationHandler<UserEvent> for App {
                             self.keybind_hints_open = false;
                         }
                         Key::Named(NamedKey::ArrowDown) => {
-                            self.keybind_hints_scroll_offset =
-                                (self.keybind_hints_scroll_offset + 28.0)
-                                    .min(self.keybind_hints_max_scroll);
+                            self.keybind_hints_scroll_offset = (self.keybind_hints_scroll_offset
+                                + 28.0)
+                                .min(self.keybind_hints_max_scroll);
                         }
                         Key::Named(NamedKey::ArrowUp) => {
                             self.keybind_hints_scroll_offset =
@@ -1662,15 +1658,19 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Key::Character(s)
                             if (s == "j" && !ctrl)
-                                || (ctrl && (s.eq_ignore_ascii_case("j") || s.eq_ignore_ascii_case("n"))) =>
+                                || (ctrl
+                                    && (s.eq_ignore_ascii_case("j")
+                                        || s.eq_ignore_ascii_case("n"))) =>
                         {
-                            self.keybind_hints_scroll_offset =
-                                (self.keybind_hints_scroll_offset + 28.0)
-                                    .min(self.keybind_hints_max_scroll);
+                            self.keybind_hints_scroll_offset = (self.keybind_hints_scroll_offset
+                                + 28.0)
+                                .min(self.keybind_hints_max_scroll);
                         }
                         Key::Character(s)
                             if (s == "k" && !ctrl)
-                                || (ctrl && (s.eq_ignore_ascii_case("k") || s.eq_ignore_ascii_case("p"))) =>
+                                || (ctrl
+                                    && (s.eq_ignore_ascii_case("k")
+                                        || s.eq_ignore_ascii_case("p"))) =>
                         {
                             self.keybind_hints_scroll_offset =
                                 (self.keybind_hints_scroll_offset - 28.0).max(0.0);
@@ -1690,25 +1690,25 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if self.pane_mode_active {
-                    if let Key::Character(s) = &event.logical_key {
-                        if let Ok(num) = s.parse::<PaneId>() {
-                            let exists = if self.config.features.multiplexer_mode {
-                                self.mux_snapshots.contains_key(&num)
+                    if let Key::Character(s) = &event.logical_key
+                        && let Ok(num) = s.parse::<PaneId>()
+                    {
+                        let exists = if self.config.features.multiplexer_mode {
+                            self.mux_snapshots.contains_key(&num)
+                        } else {
+                            self.panes.contains_key(&num)
+                        };
+                        if exists {
+                            if self.config.features.multiplexer_mode {
+                                self.send_mux_action(MuxRequest::FocusPane { pane_id: num });
                             } else {
-                                self.panes.contains_key(&num)
-                            };
-                            if exists {
-                                if self.config.features.multiplexer_mode {
-                                    self.send_mux_action(MuxRequest::FocusPane { pane_id: num });
-                                } else {
-                                    self.manager.active_tab_mut().focused_pane = num;
-                                }
-                                self.pane_mode_active = false;
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
-                                return;
+                                self.manager.active_tab_mut().focused_pane = num;
                             }
+                            self.pane_mode_active = false;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
                         }
                     }
                     if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
@@ -1814,7 +1814,14 @@ impl ApplicationHandler<UserEvent> for App {
                     .manager
                     .workspaces
                     .iter()
-                    .map(|ws| (ws.name.clone(), ws.tabs.len(), ws.active_tab, ws.pane_count()))
+                    .map(|ws| {
+                        (
+                            ws.name.clone(),
+                            ws.tabs.len(),
+                            ws.active_tab,
+                            ws.pane_count(),
+                        )
+                    })
                     .collect();
                 let mut agent_entries: Vec<(usize, String, usize, PaneId, bool, PaneAgentState)> =
                     Vec::new();
@@ -3002,7 +3009,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // 「あ」固定になるのを防ぐため、端末用 IME 出力を常に Some に保つ
                 let mut platform_output = std::mem::take(&mut full_output.platform_output);
                 if platform_output.ime.is_none() {
-                    let cursor_rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(10.0, 20.0));
+                    let cursor_rect =
+                        Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(10.0, 20.0));
                     platform_output.ime = Some(egui::output::IMEOutput {
                         rect: cursor_rect,
                         cursor_rect,
@@ -3043,19 +3051,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some((idx, new_name)) = commit_rename {
                     if self.config.features.multiplexer_mode {
-                        self.send_mux_action(MuxRequest::RenameWorkspace { idx, name: new_name });
+                        self.send_mux_action(MuxRequest::RenameWorkspace {
+                            idx,
+                            name: new_name,
+                        });
                     } else {
                         self.manager.rename_workspace(idx, new_name);
                     }
                     self.renaming_workspace_idx = None;
                     need_redraw = true;
                 }
-                if let Some(idx) = start_rename_idx {
-                    if let Some(ws) = self.manager.workspaces.get(idx) {
-                        self.rename_buf = ws.name.clone();
-                        self.renaming_workspace_idx = Some(idx);
-                        need_redraw = true;
-                    }
+                if let Some(idx) = start_rename_idx
+                    && let Some(ws) = self.manager.workspaces.get(idx)
+                {
+                    self.rename_buf = ws.name.clone();
+                    self.renaming_workspace_idx = Some(idx);
+                    need_redraw = true;
                 }
                 if let Some(idx) = close_ws_idx {
                     if self.config.features.multiplexer_mode {
@@ -3129,19 +3140,19 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if close_drawer_requested {
                     self.right_drawer_open = false;
-                    if self.browser.take().is_some() {
-                        if let Some(w) = &self.window {
-                            w.focus_window();
-                        }
+                    if self.browser.take().is_some()
+                        && let Some(w) = &self.window
+                    {
+                        w.focus_window();
                     }
                     self.router.mode = InputMode::Normal;
                     need_redraw = true;
                 }
                 if close_browser_requested {
-                    if self.browser.take().is_some() {
-                        if let Some(w) = &self.window {
-                            w.focus_window();
-                        }
+                    if self.browser.take().is_some()
+                        && let Some(w) = &self.window
+                    {
+                        w.focus_window();
                     }
                     need_redraw = true;
                 }
@@ -3179,10 +3190,8 @@ impl ApplicationHandler<UserEvent> for App {
                         need_redraw = true;
                     }
                 }
-                if need_redraw {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                if need_redraw && let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
             _ => {}
@@ -3190,6 +3199,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_github_section(
     ui: &mut egui::Ui,
     heading: &str,
@@ -3281,7 +3291,7 @@ fn render_grid_snapshot(
     row_h: f32,
     font_id: &FontId,
     is_focused: bool,
-    selection: Option<(PaneId, (usize, usize), (usize, usize))>,
+    selection: Option<PaneSelection>,
 ) {
     let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
 
@@ -3297,12 +3307,7 @@ fn render_grid_snapshot(
             if let Some(bg_rgb) = cell.bg {
                 let mut end_col = col + 1;
                 while end_col < snap.cols {
-                    if snap
-                        .cells
-                        .get(row_start + end_col)
-                        .and_then(|c| c.bg)
-                        == Some(bg_rgb)
-                    {
+                    if snap.cells.get(row_start + end_col).and_then(|c| c.bg) == Some(bg_rgb) {
                         end_col += 1;
                     } else {
                         break;
@@ -3409,8 +3414,8 @@ fn filtered_go_to_items(manager: &WorkspaceManager, query: &str) -> Vec<GoToItem
         for (tab_idx, tab) in ws.tabs.iter().enumerate() {
             for pane_id in tab.all_panes() {
                 if !q.is_empty() {
-                    let hay = format!("{} tab {} pane {}", ws.name, tab_idx + 1, pane_id)
-                        .to_lowercase();
+                    let hay =
+                        format!("{} tab {} pane {}", ws.name, tab_idx + 1, pane_id).to_lowercase();
                     if !hay.contains(&q) {
                         continue;
                     }
@@ -3476,10 +3481,7 @@ fn draw_box_drawing(painter: &egui::Painter, ch: char, rect: Rect, color: Color3
         Pos2::new(cx - ht, cy - ht),
         Pos2::new(cx + ht, rect.bottom()),
     );
-    let h_left = Rect::from_min_max(
-        Pos2::new(rect.left(), cy - ht),
-        Pos2::new(cx + ht, cy + ht),
-    );
+    let h_left = Rect::from_min_max(Pos2::new(rect.left(), cy - ht), Pos2::new(cx + ht, cy + ht));
     let h_right = Rect::from_min_max(
         Pos2::new(cx - ht, cy - ht),
         Pos2::new(rect.right(), cy + ht),
@@ -3583,7 +3585,11 @@ fn draw_box_drawing(painter: &egui::Painter, ch: char, rect: Rect, color: Color3
 fn session_file_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     if let Ok(appdata) = std::env::var("APPDATA") {
-        return Some(PathBuf::from(appdata).join("conductty").join("session.json"));
+        return Some(
+            PathBuf::from(appdata)
+                .join("conductty")
+                .join("session.json"),
+        );
     }
     std::env::var("HOME")
         .ok()
@@ -3599,9 +3605,11 @@ fn load_saved_workspace_names() -> Option<Vec<String>> {
 #[cfg(not(target_os = "windows"))]
 fn load_window_icon(size: u32) -> Option<winit::window::Icon> {
     let bytes = include_bytes!("../../../assets/app-icon-256.png");
-    let img = image::load_from_memory(bytes)
-        .ok()?
-        .resize_exact(size, size, image::imageops::FilterType::Lanczos3);
+    let img = image::load_from_memory(bytes).ok()?.resize_exact(
+        size,
+        size,
+        image::imageops::FilterType::Lanczos3,
+    );
     let rgba = img.into_rgba8();
     let (w, h) = rgba.dimensions();
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
@@ -3666,9 +3674,20 @@ fn configure_fonts(ctx: &egui::Context, families: &[String]) {
 
     // 日本語 UI（GitHub カードの日本語タイトル等）用にフォールバック日本語フォントも探す
     let mut jp_fallbacks = Vec::new();
-    for jp_name in ["Cica", "NotoSansCJK", "NotoSansJP", "BIZUDGothic", "Meiryo", "YuGothic", "Hiragino"] {
+    for jp_name in [
+        "Cica",
+        "NotoSansCJK",
+        "NotoSansJP",
+        "BIZUDGothic",
+        "Meiryo",
+        "YuGothic",
+        "Hiragino",
+    ] {
         let key = format!("conductty-jp-{jp_name}");
-        if fonts.font_data.contains_key(&format!("conductty-{jp_name}")) {
+        if fonts
+            .font_data
+            .contains_key(&format!("conductty-{jp_name}"))
+        {
             jp_fallbacks.push(format!("conductty-{jp_name}"));
             break;
         }
@@ -3681,11 +3700,11 @@ fn configure_fonts(ctx: &egui::Context, families: &[String]) {
         }
     }
 
-    if !loaded_names.is_empty() {
-        if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
-            for (idx, name) in loaded_names.into_iter().enumerate() {
-                mono.insert(idx, name);
-            }
+    if !loaded_names.is_empty()
+        && let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace)
+    {
+        for (idx, name) in loaded_names.into_iter().enumerate() {
+            mono.insert(idx, name);
         }
     }
 
@@ -3779,12 +3798,7 @@ fn find_font_bytes(dirs: &[PathBuf], family: &str) -> Option<Vec<u8>> {
     std::fs::read(&path).ok()
 }
 
-fn collect_best_font(
-    dir: &PathBuf,
-    target: &str,
-    depth: usize,
-    best: &mut Option<(i32, PathBuf)>,
-) {
+fn collect_best_font(dir: &PathBuf, target: &str, depth: usize, best: &mut Option<(i32, PathBuf)>) {
     if depth > 3 || !dir.is_dir() {
         return;
     }
@@ -3906,10 +3920,10 @@ fn resolve_core_key_code(
     // key_without_modifiers() を優先し、さらに物理キーへフォールバックする。
     let has_shortcut_mod = mods.alt_key() || mods.control_key() || mods.super_key();
     if has_shortcut_mod || matches!(logical_key, Key::Dead(_)) {
-        if let Some(code) = key_to_core_code(unmodified_key, mods) {
-            if !matches!(code, CoreKeyCode::Char(c) if !c.is_ascii()) {
-                return Some(code);
-            }
+        if let Some(code) = key_to_core_code(unmodified_key, mods)
+            && !matches!(code, CoreKeyCode::Char(c) if !c.is_ascii())
+        {
+            return Some(code);
         }
         if let Some(code) = physical_key_to_core_code(physical_key) {
             return Some(code);
@@ -3973,7 +3987,12 @@ fn print_cli_help() {
     );
 }
 
-fn send_cli_action_ok(args: &[String], req: &MuxRequest, rt: &tokio::runtime::Runtime, ok_msg: &str) -> i32 {
+fn send_cli_action_ok(
+    args: &[String],
+    req: &MuxRequest,
+    rt: &tokio::runtime::Runtime,
+    ok_msg: &str,
+) -> i32 {
     match send_ipc_with_wsl_fallback(args, req, rt) {
         Ok(MuxResponse::Ok { .. }) | Ok(MuxResponse::State { .. }) => {
             println!("{ok_msg}");
@@ -4007,7 +4026,10 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
                 Ok(MuxResponse::Panes { panes }) => {
                     for p in panes {
                         let mark = if p.focused { " *" } else { "" };
-                        println!("[{}] {} / Tab {}{}", p.pane_id, p.workspace, p.tab_index, mark);
+                        println!(
+                            "[{}] {} / Tab {}{}",
+                            p.pane_id, p.workspace, p.tab_index, mark
+                        );
                     }
                     Some(0)
                 }
@@ -4137,20 +4159,19 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
                     Some(0)
                 }
                 Ok(MuxResponse::Ok { .. }) => {
-                    if let Some(name) = args.get(2) {
-                        if let Ok(MuxResponse::Spaces { spaces }) =
+                    if let Some(name) = args.get(2)
+                        && let Ok(MuxResponse::Spaces { spaces }) =
                             send_ipc_with_wsl_fallback(args, &MuxRequest::ListSpaces, rt)
-                        {
-                            let new_idx = spaces.len().saturating_sub(1);
-                            let _ = send_ipc_with_wsl_fallback(
-                                args,
-                                &MuxRequest::RenameWorkspace {
-                                    idx: new_idx,
-                                    name: name.clone(),
-                                },
-                                rt,
-                            );
-                        }
+                    {
+                        let new_idx = spaces.len().saturating_sub(1);
+                        let _ = send_ipc_with_wsl_fallback(
+                            args,
+                            &MuxRequest::RenameWorkspace {
+                                idx: new_idx,
+                                name: name.clone(),
+                            },
+                            rt,
+                        );
                     }
                     println!("created new space");
                     Some(0)
@@ -4247,7 +4268,11 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
                 return Some(2);
             };
             let raw_text = args.get(3).map(String::as_str).unwrap_or("");
-            let text = raw_text.replace("\\r\\n", "\r").replace("\\n", "\r").replace("\\r", "\r").replace('\n', "\r");
+            let text = raw_text
+                .replace("\\r\\n", "\r")
+                .replace("\\n", "\r")
+                .replace("\\r", "\r")
+                .replace('\n', "\r");
             let req = MuxRequest::SendKeys {
                 pane_id: Some(pane_id),
                 text,
@@ -4274,7 +4299,11 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
         }
         ("broadcast", _) => {
             let raw_text = args.get(2).map(String::as_str).unwrap_or("");
-            let text = raw_text.replace("\\r\\n", "\r").replace("\\n", "\r").replace("\\r", "\r").replace('\n', "\r");
+            let text = raw_text
+                .replace("\\r\\n", "\r")
+                .replace("\\n", "\r")
+                .replace("\\r", "\r")
+                .replace('\n', "\r");
             let req = MuxRequest::SendKeys {
                 pane_id: None,
                 text,
@@ -4480,8 +4509,14 @@ mod tests {
 
     #[test]
     fn agent_scan_throttles_under_250ms_even_when_empty() {
-        assert!(should_throttle_agent_scan(std::time::Duration::from_millis(0)));
-        assert!(should_throttle_agent_scan(std::time::Duration::from_millis(249)));
-        assert!(!should_throttle_agent_scan(std::time::Duration::from_millis(250)));
+        assert!(should_throttle_agent_scan(
+            std::time::Duration::from_millis(0)
+        ));
+        assert!(should_throttle_agent_scan(
+            std::time::Duration::from_millis(249)
+        ));
+        assert!(!should_throttle_agent_scan(
+            std::time::Duration::from_millis(250)
+        ));
     }
 }

@@ -342,12 +342,11 @@ impl InputRouter {
         self.mode = InputMode::Normal;
         for binding in &self.prefix_bindings {
             if binding.matches(event) {
-                if binding.performable {
-                    if let Action::GotoSplit(dir) = binding.action {
-                        if !ctx.can_goto_split(dir) {
-                            continue;
-                        }
-                    }
+                if binding.performable
+                    && let Action::GotoSplit(dir) = binding.action
+                    && !ctx.can_goto_split(dir)
+                {
+                    continue;
                 }
                 match binding.action {
                     Action::EnterPaneMoveMode => self.mode = InputMode::PaneMove,
@@ -374,7 +373,11 @@ impl InputRouter {
 
     fn route_left_drawer_mode(&mut self, event: &KeyEvent) -> InputDecision {
         let m = event.mods;
-        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('e') | KeyCode::Char('E')) {
+        if m.ctrl
+            && m.shift
+            && !m.alt
+            && matches!(event.code, KeyCode::Char('e') | KeyCode::Char('E'))
+        {
             self.mode = InputMode::Normal;
             return InputDecision::Execute(Action::ExitLeftDrawerMode);
         }
@@ -394,9 +397,7 @@ impl InputRouter {
                 InputDecision::Execute(Action::LeftDrawerNext)
             }
             (KeyCode::Char('k') | KeyCode::Char('K'), false, false, false)
-            | (KeyCode::Up, false, false, false) => {
-                InputDecision::Execute(Action::LeftDrawerPrev)
-            }
+            | (KeyCode::Up, false, false, false) => InputDecision::Execute(Action::LeftDrawerPrev),
             (KeyCode::Enter, false, false, false) | (KeyCode::Space, false, false, false) => {
                 self.mode = InputMode::Normal;
                 InputDecision::Execute(Action::LeftDrawerSelect)
@@ -418,23 +419,27 @@ impl InputRouter {
 
     fn route_right_drawer_mode(&mut self, event: &KeyEvent) -> InputDecision {
         let m = event.mods;
-        if m.ctrl && m.shift && !m.alt && matches!(event.code, KeyCode::Char('g') | KeyCode::Char('G')) {
+        if m.ctrl
+            && m.shift
+            && !m.alt
+            && matches!(event.code, KeyCode::Char('g') | KeyCode::Char('G'))
+        {
             self.mode = InputMode::Normal;
             return InputDecision::Execute(Action::CloseRightDrawer);
         }
 
         match (&event.code, m.ctrl, m.shift, m.alt) {
-            (KeyCode::Escape, _, _, _) | (KeyCode::Char('q') | KeyCode::Char('Q'), false, false, false) => {
+            (KeyCode::Escape, _, _, _)
+            | (KeyCode::Char('q') | KeyCode::Char('Q'), false, false, false) => {
                 self.mode = InputMode::Normal;
                 InputDecision::Execute(Action::CloseRightDrawer)
             }
-            (KeyCode::Char('j') | KeyCode::Char('J'), false, false, false) | (KeyCode::Down, false, false, false) => {
-                InputDecision::Execute(Action::DrawerNext)
-            }
-            (KeyCode::Char('k') | KeyCode::Char('K'), false, false, false) | (KeyCode::Up, false, false, false) => {
-                InputDecision::Execute(Action::DrawerPrev)
-            }
-            (KeyCode::Enter, false, false, false) | (KeyCode::Char('o') | KeyCode::Char('O'), false, false, false) => {
+            (KeyCode::Char('j') | KeyCode::Char('J'), false, false, false)
+            | (KeyCode::Down, false, false, false) => InputDecision::Execute(Action::DrawerNext),
+            (KeyCode::Char('k') | KeyCode::Char('K'), false, false, false)
+            | (KeyCode::Up, false, false, false) => InputDecision::Execute(Action::DrawerPrev),
+            (KeyCode::Enter, false, false, false)
+            | (KeyCode::Char('o') | KeyCode::Char('O'), false, false, false) => {
                 InputDecision::Execute(Action::DrawerOpen)
             }
             (KeyCode::Char('b') | KeyCode::Char('B'), false, false, false) => {
@@ -509,12 +514,11 @@ impl InputRouter {
     ) -> InputDecision {
         for binding in &self.normal_bindings {
             if binding.matches(event) {
-                if binding.performable {
-                    if let Action::GotoSplit(dir) = binding.action {
-                        if !ctx.can_goto_split(dir) {
-                            continue;
-                        }
-                    }
+                if binding.performable
+                    && let Action::GotoSplit(dir) = binding.action
+                    && !ctx.can_goto_split(dir)
+                {
+                    continue;
                 }
                 match binding.action {
                     Action::EnterPaneMoveMode => self.mode = InputMode::PaneMove,
@@ -770,7 +774,10 @@ mod tests {
             mods: mods(true, false, true),
             left_alt: false,
         };
-        assert_eq!(router.route(&ev, &ctx), InputDecision::Execute(Action::NewTab));
+        assert_eq!(
+            router.route(&ev, &ctx),
+            InputDecision::Execute(Action::NewTab)
+        );
     }
 
     #[test]

@@ -165,10 +165,13 @@ impl KittyState {
                 .get("q")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            if quiet < 2 {
-                if let Some(id) = self.chunk_params.get("i").and_then(|s| s.parse::<u32>().ok()) {
-                    replies.push(format!("\x1b_Gi={id};EINVAL:payload too large\x1b\\").into_bytes());
-                }
+            if quiet < 2
+                && let Some(id) = self
+                    .chunk_params
+                    .get("i")
+                    .and_then(|s| s.parse::<u32>().ok())
+            {
+                replies.push(format!("\x1b_Gi={id};EINVAL:payload too large\x1b\\").into_bytes());
             }
             self.chunk_buf = Vec::new();
             self.chunk_params.clear();
@@ -347,7 +350,7 @@ fn decode_kitty_image(
                 return None;
             }
             let mut rgba = Vec::with_capacity(rgba_len);
-            for chunk in raw.chunks_exact(3) {
+            for chunk in raw.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             Some(KittyImage {

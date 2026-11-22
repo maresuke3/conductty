@@ -56,7 +56,10 @@ fn read_verified_token_file(path: &Path) -> Result<Option<String>, String> {
         Err(e) => return Err(format!("failed to stat IPC token: {e}")),
     };
     if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(format!("IPC token path is not a regular file: {}", path.display()));
+        return Err(format!(
+            "IPC token path is not a regular file: {}",
+            path.display()
+        ));
     }
     #[cfg(unix)]
     {
@@ -66,8 +69,8 @@ fn read_verified_token_file(path: &Path) -> Result<Option<String>, String> {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
     }
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read IPC token: {e}"))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read IPC token: {e}"))?;
     let trimmed = content.trim();
     if trimmed.len() >= 32 {
         Ok(Some(trimmed.to_string()))
@@ -77,7 +80,8 @@ fn read_verified_token_file(path: &Path) -> Result<Option<String>, String> {
 }
 
 pub fn read_or_create_ipc_token() -> Result<String, String> {
-    let path = ipc_token_path().ok_or_else(|| "cannot resolve home dir for IPC token".to_string())?;
+    let path =
+        ipc_token_path().ok_or_else(|| "cannot resolve home dir for IPC token".to_string())?;
     read_or_create_ipc_token_at(&path)
 }
 
@@ -118,7 +122,10 @@ pub fn read_or_create_ipc_token_at(path: &Path) -> Result<String, String> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(format!("IPC token file exists but remained empty: {}", path.display()))
+            Err(format!(
+                "IPC token file exists but remained empty: {}",
+                path.display()
+            ))
         }
         Err(e) => Err(format!("failed to create IPC token: {e}")),
     }

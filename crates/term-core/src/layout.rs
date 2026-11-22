@@ -56,7 +56,10 @@ impl Tab {
     }
 
     pub fn split_focused(&mut self, new_pane: PaneId, direction: SplitDirection) -> bool {
-        if self.layout.split_pane(self.focused_pane, new_pane, direction) {
+        if self
+            .layout
+            .split_pane(self.focused_pane, new_pane, direction)
+        {
             self.focused_pane = new_pane;
             self.zoomed = false;
             true
@@ -115,11 +118,9 @@ impl Tab {
         if matches!(self.layout, LayoutNode::Pane(id) if id == target) {
             return false;
         }
-        if self.layout.remove_pane(target) {
-            if self.focused_pane == target {
-                self.focused_pane = self.layout.first_pane();
-                self.zoomed = false;
-            }
+        if self.layout.remove_pane(target) && self.focused_pane == target {
+            self.focused_pane = self.layout.first_pane();
+            self.zoomed = false;
         }
         true
     }
@@ -387,13 +388,7 @@ impl LayoutNode {
                 SplitDirection::Horizontal => {
                     let w1 = area.width * *ratio;
                     let w2 = area.width - w1;
-                    first.collect_rects(
-                        Rect {
-                            width: w1,
-                            ..area
-                        },
-                        out,
-                    );
+                    first.collect_rects(Rect { width: w1, ..area }, out);
                     second.collect_rects(
                         Rect {
                             x: area.x + w1,
@@ -406,13 +401,7 @@ impl LayoutNode {
                 SplitDirection::Vertical => {
                     let h1 = area.height * *ratio;
                     let h2 = area.height - h1;
-                    first.collect_rects(
-                        Rect {
-                            height: h1,
-                            ..area
-                        },
-                        out,
-                    );
+                    first.collect_rects(Rect { height: h1, ..area }, out);
                     second.collect_rects(
                         Rect {
                             y: area.y + h1,

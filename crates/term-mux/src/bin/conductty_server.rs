@@ -85,10 +85,10 @@ impl ServerState {
         for id in exited {
             self.panes.remove(&id);
             self.agent_states.remove(&id);
-            if !self.manager.close_pane(id) {
-                if let Some(new_id) = self.spawn_pane() {
-                    self.manager = WorkspaceManager::new(new_id);
-                }
+            if !self.manager.close_pane(id)
+                && let Some(new_id) = self.spawn_pane()
+            {
+                self.manager = WorkspaceManager::new(new_id);
             }
         }
     }
@@ -179,14 +179,14 @@ impl ServerState {
                 MuxResponse::Agents { agents }
             }
             MuxRequest::CapturePane { pane_id } => {
-                if let Some(pane) = self.panes.get(&pane_id) {
-                    if let Ok(g) = pane.grid.lock() {
-                        let (lines, _) = snapshot_visible_lines(&g.snapshot());
-                        return MuxResponse::Captured {
-                            pane_id,
-                            text: lines.join("\n"),
-                        };
-                    }
+                if let Some(pane) = self.panes.get(&pane_id)
+                    && let Ok(g) = pane.grid.lock()
+                {
+                    let (lines, _) = snapshot_visible_lines(&g.snapshot());
+                    return MuxResponse::Captured {
+                        pane_id,
+                        text: lines.join("\n"),
+                    };
                 }
                 MuxResponse::Error {
                     message: format!("pane {pane_id} not found"),
@@ -423,7 +423,9 @@ async fn main() {
                     Ok(Ok(Some(line))) => line,
                     Ok(Ok(None)) => break,
                     Ok(Err(e)) => {
-                        if let Ok(mut json) = serde_json::to_string(&MuxResponse::Error { message: e }) {
+                        if let Ok(mut json) =
+                            serde_json::to_string(&MuxResponse::Error { message: e })
+                        {
                             json.push('\n');
                             let _ = writer.write_all(json.as_bytes()).await;
                         }

@@ -31,11 +31,10 @@ fn main() {
                     obj_path.to_str().unwrap(),
                 ])
                 .status()
+                && status.success()
             {
-                if status.success() {
-                    println!("cargo:rustc-link-arg-bin=conductty={}", obj_path.display());
-                    break;
-                }
+                println!("cargo:rustc-link-arg-bin=conductty={}", obj_path.display());
+                break;
             }
         }
     } else if target_env == "msvc" {
@@ -47,10 +46,9 @@ fn main() {
                 rc_path.to_str().unwrap(),
             ])
             .status()
+            && status.success()
         {
-            if status.success() {
-                println!("cargo:rustc-link-arg-bin=conductty={}", res_path.display());
-            }
+            println!("cargo:rustc-link-arg-bin=conductty={}", res_path.display());
         }
     }
 }

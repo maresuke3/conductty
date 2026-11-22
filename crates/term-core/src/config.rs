@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct AppConfig {
     pub include: Option<String>,
     pub features: FeaturesConfig,
@@ -17,16 +18,12 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum LeftDrawerMode {
+    #[default]
     Always,
     Collapsed,
     Hidden,
-}
-
-impl Default for LeftDrawerMode {
-    fn default() -> Self {
-        Self::Always
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +54,7 @@ pub struct AppearanceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ThemeColorsConfig {
     pub background: Option<String>,
     pub foreground: Option<String>,
@@ -154,19 +152,6 @@ impl Default for AppearanceConfig {
     }
 }
 
-impl Default for ThemeColorsConfig {
-    fn default() -> Self {
-        Self {
-            background: None,
-            foreground: None,
-            accent: None,
-            drawer_background: None,
-            card_background: None,
-            cursor: None,
-        }
-    }
-}
-
 impl Default for KeybindsConfig {
     fn default() -> Self {
         Self {
@@ -213,20 +198,6 @@ impl Default for WindowConfig {
             save_state: "always".to_string(),
             split_preserve_zoom: "navigation".to_string(),
             macos_option_as_alt: "left".to_string(),
-        }
-    }
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            include: None,
-            features: FeaturesConfig::default(),
-            appearance: AppearanceConfig::default(),
-            theme: ThemeColorsConfig::default(),
-            keybinds: KeybindsConfig::default(),
-            shell: ShellConfig::default(),
-            window: WindowConfig::default(),
         }
     }
 }
@@ -292,7 +263,9 @@ impl TargetOs {
 /// 4. `~/.config.conductty`
 pub fn config_search_paths(home: &Path) -> Vec<PathBuf> {
     vec![
-        home.join(".config").join("conductty").join("config.conductty"),
+        home.join(".config")
+            .join("conductty")
+            .join("config.conductty"),
         home.join(".config").join("config.conductty"),
         home.join(".conductty").join("config.conductty"),
         home.join(".config.conductty"),
@@ -359,7 +332,13 @@ const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 fn is_wsl_unc_path(inc: &str) -> bool {
     let norm: String = inc
         .chars()
-        .map(|c| if c == '/' { '\\' } else { c.to_ascii_lowercase() })
+        .map(|c| {
+            if c == '/' {
+                '\\'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
         .collect();
     norm.starts_with("\\\\wsl.localhost\\") || norm.starts_with("\\\\wsl$\\")
 }
@@ -394,17 +373,20 @@ fn apply_os_overrides(
         let Some(mut section) = os_map.remove(*key) else {
             continue;
         };
-        if depth < 5 {
-            if let (Some(dir), Some(inc)) = (
+        if depth < 5
+            && let (Some(dir), Some(inc)) = (
                 base_dir,
-                section.get("include").and_then(|v| v.as_str()).map(str::to_string),
-            ) {
-                let resolved = resolve_include_path(dir, &inc)?;
-                let mut included =
-                    load_toml_with_include_inner(&resolved, depth + 1, target_os, visited)?;
-                merge_toml(&mut included, section);
-                section = included;
-            }
+                section
+                    .get("include")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            )
+        {
+            let resolved = resolve_include_path(dir, &inc)?;
+            let mut included =
+                load_toml_with_include_inner(&resolved, depth + 1, target_os, visited)?;
+            merge_toml(&mut included, section);
+            section = included;
         }
         merge_toml(val, section);
     }
@@ -433,7 +415,10 @@ fn load_toml_with_include_inner(
 ) -> Result<toml::Value, String> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canonical.clone()) {
-        return Err(format!("cyclic config include detected: {}", path.display()));
+        return Err(format!(
+            "cyclic config include detected: {}",
+            path.display()
+        ));
     }
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("config metadata error ({}): {e}", path.display()))?;
@@ -443,7 +428,11 @@ fn load_toml_with_include_inner(
     }
     if meta.len() > MAX_CONFIG_FILE_BYTES {
         visited.remove(&canonical);
-        return Err(format!("config file too large ({} bytes): {}", meta.len(), path.display()));
+        return Err(format!(
+            "config file too large ({} bytes): {}",
+            meta.len(),
+            path.display()
+        ));
     }
 
     let raw = std::fs::read_to_string(path)
@@ -453,14 +442,13 @@ fn load_toml_with_include_inner(
         .map_err(|e| format!("config parse error ({}): {e}", path.display()))?;
 
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    if depth < 5 {
-        if let Some(inc) = val.get("include").and_then(|v| v.as_str()) {
-            let resolved = resolve_include_path(base_dir, inc)?;
-            let mut base =
-                load_toml_with_include_inner(&resolved, depth + 1, target_os, visited)?;
-            merge_toml(&mut base, val);
-            val = base;
-        }
+    if depth < 5
+        && let Some(inc) = val.get("include").and_then(|v| v.as_str())
+    {
+        let resolved = resolve_include_path(base_dir, inc)?;
+        let mut base = load_toml_with_include_inner(&resolved, depth + 1, target_os, visited)?;
+        merge_toml(&mut base, val);
+        val = base;
     }
     apply_os_overrides(&mut val, target_os, Some(base_dir), depth + 1, visited)?;
     visited.remove(&canonical);
@@ -548,10 +536,20 @@ impl AppConfig {
         if let Some(hex) = self.theme.accent.as_deref().and_then(parse_hex_rgb) {
             base.accent = hex;
         }
-        if let Some(hex) = self.theme.drawer_background.as_deref().and_then(parse_hex_rgb) {
+        if let Some(hex) = self
+            .theme
+            .drawer_background
+            .as_deref()
+            .and_then(parse_hex_rgb)
+        {
             base.drawer_bg = hex;
         }
-        if let Some(hex) = self.theme.card_background.as_deref().and_then(parse_hex_rgb) {
+        if let Some(hex) = self
+            .theme
+            .card_background
+            .as_deref()
+            .and_then(parse_hex_rgb)
+        {
             base.card_bg = hex;
         }
         if let Some(hex) = self.theme.cursor.as_deref().and_then(parse_hex_rgb) {
