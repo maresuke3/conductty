@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use term_core::agent::{PaneAgentState, detect_pane_agent, snapshot_visible_lines};
 use term_core::config::AppConfig;
 use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::layout::{PaneId, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_mux::{
-    DEFAULT_MUX_SERVER_ADDR, MuxRequest, MuxResponse, PaneInfo, SpawnKind, split_dir_for_spawn,
+    AgentInfo, DEFAULT_MUX_SERVER_ADDR, MuxRequest, MuxResponse, PaneInfo, SpaceInfo, SpawnKind,
+    split_dir_for_spawn,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -21,6 +23,8 @@ struct ServerState {
     config: AppConfig,
     manager: WorkspaceManager,
     panes: HashMap<PaneId, ServerPane>,
+    agent_states: HashMap<PaneId, PaneAgentState>,
+    started_at: std::time::Instant,
     next_pane_id: PaneId,
 }
 
@@ -30,6 +34,8 @@ impl ServerState {
             config,
             manager: WorkspaceManager::new(1),
             panes: HashMap::new(),
+            agent_states: HashMap::new(),
+            started_at: std::time::Instant::now(),
             next_pane_id: 1,
         };
         if let Some(first_id) = state.spawn_pane() {
@@ -114,6 +120,69 @@ impl ServerState {
                     }
                 }
                 MuxResponse::Panes { panes }
+            }
+            MuxRequest::ListSpaces => {
+                let active_ws = self.manager.active_workspace;
+                let spaces = self
+                    .manager
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ws)| SpaceInfo {
+                        index,
+                        name: ws.name.clone(),
+                        tabs: ws.tabs.len(),
+                        panes: ws.pane_count(),
+                        active: index == active_ws,
+                    })
+                    .collect();
+                MuxResponse::Spaces { spaces }
+            }
+            MuxRequest::ListAgents => {
+                let now_ms = self.started_at.elapsed().as_millis() as u64;
+                let mut next_states = HashMap::new();
+                let mut agents = Vec::new();
+                for ws in &self.manager.workspaces {
+                    for (t_idx, tab) in ws.tabs.iter().enumerate() {
+                        for pid in tab.all_panes() {
+                            let Some(pane) = self.panes.get(&pid) else {
+                                continue;
+                            };
+                            let Ok(g) = pane.grid.lock() else {
+                                continue;
+                            };
+                            let (lines, hash) = snapshot_visible_lines(&g.snapshot());
+                            let prev = self.agent_states.get(&pid);
+                            if let Some(st) = detect_pane_agent(&lines, hash, now_ms, prev) {
+                                agents.push(AgentInfo {
+                                    pane_id: pid,
+                                    workspace: ws.name.clone(),
+                                    tab_index: t_idx + 1,
+                                    kind: st.kind.label().to_string(),
+                                    status: st.status.badge().to_string(),
+                                    summary: st.summary.clone(),
+                                });
+                                next_states.insert(pid, st);
+                            }
+                        }
+                    }
+                }
+                self.agent_states = next_states;
+                MuxResponse::Agents { agents }
+            }
+            MuxRequest::CapturePane { pane_id } => {
+                if let Some(pane) = self.panes.get(&pane_id) {
+                    if let Ok(g) = pane.grid.lock() {
+                        let (lines, _) = snapshot_visible_lines(&g.snapshot());
+                        return MuxResponse::Captured {
+                            pane_id,
+                            text: lines.join("\n"),
+                        };
+                    }
+                }
+                MuxResponse::Error {
+                    message: format!("pane {pane_id} not found"),
+                }
             }
             MuxRequest::SendKeys {
                 pane_id,
@@ -207,6 +276,24 @@ impl ServerState {
                 }
             }
             MuxRequest::FocusPane { pane_id } => {
+                if !self.panes.contains_key(&pane_id) {
+                    return MuxResponse::Error {
+                        message: format!("pane {pane_id} not found"),
+                    };
+                }
+                for (ws_idx, ws) in self.manager.workspaces.iter().enumerate() {
+                    for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+                        if tab.all_panes().contains(&pane_id) {
+                            self.manager.switch_workspace(ws_idx);
+                            self.manager.switch_tab(tab_idx);
+                            self.manager.active_tab_mut().focused_pane = pane_id;
+                            return MuxResponse::State {
+                                manager: self.manager.clone(),
+                                snapshots: self.collect_snapshots(),
+                            };
+                        }
+                    }
+                }
                 self.manager.active_tab_mut().focused_pane = pane_id;
                 MuxResponse::State {
                     manager: self.manager.clone(),
@@ -221,9 +308,15 @@ impl ServerState {
                 }
             }
             MuxRequest::CloseWorkspace { idx } => {
+                if idx == 0 {
+                    return MuxResponse::Error {
+                        message: "cannot close Master Space".to_string(),
+                    };
+                }
                 let closed = self.manager.close_workspace(idx);
                 for pid in closed {
                     self.panes.remove(&pid);
+                    self.agent_states.remove(&pid);
                 }
                 MuxResponse::State {
                     manager: self.manager.clone(),
@@ -234,7 +327,27 @@ impl ServerState {
                 let (closed, _) = self.manager.close_tab(idx);
                 for pid in closed {
                     self.panes.remove(&pid);
+                    self.agent_states.remove(&pid);
                 }
+                MuxResponse::State {
+                    manager: self.manager.clone(),
+                    snapshots: self.collect_snapshots(),
+                }
+            }
+            MuxRequest::ClosePane { pane_id } => {
+                if !self.panes.contains_key(&pane_id) {
+                    return MuxResponse::Error {
+                        message: format!("pane {pane_id} not found"),
+                    };
+                }
+                if self.panes.len() <= 1 {
+                    return MuxResponse::Error {
+                        message: "cannot close the last pane".to_string(),
+                    };
+                }
+                self.panes.remove(&pane_id);
+                self.agent_states.remove(&pane_id);
+                self.manager.close_pane(pane_id);
                 MuxResponse::State {
                     manager: self.manager.clone(),
                     snapshots: self.collect_snapshots(),

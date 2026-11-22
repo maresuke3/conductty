@@ -15,6 +15,25 @@ pub struct PaneInfo {
     pub focused: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpaceInfo {
+    pub index: usize,
+    pub name: String,
+    pub tabs: usize,
+    pub panes: usize,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInfo {
+    pub pane_id: PaneId,
+    pub workspace: String,
+    pub tab_index: usize,
+    pub kind: String,
+    pub status: String,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SpawnKind {
     SplitRight,
@@ -28,6 +47,11 @@ pub enum SpawnKind {
 pub enum MuxRequest {
     Ping,
     ListPanes,
+    ListSpaces,
+    ListAgents,
+    CapturePane {
+        pane_id: PaneId,
+    },
     SendKeys {
         pane_id: Option<PaneId>,
         text: String,
@@ -66,6 +90,9 @@ pub enum MuxRequest {
     CloseTab {
         idx: usize,
     },
+    ClosePane {
+        pane_id: PaneId,
+    },
     ToggleZoom,
 }
 
@@ -75,6 +102,16 @@ pub enum MuxResponse {
     Pong,
     Panes {
         panes: Vec<PaneInfo>,
+    },
+    Spaces {
+        spaces: Vec<SpaceInfo>,
+    },
+    Agents {
+        agents: Vec<AgentInfo>,
+    },
+    Captured {
+        pane_id: PaneId,
+        text: String,
     },
     Ok {
         delivered_to: usize,

@@ -20,8 +20,8 @@ use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, 
 use term_core::pty::PtySession;
 use term_drawer::{DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot};
 use term_mux::{
-    DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MuxRequest, MuxResponse, PaneInfo, SpawnKind,
-    send_request,
+    AgentInfo, DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MuxRequest, MuxResponse, PaneInfo,
+    SpaceInfo, SpawnKind, send_request, split_dir_for_spawn,
 };
 use term_render::bg_from_rgb;
 use winit::application::ApplicationHandler;
@@ -417,6 +417,137 @@ impl App {
                     }
                 }
                 MuxResponse::Panes { panes }
+            }
+            MuxRequest::ListSpaces => {
+                let active_ws = self.manager.active_workspace;
+                let spaces = self
+                    .manager
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ws)| SpaceInfo {
+                        index,
+                        name: ws.name.clone(),
+                        tabs: ws.tabs.len(),
+                        panes: ws.pane_count(),
+                        active: index == active_ws,
+                    })
+                    .collect();
+                MuxResponse::Spaces { spaces }
+            }
+            MuxRequest::ListAgents => {
+                self.refresh_agent_states();
+                let mut agents = Vec::new();
+                for ws in &self.manager.workspaces {
+                    for (t_idx, tab) in ws.tabs.iter().enumerate() {
+                        for pid in tab.all_panes() {
+                            if let Some(st) = self.agent_states.get(&pid) {
+                                agents.push(AgentInfo {
+                                    pane_id: pid,
+                                    workspace: ws.name.clone(),
+                                    tab_index: t_idx + 1,
+                                    kind: st.kind.label().to_string(),
+                                    status: st.status.badge().to_string(),
+                                    summary: st.summary.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                MuxResponse::Agents { agents }
+            }
+            MuxRequest::CapturePane { pane_id } => {
+                if let Some(pane) = self.panes.get(&pane_id) {
+                    if let Ok(g) = pane.grid.lock() {
+                        let (lines, _) = snapshot_visible_lines(&g.snapshot());
+                        return MuxResponse::Captured {
+                            pane_id,
+                            text: lines.join("\n"),
+                        };
+                    }
+                }
+                MuxResponse::Error {
+                    message: format!("pane {pane_id} not found"),
+                }
+            }
+            MuxRequest::SpawnPane { kind } => {
+                let Some(new_id) = self.spawn_pane() else {
+                    return MuxResponse::Error {
+                        message: "failed to spawn pane".to_string(),
+                    };
+                };
+                match kind {
+                    SpawnKind::SplitRight | SpawnKind::SplitDown => {
+                        if let Some(dir) = split_dir_for_spawn(kind) {
+                            self.manager.active_tab_mut().split_focused(new_id, dir);
+                        }
+                    }
+                    SpawnKind::NewTab => {
+                        self.manager.add_tab(new_id);
+                    }
+                    SpawnKind::NewWorkspace => {
+                        let num = self.manager.workspaces.len();
+                        self.manager.add_workspace(format!("Dev {num}"), new_id);
+                    }
+                }
+                MuxResponse::Ok { delivered_to: 1 }
+            }
+            MuxRequest::FocusPane { pane_id } => {
+                for (ws_idx, ws) in self.manager.workspaces.iter().enumerate() {
+                    for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+                        if tab.all_panes().contains(&pane_id) {
+                            self.manager.switch_workspace(ws_idx);
+                            self.manager.switch_tab(tab_idx);
+                            self.manager.active_tab_mut().focused_pane = pane_id;
+                            self.left_drawer_selected_idx = ws_idx;
+                            return MuxResponse::Ok { delivered_to: 1 };
+                        }
+                    }
+                }
+                MuxResponse::Error {
+                    message: format!("pane {pane_id} not found"),
+                }
+            }
+            MuxRequest::ClosePane { pane_id } => {
+                if !self.panes.contains_key(&pane_id) {
+                    return MuxResponse::Error {
+                        message: format!("pane {pane_id} not found"),
+                    };
+                }
+                if self.panes.len() <= 1 {
+                    return MuxResponse::Error {
+                        message: "cannot close the last pane".to_string(),
+                    };
+                }
+                self.panes.remove(&pane_id);
+                self.agent_states.remove(&pane_id);
+                self.manager.close_pane(pane_id);
+                MuxResponse::Ok { delivered_to: 1 }
+            }
+            MuxRequest::CloseWorkspace { idx } => {
+                if idx == 0 {
+                    return MuxResponse::Error {
+                        message: "cannot close Master Space".to_string(),
+                    };
+                }
+                if idx >= self.manager.workspaces.len() {
+                    return MuxResponse::Error {
+                        message: format!("space {idx} not found"),
+                    };
+                }
+                let closed = self.manager.close_workspace(idx);
+                for pid in closed {
+                    self.panes.remove(&pid);
+                    self.agent_states.remove(&pid);
+                }
+                if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
+                    self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
+                }
+                MuxResponse::Ok { delivered_to: 1 }
+            }
+            MuxRequest::RenameWorkspace { idx, name } => {
+                self.manager.rename_workspace(idx, name);
+                MuxResponse::Ok { delivered_to: 1 }
             }
             MuxRequest::SendKeys {
                 pane_id,
@@ -3307,10 +3438,54 @@ fn send_ipc_with_wsl_fallback(
     }
 }
 
+fn print_cli_help() {
+    println!(
+        "conductty CLI subcommands:
+  panes | pane list                 List all panes
+  spaces | space list               List all spaces (workspaces)
+  agents | agent list               List detected AI agents and statuses
+  capture <pane_id>                 Print visible text of a pane
+  send <pane_id> <text>             Send keys/command to a pane
+  broadcast <text>                  Broadcast keys/command to all panes
+  split [--right | --down]          Split focused pane
+  new-tab                           Create a new tab
+  new-space [name]                  Create a new space (workspace)
+  focus <pane_id>                   Focus a pane
+  kill-pane <pane_id>               Close a pane
+  kill-space <idx_or_name>          Close a space (except Master Space)"
+    );
+}
+
+fn send_cli_action_ok(args: &[String], req: &MuxRequest, rt: &tokio::runtime::Runtime, ok_msg: &str) -> i32 {
+    match send_ipc_with_wsl_fallback(args, req, rt) {
+        Ok(MuxResponse::Ok { .. }) | Ok(MuxResponse::State { .. }) => {
+            println!("{ok_msg}");
+            0
+        }
+        Ok(MuxResponse::Error { message }) => {
+            eprintln!("error: {message}");
+            1
+        }
+        Ok(other) => {
+            eprintln!("unexpected response: {other:?}");
+            1
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            1
+        }
+    }
+}
+
 fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i32> {
     let sub = args.get(1)?.as_str();
-    match sub {
-        "panes" => {
+    let sub2 = args.get(2).map(String::as_str);
+    match (sub, sub2) {
+        ("help" | "--help" | "-h", _) => {
+            print_cli_help();
+            Some(0)
+        }
+        ("panes", _) | ("pane", Some("list")) => {
             match send_ipc_with_wsl_fallback(args, &MuxRequest::ListPanes, rt) {
                 Ok(MuxResponse::Panes { panes }) => {
                     for p in panes {
@@ -3329,7 +3504,223 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
                 }
             }
         }
-        "send" => {
+        ("spaces", _) | ("space", Some("list")) => {
+            match send_ipc_with_wsl_fallback(args, &MuxRequest::ListSpaces, rt) {
+                Ok(MuxResponse::Spaces { spaces }) => {
+                    for s in spaces {
+                        let mark = if s.active { " *" } else { "" };
+                        println!(
+                            "[{}] {} ({} tabs, {} panes){}",
+                            s.index, s.name, s.tabs, s.panes, mark
+                        );
+                    }
+                    Some(0)
+                }
+                Ok(other) => {
+                    eprintln!("unexpected response: {other:?}");
+                    Some(1)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    Some(1)
+                }
+            }
+        }
+        ("agents", _) | ("agent", Some("list")) => {
+            match send_ipc_with_wsl_fallback(args, &MuxRequest::ListAgents, rt) {
+                Ok(MuxResponse::Agents { agents }) => {
+                    if agents.is_empty() {
+                        println!("no active agents detected");
+                    } else {
+                        for a in agents {
+                            println!(
+                                "[{}] {} ({}) - {} / Tab {} | {}",
+                                a.pane_id, a.kind, a.status, a.workspace, a.tab_index, a.summary
+                            );
+                        }
+                    }
+                    Some(0)
+                }
+                Ok(other) => {
+                    eprintln!("unexpected response: {other:?}");
+                    Some(1)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    Some(1)
+                }
+            }
+        }
+        ("capture", _) => {
+            let Some(pane_str) = args.get(2) else {
+                eprintln!("usage: conductty capture <pane_id>");
+                return Some(2);
+            };
+            let Ok(pane_id) = pane_str.parse::<PaneId>() else {
+                eprintln!("invalid pane_id: {pane_str}");
+                return Some(2);
+            };
+            match send_ipc_with_wsl_fallback(args, &MuxRequest::CapturePane { pane_id }, rt) {
+                Ok(MuxResponse::Captured { text, .. }) => {
+                    println!("{text}");
+                    Some(0)
+                }
+                Ok(MuxResponse::Error { message }) => {
+                    eprintln!("error: {message}");
+                    Some(1)
+                }
+                Ok(other) => {
+                    eprintln!("unexpected response: {other:?}");
+                    Some(1)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    Some(1)
+                }
+            }
+        }
+        ("split", _) => {
+            let kind = match sub2 {
+                Some("--down") | Some("-d") | Some("down") => SpawnKind::SplitDown,
+                _ => SpawnKind::SplitRight,
+            };
+            Some(send_cli_action_ok(
+                args,
+                &MuxRequest::SpawnPane { kind },
+                rt,
+                "pane split",
+            ))
+        }
+        ("new-tab", _) => Some(send_cli_action_ok(
+            args,
+            &MuxRequest::SpawnPane {
+                kind: SpawnKind::NewTab,
+            },
+            rt,
+            "created new tab",
+        )),
+        ("new-space" | "new-workspace", _) => {
+            let req = MuxRequest::SpawnPane {
+                kind: SpawnKind::NewWorkspace,
+            };
+            match send_ipc_with_wsl_fallback(args, &req, rt) {
+                Ok(MuxResponse::State { manager, .. }) => {
+                    let new_idx = manager.workspaces.len().saturating_sub(1);
+                    if let Some(name) = args.get(2) {
+                        let _ = send_ipc_with_wsl_fallback(
+                            args,
+                            &MuxRequest::RenameWorkspace {
+                                idx: new_idx,
+                                name: name.clone(),
+                            },
+                            rt,
+                        );
+                    }
+                    println!("created space [{new_idx}]");
+                    Some(0)
+                }
+                Ok(MuxResponse::Ok { .. }) => {
+                    if let Some(name) = args.get(2) {
+                        if let Ok(MuxResponse::Spaces { spaces }) =
+                            send_ipc_with_wsl_fallback(args, &MuxRequest::ListSpaces, rt)
+                        {
+                            let new_idx = spaces.len().saturating_sub(1);
+                            let _ = send_ipc_with_wsl_fallback(
+                                args,
+                                &MuxRequest::RenameWorkspace {
+                                    idx: new_idx,
+                                    name: name.clone(),
+                                },
+                                rt,
+                            );
+                        }
+                    }
+                    println!("created new space");
+                    Some(0)
+                }
+                Ok(MuxResponse::Error { message }) => {
+                    eprintln!("error: {message}");
+                    Some(1)
+                }
+                Ok(other) => {
+                    eprintln!("unexpected response: {other:?}");
+                    Some(1)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    Some(1)
+                }
+            }
+        }
+        ("focus", _) => {
+            let Some(pane_str) = args.get(2) else {
+                eprintln!("usage: conductty focus <pane_id>");
+                return Some(2);
+            };
+            let Ok(pane_id) = pane_str.parse::<PaneId>() else {
+                eprintln!("invalid pane_id: {pane_str}");
+                return Some(2);
+            };
+            Some(send_cli_action_ok(
+                args,
+                &MuxRequest::FocusPane { pane_id },
+                rt,
+                &format!("focused pane {pane_id}"),
+            ))
+        }
+        ("kill-pane", _) => {
+            let Some(pane_str) = args.get(2) else {
+                eprintln!("usage: conductty kill-pane <pane_id>");
+                return Some(2);
+            };
+            let Ok(pane_id) = pane_str.parse::<PaneId>() else {
+                eprintln!("invalid pane_id: {pane_str}");
+                return Some(2);
+            };
+            Some(send_cli_action_ok(
+                args,
+                &MuxRequest::ClosePane { pane_id },
+                rt,
+                &format!("killed pane {pane_id}"),
+            ))
+        }
+        ("kill-space" | "kill-workspace", _) => {
+            let Some(target) = args.get(2) else {
+                eprintln!("usage: conductty kill-space <index_or_name>");
+                return Some(2);
+            };
+            let idx = if let Ok(n) = target.parse::<usize>() {
+                n
+            } else {
+                match send_ipc_with_wsl_fallback(args, &MuxRequest::ListSpaces, rt) {
+                    Ok(MuxResponse::Spaces { spaces }) => {
+                        let Some(found) = spaces
+                            .into_iter()
+                            .find(|s| s.name.eq_ignore_ascii_case(target))
+                        else {
+                            eprintln!("space not found: {target}");
+                            return Some(1);
+                        };
+                        found.index
+                    }
+                    Ok(other) => {
+                        eprintln!("unexpected response: {other:?}");
+                        return Some(1);
+                    }
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return Some(1);
+                    }
+                }
+            };
+            Some(send_cli_action_ok(
+                args,
+                &MuxRequest::CloseWorkspace { idx },
+                rt,
+                &format!("killed space {idx}"),
+            ))
+        }
+        ("send", _) => {
             let Some(pane_str) = args.get(2) else {
                 eprintln!("usage: conductty send <pane_id> <text>");
                 return Some(2);
@@ -3364,7 +3755,7 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
                 }
             }
         }
-        "broadcast" => {
+        ("broadcast", _) => {
             let raw_text = args.get(2).map(String::as_str).unwrap_or("");
             let text = raw_text.replace("\\r\\n", "\r").replace("\\n", "\r").replace("\\r", "\r").replace('\n', "\r");
             let req = MuxRequest::SendKeys {
