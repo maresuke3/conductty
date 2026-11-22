@@ -205,6 +205,7 @@ impl InputRouter {
             (&kb.select_pane, Action::OpenSelectPane),
             (&kb.go_to, Action::OpenGoTo),
             (&kb.new_tab, Action::NewTab),
+            (&kb.new_workspace, Action::NewWorkspace),
             (&kb.split_right, Action::SplitRight),
             (&kb.split_down, Action::SplitDown),
             (&kb.goto_left, Action::GotoSplit(NavDirection::Left)),
@@ -819,5 +820,41 @@ mod tests {
             InputDecision::Execute(Action::ToggleKeybindHints)
         );
         assert_eq!(router.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn new_workspace_default_and_prefix_override_work() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.keybinds.new_workspace, "ctrl+shift+t");
+        let mut router = InputRouter::from_config(&cfg);
+        let ctx = MockCtx { has_right: false };
+
+        let ctrl_shift_t = KeyEvent {
+            code: KeyCode::Char('t'),
+            mods: mods(true, false, true),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&ctrl_shift_t, &ctx),
+            InputDecision::Execute(Action::NewWorkspace)
+        );
+
+        cfg.keybinds.new_workspace = "prefix+w".to_string();
+        let mut router = InputRouter::from_config(&cfg);
+        let ctrl_b = KeyEvent {
+            code: KeyCode::Char('b'),
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+        let key_w = KeyEvent {
+            code: KeyCode::Char('w'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
+        assert_eq!(
+            router.route(&key_w, &ctx),
+            InputDecision::Execute(Action::NewWorkspace)
+        );
     }
 }

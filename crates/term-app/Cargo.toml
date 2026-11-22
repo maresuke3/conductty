@@ -23,3 +23,9 @@ winit.workspace = true
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 wry.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_DirectComposition",
+] }

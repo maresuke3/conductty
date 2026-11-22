@@ -32,3 +32,6 @@ vte = "0.15"
 wgpu = "24.0"
 winit = "0.30"
 wry = "0.50"
+
+[patch.crates-io]
+wgpu-hal = { path = "patches/wgpu-hal" }

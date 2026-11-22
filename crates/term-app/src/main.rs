@@ -54,21 +54,59 @@ struct PaneRuntime {
     last_size: (usize, usize),
 }
 
+fn panel_color(r: u8, g: u8, b: u8, opacity: f32) -> Color32 {
+    let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn create_wgpu_surface(
+    instance: &wgpu::Instance,
+    window: Arc<Window>,
+    direct_comp: &Option<win_backdrop::DirectCompState>,
+) -> wgpu::Surface<'static> {
+    #[cfg(target_os = "windows")]
+    if let Some(dc) = direct_comp {
+        return unsafe {
+            instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(
+                    dc.visual_ptr(),
+                ))
+                .expect("failed to create DirectComposition wgpu surface")
+        };
+    }
+    let _ = direct_comp;
+    instance
+        .create_surface(window)
+        .expect("failed to create wgpu surface")
+}
+
 struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     egui_renderer: egui_wgpu::Renderer,
+    direct_comp: Option<win_backdrop::DirectCompState>,
 }
 
 impl GpuState {
     fn new(window: Arc<Window>, rt: &tokio::runtime::Runtime, transparent: bool) -> Self {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
-        let surface = instance
-            .create_surface(window)
-            .expect("failed to create wgpu surface");
+        let direct_comp = if cfg!(target_os = "windows") && transparent {
+            win_backdrop::DirectCompState::new(&window)
+        } else {
+            None
+        };
+        let instance_desc = if direct_comp.is_some() {
+            wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::DX12,
+                ..wgpu::InstanceDescriptor::from_env_or_default()
+            }
+        } else {
+            wgpu::InstanceDescriptor::from_env_or_default()
+        };
+        let instance = wgpu::Instance::new(&instance_desc);
+        let surface = create_wgpu_surface(&instance, window, &direct_comp);
 
         let adapter = rt
             .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -94,12 +132,12 @@ impl GpuState {
             caps.alpha_modes
                 .iter()
                 .copied()
-                .find(|m| {
-                    matches!(
-                        m,
-                        wgpu::CompositeAlphaMode::PreMultiplied
-                            | wgpu::CompositeAlphaMode::PostMultiplied
-                    )
+                .find(|m| *m == wgpu::CompositeAlphaMode::PreMultiplied)
+                .or_else(|| {
+                    caps.alpha_modes
+                        .iter()
+                        .copied()
+                        .find(|m| *m == wgpu::CompositeAlphaMode::PostMultiplied)
                 })
                 .unwrap_or(caps.alpha_modes[0])
         } else {
@@ -121,6 +159,9 @@ impl GpuState {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        if let Some(dc) = &direct_comp {
+            dc.commit();
+        }
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
@@ -130,6 +171,7 @@ impl GpuState {
             queue,
             config,
             egui_renderer,
+            direct_comp,
         }
     }
 
@@ -140,6 +182,9 @@ impl GpuState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        if let Some(dc) = &self.direct_comp {
+            dc.commit();
+        }
     }
 
     fn render_egui(
@@ -1136,14 +1181,18 @@ impl App {
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            // macOS (Metal) は winit の透過をそのまま使う。Windows は win_backdrop (WS_EX_LAYERED) で透過するため false にする
+            // 全 OS で背景・UI パネルのみをピクセル単位透過させる（Windows は DirectComposition + patched wgpu-hal を使用）
             let is_wslg = cfg!(target_os = "linux") && std::env::var_os("WSL_DISTRO_NAME").is_some();
-            let transparent = cfg!(target_os = "macos")
-                && self.config.appearance.background_opacity < 0.999
-                && !is_wslg;
-            let attrs = WindowAttributes::default()
+            let transparent = self.config.appearance.background_opacity < 0.999 && !is_wslg;
+            #[allow(unused_mut)]
+            let mut attrs = WindowAttributes::default()
                 .with_title("conductty")
                 .with_transparent(transparent);
+            #[cfg(target_os = "windows")]
+            if transparent {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attrs = attrs.with_no_redirection_bitmap(true);
+            }
             let window = Arc::new(
                 event_loop
                     .create_window(attrs)
@@ -1740,6 +1789,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut pending_resizes: Vec<(PaneId, usize, usize)> = Vec::new();
 
                 let selection = self.selection;
+                let ui_opacity = self.config.appearance.background_opacity;
                 let mut computed_cell_size = self.cell_size;
                 let mut computed_terminal_area: Option<CoreRect> = None;
 
@@ -1751,7 +1801,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .inner_margin(12.0),
                             )
                             .show(ctx, |ui| {
@@ -2025,7 +2075,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .inner_margin(4.0),
                             )
                             .show(ctx, |ui| {
@@ -2064,7 +2114,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .inner_margin(12.0),
                             )
                             .show(ctx, |ui| {
@@ -2206,7 +2256,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .exact_height(TAB_BAR_HEIGHT)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(Color32::from_rgb(0x18, 0x1a, 0x28))
+                                    .fill(panel_color(0x18, 0x1a, 0x28, ui_opacity))
                                     .inner_margin(egui::Margin::symmetric(8, 4)),
                             )
                             .show(ctx, |ui| {
@@ -2530,7 +2580,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .fixed_size(Vec2::new(520.0, 420.0))
                             .frame(
                                 egui::Frame::window(&ctx.style())
-                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0x7a, 0xa2, 0xf7)))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::same(14)),
@@ -2563,7 +2613,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 });
                                 ui.add_space(6.0);
                                 egui::Frame::NONE
-                                    .fill(Color32::from_rgb(0x19, 0x1b, 0x29))
+                                    .fill(panel_color(0x19, 0x1b, 0x29, ui_opacity))
                                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x3b, 0x42, 0x61)))
                                     .corner_radius(4.0)
                                     .inner_margin(egui::Margin::symmetric(8, 6))
@@ -2696,6 +2746,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 "Panes & Tabs",
                                 vec![
                                     ("New Tab", kb_snapshot.new_tab.clone()),
+                                    ("New Workspace", kb_snapshot.new_workspace.clone()),
                                     ("Split Right", kb_snapshot.split_right.clone()),
                                     ("Split Down", kb_snapshot.split_down.clone()),
                                     ("Toggle Zoom", kb_snapshot.toggle_zoom.clone()),
@@ -2734,7 +2785,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .fixed_size(Vec2::new(560.0, 460.0))
                             .frame(
                                 egui::Frame::window(&ctx.style())
-                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0xff, 0x9e, 0x64)))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::same(16)),
@@ -2823,12 +2874,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 egui_state.handle_platform_output(window, platform_output);
 
-                let bg_alpha = if cfg!(target_os = "windows") {
-                    1.0
+                let bg_alpha = self.config.appearance.background_opacity;
+                let mut bg = if gpu.config.alpha_mode == wgpu::CompositeAlphaMode::PostMultiplied {
+                    bg_from_rgb(self.theme.bg, 1.0)
                 } else {
-                    self.config.appearance.background_opacity
+                    bg_from_rgb(self.theme.bg, bg_alpha)
                 };
-                let bg = bg_from_rgb(self.theme.bg, bg_alpha);
+                bg.a = bg_alpha.clamp(0.0, 1.0) as f64;
                 match gpu.render_egui(window, &self.egui_ctx, full_output, bg) {
                     Ok(()) => {}
                     Err(wgpu::SurfaceError::Lost) => {

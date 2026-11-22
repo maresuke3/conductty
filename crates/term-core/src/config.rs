@@ -70,6 +70,7 @@ pub struct ThemeColorsConfig {
 pub struct KeybindsConfig {
     pub prefix: String,
     pub new_tab: String,
+    pub new_workspace: String,
     pub split_right: String,
     pub split_down: String,
     pub toggle_zoom: String,
@@ -169,6 +170,7 @@ impl Default for KeybindsConfig {
         Self {
             prefix: "ctrl+b".to_string(),
             new_tab: "ctrl+t".to_string(),
+            new_workspace: "ctrl+shift+t".to_string(),
             split_right: "alt+d".to_string(),
             split_down: "alt+shift+d".to_string(),
             toggle_zoom: "ctrl+shift+z".to_string(),

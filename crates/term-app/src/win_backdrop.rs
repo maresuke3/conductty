@@ -1,11 +1,12 @@
 #[cfg(target_os = "windows")]
 mod imp {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::DirectComposition::{
+        DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+    };
+    use windows::core::{IUnknown, Interface};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
-
-    const GWL_EXSTYLE: i32 = -20;
-    const WS_EX_LAYERED: isize = 0x0008_0000;
-    const LWA_ALPHA: u32 = 0x0000_0002;
 
     #[link(name = "dwmapi")]
     unsafe extern "system" {
@@ -17,14 +18,48 @@ mod imp {
         ) -> i32;
     }
 
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn GetWindowLongPtrW(hwnd: isize, n_index: i32) -> isize;
-        fn SetWindowLongPtrW(hwnd: isize, n_index: i32, dw_new_long: isize) -> isize;
-        fn SetLayeredWindowAttributes(hwnd: isize, cr_key: u32, b_alpha: u8, dw_flags: u32) -> i32;
+    pub struct DirectCompState {
+        device: IDCompositionDevice,
+        _target: IDCompositionTarget,
+        visual: IDCompositionVisual,
     }
 
-    pub fn apply(window: &Window, opacity: f32) {
+    impl DirectCompState {
+        pub fn new(window: &Window) -> Option<Self> {
+            let Ok(handle) = window.window_handle() else {
+                return None;
+            };
+            let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+                return None;
+            };
+            let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
+            unsafe {
+                let device: IDCompositionDevice =
+                    DCompositionCreateDevice2::<Option<&IUnknown>, IDCompositionDevice>(None).ok()?;
+                let target = device.CreateTargetForHwnd(hwnd, true).ok()?;
+                let visual = device.CreateVisual().ok()?;
+                target.SetRoot(&visual).ok()?;
+                device.Commit().ok()?;
+                Some(Self {
+                    device,
+                    _target: target,
+                    visual,
+                })
+            }
+        }
+
+        pub fn visual_ptr(&self) -> *mut std::ffi::c_void {
+            self.visual.as_raw()
+        }
+
+        pub fn commit(&self) {
+            unsafe {
+                let _ = self.device.Commit();
+            }
+        }
+    }
+
+    pub fn apply(window: &Window, _opacity: f32) {
         let Ok(handle) = window.window_handle() else {
             return;
         };
@@ -34,7 +69,7 @@ mod imp {
         let hwnd = win32.hwnd.get();
 
         unsafe {
-            // 1. タイトルバーをダークモードにする (DWMWA_USE_IMMERSIVE_DARK_MODE = 20)
+            // タイトルバーをダークモードにする (DWMWA_USE_IMMERSIVE_DARK_MODE = 20)
             let dark: i32 = 1;
             let _ = DwmSetWindowAttribute(
                 hwnd,
@@ -42,14 +77,6 @@ mod imp {
                 (&dark as *const i32).cast(),
                 std::mem::size_of::<i32>() as u32,
             );
-
-            // 2. Windows 透過: Vulkan + winit の白いすりガラスを避け、WS_EX_LAYERED + LWA_ALPHA で純粋に半透明化する
-            if opacity < 0.999 {
-                let alpha = (opacity.clamp(0.1, 1.0) * 255.0).round() as u8;
-                let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED);
-                let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
-            }
         }
     }
 }
@@ -57,7 +84,23 @@ mod imp {
 #[cfg(not(target_os = "windows"))]
 mod imp {
     use winit::window::Window;
+
+    pub struct DirectCompState;
+
+    impl DirectCompState {
+        pub fn new(_window: &Window) -> Option<Self> {
+            None
+        }
+
+        #[allow(dead_code)]
+        pub fn visual_ptr(&self) -> *mut std::ffi::c_void {
+            std::ptr::null_mut()
+        }
+
+        pub fn commit(&self) {}
+    }
+
     pub fn apply(_window: &Window, _opacity: f32) {}
 }
 
-pub use imp::apply;
+pub use imp::{DirectCompState, apply};
