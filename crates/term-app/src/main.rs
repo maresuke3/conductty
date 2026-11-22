@@ -13,7 +13,7 @@ use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme};
 use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::input::{
     Action, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode, KeyEvent as CoreKeyEvent,
-    Modifiers, PerformableContext,
+    GoToCommand, Modifiers, PerformableContext,
 };
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
@@ -234,7 +234,11 @@ struct App {
     mux_snapshots: HashMap<PaneId, GridSnapshot>,
     mux_last_sizes: HashMap<PaneId, (usize, usize)>,
     next_pane_id: PaneId,
-    go_to_active: bool,
+    select_pane_active: bool,
+    go_to_open: bool,
+    go_to_filtering: bool,
+    go_to_query: String,
+    go_to_selected_idx: usize,
     left_drawer_mode: LeftDrawerMode,
     left_drawer_selected_idx: usize,
     renaming_workspace_idx: Option<usize>,
@@ -679,6 +683,24 @@ impl App {
         }
     }
 
+    fn jump_to_go_to_item(&mut self, item: &GoToItem) {
+        if self.config.features.multiplexer_mode {
+            self.send_mux_action(MuxRequest::SwitchWorkspace { idx: item.ws_idx });
+            self.send_mux_action(MuxRequest::SwitchTab { idx: item.tab_idx });
+            self.send_mux_action(MuxRequest::FocusPane {
+                pane_id: item.pane_id,
+            });
+        } else {
+            self.manager.switch_workspace(item.ws_idx);
+            self.manager.switch_tab(item.tab_idx);
+            self.manager.active_tab_mut().focused_pane = item.pane_id;
+        }
+        self.left_drawer_selected_idx = item.ws_idx;
+        self.go_to_open = false;
+        self.go_to_query.clear();
+        self.go_to_selected_idx = 0;
+    }
+
     fn handle_action(&mut self, action: Action) {
         let area = self.terminal_area();
         if self.config.features.multiplexer_mode {
@@ -760,8 +782,16 @@ impl App {
             Action::ToggleZoom => {
                 self.manager.active_tab_mut().toggle_zoom();
             }
+            Action::OpenSelectPane => {
+                self.select_pane_active = !self.select_pane_active;
+            }
             Action::OpenGoTo => {
-                self.go_to_active = !self.go_to_active;
+                self.go_to_open = !self.go_to_open;
+                if self.go_to_open {
+                    self.go_to_filtering = false;
+                    self.go_to_query.clear();
+                    self.go_to_selected_idx = 0;
+                }
             }
             Action::ToggleLeftDrawer => {
                 if self.config.features.left_drawer_mode == LeftDrawerMode::Hidden {
@@ -1168,9 +1198,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if self.router.mode == InputMode::Normal && !self.go_to_active {
+                if self.go_to_open {
+                    if self.go_to_filtering {
+                        self.go_to_query.push_str(&text);
+                        self.go_to_selected_idx = 0;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                } else if self.router.mode == InputMode::Normal && !self.select_pane_active {
                     let focused = self.manager.active_tab().focused_pane;
-                    if let Some(pane) = self.panes.get_mut(&focused) {
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::WriteBytes {
+                            pane_id: focused,
+                            bytes: text.into_bytes(),
+                        });
+                    } else if let Some(pane) = self.panes.get_mut(&focused) {
                         let _ = pane.pty.write_bytes(text.as_bytes());
                     }
                 }
@@ -1184,12 +1227,93 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self.go_to_active {
+                if self.go_to_open {
+                    let items = filtered_go_to_items(&self.manager, &self.go_to_query);
+                    let core_ev = to_core_key_event(&event.logical_key, self.modifiers);
+                    if let Some(cmd) = core_ev
+                        .as_ref()
+                        .and_then(|ev| self.router.route_go_to(ev, self.go_to_filtering))
+                    {
+                        match cmd {
+                            GoToCommand::Next => {
+                                if !items.is_empty() {
+                                    self.go_to_selected_idx =
+                                        (self.go_to_selected_idx + 1) % items.len();
+                                }
+                            }
+                            GoToCommand::Prev => {
+                                if !items.is_empty() {
+                                    self.go_to_selected_idx = if self.go_to_selected_idx == 0 {
+                                        items.len() - 1
+                                    } else {
+                                        self.go_to_selected_idx - 1
+                                    };
+                                }
+                            }
+                            GoToCommand::Select => {
+                                if let Some(item) = items.get(self.go_to_selected_idx) {
+                                    self.jump_to_go_to_item(item);
+                                } else {
+                                    self.go_to_open = false;
+                                }
+                                self.go_to_filtering = false;
+                            }
+                            GoToCommand::Close => {
+                                if self.go_to_filtering {
+                                    self.go_to_filtering = false;
+                                } else {
+                                    self.go_to_open = false;
+                                }
+                            }
+                            GoToCommand::StartFilter => {
+                                self.go_to_filtering = true;
+                            }
+                        }
+                    } else if self.go_to_filtering {
+                        let ctrl = self.modifiers.control_key();
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Backspace) => {
+                                self.go_to_query.pop();
+                                self.go_to_selected_idx = 0;
+                            }
+                            Key::Named(NamedKey::Space)
+                                if !ctrl && !self.modifiers.alt_key() =>
+                            {
+                                self.go_to_query.push(' ');
+                                self.go_to_selected_idx = 0;
+                            }
+                            Key::Character(s)
+                                if !ctrl
+                                    && !self.modifiers.alt_key()
+                                    && !self.modifiers.super_key() =>
+                            {
+                                self.go_to_query.push_str(s.as_str());
+                                self.go_to_selected_idx = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
+                if self.select_pane_active {
                     if let Key::Character(s) = &event.logical_key {
                         if let Ok(num) = s.parse::<PaneId>() {
-                            if self.panes.contains_key(&num) {
-                                self.manager.active_tab_mut().focused_pane = num;
-                                self.go_to_active = false;
+                            let exists = if self.config.features.multiplexer_mode {
+                                self.mux_snapshots.contains_key(&num)
+                            } else {
+                                self.panes.contains_key(&num)
+                            };
+                            if exists {
+                                if self.config.features.multiplexer_mode {
+                                    self.send_mux_action(MuxRequest::FocusPane { pane_id: num });
+                                } else {
+                                    self.manager.active_tab_mut().focused_pane = num;
+                                }
+                                self.select_pane_active = false;
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
                                 }
@@ -1198,7 +1322,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
-                        self.go_to_active = false;
+                        self.select_pane_active = false;
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
@@ -1251,7 +1375,21 @@ impl ApplicationHandler<UserEvent> for App {
                 let pane_mode = self.router.mode == InputMode::Pane;
                 let prefix_mode = self.router.mode == InputMode::Prefix;
                 let zoomed = self.manager.active_tab().zoomed;
-                let go_to_active = self.go_to_active;
+                let select_pane_active = self.select_pane_active;
+                let go_to_open = self.go_to_open;
+                let go_to_filtering = self.go_to_filtering;
+                let go_to_query = self.go_to_query.clone();
+                let go_to_items = if go_to_open {
+                    filtered_go_to_items(&self.manager, &go_to_query)
+                } else {
+                    Vec::new()
+                };
+                let go_to_selected_idx = if go_to_items.is_empty() {
+                    0
+                } else {
+                    self.go_to_selected_idx.min(go_to_items.len() - 1)
+                };
+                let mut go_to_click_target: Option<GoToItem> = None;
                 let left_drawer_mode = self.left_drawer_mode;
                 let left_selected = self.left_drawer_selected_idx;
                 let active_ws_idx = self.manager.active_workspace;
@@ -1881,7 +2019,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
                                 }
 
-                                if go_to_active {
+                                if select_pane_active {
                                     let badge_pos = Pos2::new(rect.x + 14.0, rect.y + 14.0);
                                     let badge_rect =
                                         Rect::from_min_size(badge_pos, Vec2::new(36.0, 28.0));
@@ -1910,8 +2048,8 @@ impl ApplicationHandler<UserEvent> for App {
                             if zoomed {
                                 status_parts.push("ZOOMED");
                             }
-                            if go_to_active {
-                                status_parts.push("GO_TO (press pane number)");
+                            if select_pane_active {
+                                status_parts.push("SELECT PANE (press pane number)");
                             }
                             if self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed
                                 && left_drawer_mode != LeftDrawerMode::Always
@@ -1955,6 +2093,160 @@ impl ApplicationHandler<UserEvent> for App {
                                 );
                             }
                         });
+
+                    if go_to_open {
+                        egui::Window::new("go_to_modal")
+                            .title_bar(false)
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                            .fixed_size(Vec2::new(520.0, 420.0))
+                            .frame(
+                                egui::Frame::window(&ctx.style())
+                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0x7a, 0xa2, 0xf7)))
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin::same(14)),
+                            )
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(if go_to_filtering {
+                                            "Go To Space / Pane  [FILTER]"
+                                        } else {
+                                            "Go To Space / Pane  [VIM]"
+                                        })
+                                        .strong()
+                                        .size(15.0)
+                                        .color(Color32::from_rgb(0x82, 0xaa, 0xff)),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} pane(s)",
+                                                    go_to_items.len()
+                                                ))
+                                                .small()
+                                                .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                egui::Frame::NONE
+                                    .fill(Color32::from_rgb(0x19, 0x1b, 0x29))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x3b, 0x42, 0x61)))
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        let prompt = if go_to_query.is_empty() && !go_to_filtering {
+                                            "Press / to filter spaces or panes...".to_string()
+                                        } else if go_to_filtering {
+                                            format!("/{go_to_query}_")
+                                        } else {
+                                            format!("/{go_to_query}")
+                                        };
+                                        let color = if go_to_query.is_empty() && !go_to_filtering {
+                                            Color32::from_rgb(0x63, 0x6d, 0xa6)
+                                        } else {
+                                            Color32::from_rgb(0xc8, 0xd3, 0xf5)
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(prompt)
+                                                .monospace()
+                                                .size(13.0)
+                                                .color(color),
+                                        );
+                                    });
+                                ui.add_space(8.0);
+
+                                egui::ScrollArea::vertical()
+                                    .max_height(300.0)
+                                    .show(ui, |ui| {
+                                        if go_to_items.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("No matching panes")
+                                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                            );
+                                            return;
+                                        }
+                                        let mut last_ws: Option<usize> = None;
+                                        for (idx, item) in go_to_items.iter().enumerate() {
+                                            if last_ws != Some(item.ws_idx) {
+                                                if last_ws.is_some() {
+                                                    ui.add_space(4.0);
+                                                }
+                                                let ws_label = if item.ws_idx == active_ws_idx {
+                                                    format!("{} (current)", item.ws_name)
+                                                } else {
+                                                    item.ws_name.clone()
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(ws_label)
+                                                        .strong()
+                                                        .size(13.0)
+                                                        .color(Color32::from_rgb(0xc3, 0xe8, 0x8d)),
+                                                );
+                                                last_ws = Some(item.ws_idx);
+                                            }
+                                            let is_selected = idx == go_to_selected_idx;
+                                            let row_bg = if is_selected {
+                                                Color32::from_rgb(0x2f, 0x33, 0x4d)
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            };
+                                            let resp = egui::Frame::NONE
+                                                .fill(row_bg)
+                                                .corner_radius(4.0)
+                                                .inner_margin(egui::Margin::symmetric(10, 5))
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.horizontal(|ui| {
+                                                        let marker = if is_selected { ">" } else { " " };
+                                                        let focus_tag = if item.is_focused {
+                                                            " *"
+                                                        } else {
+                                                            ""
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{marker} Tab {}  ·  Pane {}{focus_tag}",
+                                                                item.tab_idx + 1,
+                                                                item.pane_id
+                                                            ))
+                                                            .monospace()
+                                                            .size(13.0)
+                                                            .color(if is_selected {
+                                                                Color32::from_rgb(0xff, 0xff, 0xff)
+                                                            } else {
+                                                                Color32::from_rgb(0xc8, 0xd3, 0xf5)
+                                                            }),
+                                                        );
+                                                    });
+                                                })
+                                                .response;
+                                            if is_selected {
+                                                resp.scroll_to_me(None);
+                                            }
+                                            if resp.interact(egui::Sense::click()).clicked() {
+                                                go_to_click_target = Some(item.clone());
+                                            }
+                                        }
+                                    });
+
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "j/k: move   /: filter   Enter: jump   q/Esc: close",
+                                    )
+                                    .small()
+                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                );
+                            });
+                    }
                 });
 
                 self.cell_size = computed_cell_size;
@@ -1992,6 +2284,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 let mut need_redraw = egui_wants_repaint;
+                if let Some(item) = go_to_click_target {
+                    self.jump_to_go_to_item(&item);
+                    need_redraw = true;
+                }
                 self.rename_buf = rename_buf;
                 if cancel_rename {
                     self.renaming_workspace_idx = None;
@@ -2378,6 +2674,43 @@ fn render_grid_snapshot(
             Color32::from_rgba_unmultiplied(0x82, 0xaa, 0xff, 160),
         );
     }
+}
+
+#[derive(Debug, Clone)]
+struct GoToItem {
+    ws_idx: usize,
+    ws_name: String,
+    tab_idx: usize,
+    pane_id: PaneId,
+    is_focused: bool,
+}
+
+fn filtered_go_to_items(manager: &WorkspaceManager, query: &str) -> Vec<GoToItem> {
+    let q = query.trim().to_lowercase();
+    let mut items = Vec::new();
+    for (ws_idx, ws) in manager.workspaces.iter().enumerate() {
+        for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+            for pane_id in tab.all_panes() {
+                if !q.is_empty() {
+                    let hay = format!("{} tab {} pane {}", ws.name, tab_idx + 1, pane_id)
+                        .to_lowercase();
+                    if !hay.contains(&q) {
+                        continue;
+                    }
+                }
+                items.push(GoToItem {
+                    ws_idx,
+                    ws_name: ws.name.clone(),
+                    tab_idx,
+                    pane_id,
+                    is_focused: ws_idx == manager.active_workspace
+                        && tab_idx == ws.active_tab
+                        && pane_id == tab.focused_pane,
+                });
+            }
+        }
+    }
+    items
 }
 
 fn is_box_drawing_char(ch: char) -> bool {
@@ -2891,7 +3224,11 @@ fn main() {
         mux_snapshots: HashMap::new(),
         mux_last_sizes: HashMap::new(),
         next_pane_id: 1,
-        go_to_active: false,
+        select_pane_active: false,
+        go_to_open: false,
+        go_to_filtering: false,
+        go_to_query: String::new(),
+        go_to_selected_idx: 0,
         left_drawer_mode,
         left_drawer_selected_idx: 0,
         renaming_workspace_idx: None,

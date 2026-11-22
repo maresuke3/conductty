@@ -70,7 +70,17 @@ pub enum Action {
     Copy,
     Paste,
     ReloadConfig,
+    OpenSelectPane,
     OpenGoTo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoToCommand {
+    Next,
+    Prev,
+    Select,
+    Close,
+    StartFilter,
 }
 
 /// 純粋な入力ルーティング結果（副作用なし）
@@ -174,6 +184,7 @@ pub struct InputRouter {
     pub normal_bindings: Vec<KeyBinding>,
     pub prefix_trigger: Option<KeyBinding>,
     pub prefix_bindings: Vec<KeyBinding>,
+    pub go_to_bindings: Vec<(KeyBinding, GoToCommand)>,
 }
 
 impl Default for InputRouter {
@@ -190,6 +201,7 @@ impl InputRouter {
             (&kb.toggle_zoom, Action::ToggleZoom),
             (&kb.toggle_left_drawer, Action::ToggleLeftDrawer),
             (&kb.toggle_right_drawer, Action::ToggleRightDrawer),
+            (&kb.select_pane, Action::OpenSelectPane),
             (&kb.go_to, Action::OpenGoTo),
             (&kb.new_tab, Action::NewTab),
             (&kb.split_right, Action::SplitRight),
@@ -240,13 +252,64 @@ impl InputRouter {
             normal_bindings.push(b);
         }
 
+        let mut go_to_bindings = Vec::new();
+        let go_to_specs = [
+            (&kb.go_to_next, GoToCommand::Next),
+            (&kb.go_to_prev, GoToCommand::Prev),
+            (&kb.go_to_select, GoToCommand::Select),
+            (&kb.go_to_close, GoToCommand::Close),
+            (&kb.go_to_filter, GoToCommand::StartFilter),
+        ];
+        for (spec, cmd) in go_to_specs {
+            for part in split_binding_list(spec) {
+                if let Some(b) = KeyBinding::parse(part, Action::OpenGoTo) {
+                    go_to_bindings.push((b, cmd));
+                }
+            }
+        }
+
         Self {
             mode: InputMode::Normal,
             macos_left_option_as_alt: config.window.macos_option_as_alt == "left",
             normal_bindings,
             prefix_trigger,
             prefix_bindings,
+            go_to_bindings,
         }
+    }
+
+    pub fn route_go_to(&self, event: &KeyEvent, filtering: bool) -> Option<GoToCommand> {
+        for (binding, cmd) in &self.go_to_bindings {
+            if !binding.matches(event) {
+                continue;
+            }
+            if filtering {
+                match cmd {
+                    GoToCommand::Select => return Some(*cmd),
+                    GoToCommand::Next | GoToCommand::Prev
+                        if binding.ctrl || !matches!(binding.code, KeyCode::Char(_)) =>
+                    {
+                        return Some(*cmd);
+                    }
+                    GoToCommand::Close if binding.code == KeyCode::Escape => return Some(*cmd),
+                    _ => {}
+                }
+            } else {
+                return Some(*cmd);
+            }
+        }
+        None
+    }
+}
+
+fn split_binding_list(spec: &str) -> Vec<&str> {
+    if spec.trim() == "," {
+        vec![","]
+    } else {
+        spec.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 }
 
@@ -682,5 +745,50 @@ mod tests {
         };
         assert_eq!(router.route(&esc, &ctx), InputDecision::Ignore);
         assert_eq!(router.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn go_to_vim_and_filter_bindings_work() {
+        let cfg = AppConfig::default();
+        let router = InputRouter::from_config(&cfg);
+
+        let j = KeyEvent {
+            code: KeyCode::Char('j'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        let k = KeyEvent {
+            code: KeyCode::Char('k'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        let slash = KeyEvent {
+            code: KeyCode::Char('/'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        let q = KeyEvent {
+            code: KeyCode::Char('q'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        let ctrl_j = KeyEvent {
+            code: KeyCode::Char('j'),
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+
+        assert_eq!(router.route_go_to(&j, false), Some(GoToCommand::Next));
+        assert_eq!(router.route_go_to(&k, false), Some(GoToCommand::Prev));
+        assert_eq!(
+            router.route_go_to(&slash, false),
+            Some(GoToCommand::StartFilter)
+        );
+        assert_eq!(router.route_go_to(&q, false), Some(GoToCommand::Close));
+
+        // フィルタ入力中は j / q は文字入力扱いになり、Ctrl+j は移動として効く
+        assert_eq!(router.route_go_to(&j, true), None);
+        assert_eq!(router.route_go_to(&q, true), None);
+        assert_eq!(router.route_go_to(&ctrl_j, true), Some(GoToCommand::Next));
     }
 }
