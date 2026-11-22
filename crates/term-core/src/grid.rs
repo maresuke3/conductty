@@ -89,6 +89,7 @@ pub struct TerminalGrid {
     pub cursor_col: usize,
     pub cursor_row: usize,
     pub cursor_visible: bool,
+    pub bracketed_paste: bool,
     pub cells: Vec<Cell>,
     pub scrollback: VecDeque<Vec<Cell>>,
     pub scroll_offset: usize,
@@ -112,6 +113,7 @@ impl TerminalGrid {
             cursor_col: 0,
             cursor_row: 0,
             cursor_visible: true,
+            bracketed_paste: false,
             cells: vec![Cell::default(); cols * rows],
             scrollback: VecDeque::new(),
             scroll_offset: 0,
@@ -462,6 +464,12 @@ impl Perform for TerminalGrid {
             }
             'l' if is_private && first == 25 => {
                 self.cursor_visible = false;
+            }
+            'h' if is_private && first == 2004 => {
+                self.bracketed_paste = true;
+            }
+            'l' if is_private && first == 2004 => {
+                self.bracketed_paste = false;
             }
             'h' if is_private && first == 1049 => {
                 if self.alt_screen.is_none() {
