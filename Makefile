@@ -1,4 +1,4 @@
-.PHONY: run run-wsl build-win run-win test check clippy build
+.PHONY: run run-wsl build-win run-win test check clippy build setup-hooks
 
 # WSL 環境なら自動で X11 + ソフトウェアGL フラグを付与して起動する
 run:
@@ -29,3 +29,6 @@ clippy:
 
 build:
 	cargo build --release --bin conductty --bin conductty-server
+
+setup-hooks:
+	lefthook install
