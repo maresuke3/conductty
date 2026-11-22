@@ -226,6 +226,60 @@ impl Default for AppConfig {
     }
 }
 
+/// 実行環境 OS の種別（OS 別設定ファイルおよび `[os.<name>]` 上書きの判定用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetOs {
+    MacOs,
+    Windows,
+    Linux,
+    Wsl,
+}
+
+impl TargetOs {
+    pub fn current() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacOs
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::Windows
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+                Self::Wsl
+            } else {
+                Self::Linux
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            Self::Linux
+        }
+    }
+
+    /// `[os.<key>]` セクションで適用するキー順（WSL は `linux` の後に `wsl` を重ねる）
+    pub fn override_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::MacOs => &["macos"],
+            Self::Windows => &["windows"],
+            Self::Linux => &["linux"],
+            Self::Wsl => &["linux", "wsl"],
+        }
+    }
+
+    /// 優先して探索する OS 専用設定ファイル名（先頭ほど高優先度）
+    pub fn file_names(self) -> &'static [&'static str] {
+        match self {
+            Self::MacOs => &["macos.conductty"],
+            Self::Windows => &["windows.conductty"],
+            Self::Linux => &["linux.conductty"],
+            Self::Wsl => &["wsl.conductty", "linux.conductty"],
+        }
+    }
+}
+
 /// 設定ファイルの探索優先順位:
 /// 1. `~/.config/conductty/config.conductty`
 /// 2. `~/.config/config.conductty`
@@ -238,6 +292,28 @@ pub fn config_search_paths(home: &Path) -> Vec<PathBuf> {
         home.join(".conductty").join("config.conductty"),
         home.join(".config.conductty"),
     ]
+}
+
+/// OS 専用設定ファイル（`<os>.conductty`）を優先しつつ探索するパス一覧を返す。
+/// 各配置ディレクトリで `<os>.conductty` が見つかればそれを採用し、`config.conductty` は読まない。
+pub fn config_search_paths_for_os(home: &Path, target_os: TargetOs) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let dirs = [
+        home.join(".config").join("conductty"),
+        home.join(".config"),
+        home.join(".conductty"),
+    ];
+    for dir in dirs {
+        for name in target_os.file_names() {
+            paths.push(dir.join(name));
+        }
+        paths.push(dir.join("config.conductty"));
+    }
+    for name in target_os.file_names() {
+        paths.push(home.join(format!(".{name}")));
+    }
+    paths.push(home.join(".config.conductty"));
+    paths
 }
 
 fn resolve_home_dir() -> Option<PathBuf> {
@@ -273,36 +349,88 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+fn resolve_include_path(base_dir: &Path, inc: &str) -> PathBuf {
+    let inc_path = Path::new(inc);
+    if inc_path.is_absolute() || inc.starts_with("\\\\") {
+        inc_path.to_path_buf()
+    } else {
+        base_dir.join(inc_path)
+    }
+}
+
+fn apply_os_overrides(
+    val: &mut toml::Value,
+    target_os: TargetOs,
+    base_dir: Option<&Path>,
+    depth: u8,
+) -> Result<(), String> {
+    let Some(root_map) = val.as_table_mut() else {
+        return Ok(());
+    };
+    let Some(toml::Value::Table(mut os_map)) = root_map.remove("os") else {
+        return Ok(());
+    };
+
+    for key in target_os.override_keys() {
+        let Some(mut section) = os_map.remove(*key) else {
+            continue;
+        };
+        if depth < 5 {
+            if let (Some(dir), Some(inc)) = (
+                base_dir,
+                section.get("include").and_then(|v| v.as_str()).map(str::to_string),
+            ) {
+                let resolved = resolve_include_path(dir, &inc);
+                let mut included = load_toml_with_include_for_os(&resolved, depth + 1, target_os)?;
+                merge_toml(&mut included, section);
+                section = included;
+            }
+        }
+        merge_toml(val, section);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn load_toml_with_include(path: &Path, depth: u8) -> Result<toml::Value, String> {
+    load_toml_with_include_for_os(path, depth, TargetOs::current())
+}
+
+fn load_toml_with_include_for_os(
+    path: &Path,
+    depth: u8,
+    target_os: TargetOs,
+) -> Result<toml::Value, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("config read error ({}): {e}", path.display()))?;
-    let val: toml::Value = raw
+    let mut val: toml::Value = raw
         .parse()
         .map_err(|e| format!("config parse error ({}): {e}", path.display()))?;
 
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     if depth < 5 {
         if let Some(inc) = val.get("include").and_then(|v| v.as_str()) {
-            let inc_path = Path::new(inc);
-            let resolved = if inc_path.is_absolute() || inc.starts_with("\\\\") {
-                inc_path.to_path_buf()
-            } else {
-                path.parent().unwrap_or_else(|| Path::new(".")).join(inc_path)
-            };
-            let mut base = load_toml_with_include(&resolved, depth + 1)?;
+            let resolved = resolve_include_path(base_dir, inc);
+            let mut base = load_toml_with_include_for_os(&resolved, depth + 1, target_os)?;
             merge_toml(&mut base, val);
-            return Ok(base);
+            val = base;
         }
     }
+    apply_os_overrides(&mut val, target_os, Some(base_dir), depth)?;
     Ok(val)
 }
 
 impl AppConfig {
     pub fn load() -> Self {
+        Self::load_for_os(TargetOs::current())
+    }
+
+    pub fn load_for_os(target_os: TargetOs) -> Self {
         if let Some(home) = resolve_home_dir() {
-            let paths = config_search_paths(&home);
+            let paths = config_search_paths_for_os(&home, target_os);
             for path in &paths {
                 if path.is_file() {
-                    match load_toml_with_include(path, 0)
+                    match load_toml_with_include_for_os(path, 0, target_os)
                         .and_then(|v| v.try_into::<AppConfig>().map_err(|e| e.to_string()))
                     {
                         Ok(cfg) => {
@@ -325,7 +453,13 @@ impl AppConfig {
     }
 
     pub fn from_toml_str(raw: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(raw)
+        Self::from_toml_str_for_os(raw, TargetOs::current())
+    }
+
+    pub fn from_toml_str_for_os(raw: &str, target_os: TargetOs) -> Result<Self, toml::de::Error> {
+        let mut val: toml::Value = toml::from_str(raw)?;
+        let _ = apply_os_overrides(&mut val, target_os, None, 0);
+        val.try_into()
     }
 
     pub fn resolve_theme(&self) -> ResolvedTheme {
@@ -468,5 +602,85 @@ new_tab = "ctrl+shift+t"
         assert_eq!(cfg.features.left_drawer_mode, LeftDrawerMode::Hidden);
         assert!((cfg.appearance.font_size - 16.0).abs() < f32::EPSILON);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn os_search_paths_prioritize_os_specific_file_before_config() {
+        let home = Path::new("/home/tester");
+
+        let mac_paths = config_search_paths_for_os(home, TargetOs::MacOs);
+        assert_eq!(
+            mac_paths[0],
+            PathBuf::from("/home/tester/.config/conductty/macos.conductty")
+        );
+        assert_eq!(
+            mac_paths[1],
+            PathBuf::from("/home/tester/.config/conductty/config.conductty")
+        );
+
+        let wsl_paths = config_search_paths_for_os(home, TargetOs::Wsl);
+        assert_eq!(
+            wsl_paths[0],
+            PathBuf::from("/home/tester/.config/conductty/wsl.conductty")
+        );
+        assert_eq!(
+            wsl_paths[1],
+            PathBuf::from("/home/tester/.config/conductty/linux.conductty")
+        );
+        assert_eq!(
+            wsl_paths[2],
+            PathBuf::from("/home/tester/.config/conductty/config.conductty")
+        );
+    }
+
+    #[test]
+    fn os_section_overrides_apply_only_for_matching_os_and_wsl_layers_over_linux() {
+        let raw = r##"
+[appearance]
+font_size = 18.0
+background_opacity = 0.85
+
+[keybinds]
+split_right = "alt+d"
+
+[os.macos.appearance]
+font_size = 16.0
+
+[os.macos.keybinds]
+split_right = "cmd+d"
+
+[os.windows.appearance]
+font_size = 20.0
+
+[os.linux.features]
+embedded_browser = false
+
+[os.linux.appearance]
+font_size = 17.0
+
+[os.wsl.appearance]
+background_opacity = 1.0
+"##;
+
+        let mac = AppConfig::from_toml_str_for_os(raw, TargetOs::MacOs).unwrap();
+        assert!((mac.appearance.font_size - 16.0).abs() < f32::EPSILON);
+        assert!((mac.appearance.background_opacity - 0.85).abs() < f32::EPSILON);
+        assert_eq!(mac.keybinds.split_right, "cmd+d");
+        assert!(mac.features.embedded_browser);
+
+        let win = AppConfig::from_toml_str_for_os(raw, TargetOs::Windows).unwrap();
+        assert!((win.appearance.font_size - 20.0).abs() < f32::EPSILON);
+        assert_eq!(win.keybinds.split_right, "alt+d");
+
+        let linux = AppConfig::from_toml_str_for_os(raw, TargetOs::Linux).unwrap();
+        assert!((linux.appearance.font_size - 17.0).abs() < f32::EPSILON);
+        assert!((linux.appearance.background_opacity - 0.85).abs() < f32::EPSILON);
+        assert!(!linux.features.embedded_browser);
+
+        // WSL は [os.linux.*] の後に [os.wsl.*] が重なる
+        let wsl = AppConfig::from_toml_str_for_os(raw, TargetOs::Wsl).unwrap();
+        assert!((wsl.appearance.font_size - 17.0).abs() < f32::EPSILON);
+        assert!((wsl.appearance.background_opacity - 1.0).abs() < f32::EPSILON);
+        assert!(!wsl.features.embedded_browser);
     }
 }

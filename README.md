@@ -70,15 +70,16 @@ make clippy
 
 ## 設定 (`config.conductty`)
 
-設定ファイルは以下の優先順位で読み込まれます（見つからない場合は組み込みデフォルトを使用）。
+設定ファイルは以下のディレクトリ優先順位で読み込まれます（見つからない場合は組み込みデフォルトを使用）。  
+各ディレクトリでは **OS 専用ファイル**（`macos.conductty` / `windows.conductty` / `linux.conductty` / WSL は `wsl.conductty` → `linux.conductty`）が `config.conductty` より優先され、OS 専用ファイルが見つかった場合は `config.conductty` は読み込みません。
 
-1. `~/.config/conductty/config.conductty`
-2. `~/.config/config.conductty`
-3. `~/.conductty/config.conductty`
-4. `~/.config.conductty`
+1. `~/.config/conductty/`（`<os>.conductty` → `config.conductty`）
+2. `~/.config/`（`<os>.conductty` → `config.conductty`）
+3. `~/.conductty/`（`<os>.conductty` → `config.conductty`）
+4. `~/`（`.<os>.conductty` → `.config.conductty`）
 5. 組み込みデフォルト設定
 
-リポジトリルートの [`config.conductty`](config.conductty) をベースにコピーして編集できます。`include = "base.toml"` による設定ファイルの分割・継承にも対応しています。
+リポジトリルートの [`config.conductty`](config.conductty) をベースにコピーして編集できます。`include = "base.toml"` による設定ファイルの分割・継承や、1 つの `config.conductty` 内で `[os.macos.*]` / `[os.windows.*]` / `[os.linux.*]` / `[os.wsl.*]` を使った OS 別上書き（WSL では `[os.linux.*]` の後に `[os.wsl.*]` を重ねて適用）にも対応しています。
 
 ### 主な設定項目
 
