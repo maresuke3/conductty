@@ -3,6 +3,10 @@ name = "term-mux"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "conductty-server"
+path = "src/bin/conductty_server.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

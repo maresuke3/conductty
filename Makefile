@@ -12,7 +12,7 @@ run-wsl:
 	WAYLAND_DISPLAY="" WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1 cargo run --bin conductty
 
 build-win:
-	cargo build --target x86_64-pc-windows-gnu --bin conductty
+	cargo build --target x86_64-pc-windows-gnu --bin conductty --bin conductty-server
 	cp -f target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2Loader.dll target/x86_64-pc-windows-gnu/debug/
 
 run-win: build-win
@@ -28,4 +28,4 @@ clippy:
 	cargo clippy --workspace
 
 build:
-	cargo build --release --bin conductty
+	cargo build --release --bin conductty --bin conductty-server

@@ -1,24 +1,36 @@
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
 use vte::{Params, Parser, Perform};
 
 use crate::kitty::KittyState;
 
 const MAX_SCROLLBACK: usize = 2000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgb {
     pub r: u8,
     pub g: u8,
     pub b: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
     pub ch: char,
     pub fg: Rgb,
     pub bg: Option<Rgb>,
     pub bold: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridSnapshot {
+    pub cols: usize,
+    pub rows: usize,
+    pub cursor_col: usize,
+    pub cursor_row: usize,
+    pub cursor_visible: bool,
+    pub bracketed_paste: bool,
+    pub cells: Vec<Cell>,
 }
 
 impl Default for Cell {
@@ -145,6 +157,24 @@ impl TerminalGrid {
 
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_replies)
+    }
+
+    pub fn snapshot(&self) -> GridSnapshot {
+        let mut cells = Vec::with_capacity(self.cols * self.rows);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                cells.push(self.visible_cell(col, row).copied().unwrap_or_default());
+            }
+        }
+        GridSnapshot {
+            cols: self.cols,
+            rows: self.rows,
+            cursor_col: self.cursor_col,
+            cursor_row: self.cursor_row,
+            cursor_visible: self.cursor_visible,
+            bracketed_paste: self.bracketed_paste,
+            cells,
+        }
     }
 
     pub fn scroll_up(&mut self, lines: usize) {

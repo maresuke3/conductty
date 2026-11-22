@@ -10,7 +10,7 @@ use std::thread;
 use browser::{BrowserBounds, EmbeddedBrowser};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
 use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme};
-use term_core::grid::TerminalGrid;
+use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::input::{
     Action, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode, KeyEvent as CoreKeyEvent,
     Modifiers, PerformableContext,
@@ -18,7 +18,10 @@ use term_core::input::{
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_drawer::{DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot};
-use term_mux::{DEFAULT_IPC_ADDR, MuxRequest, MuxResponse, PaneInfo, send_request};
+use term_mux::{
+    DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MuxRequest, MuxResponse, PaneInfo, SpawnKind,
+    send_request,
+};
 use term_render::bg_from_rgb;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -37,6 +40,7 @@ enum UserEvent {
     PtyOutput,
     PaneExited(PaneId),
     DrawerUpdated(DrawerSnapshot),
+    MuxStateUpdated(WorkspaceManager, HashMap<PaneId, GridSnapshot>),
     IpcRequest(MuxRequest, tokio::sync::oneshot::Sender<MuxResponse>),
 }
 
@@ -227,6 +231,8 @@ struct App {
     egui_state: Option<egui_winit::State>,
     manager: WorkspaceManager,
     panes: HashMap<PaneId, PaneRuntime>,
+    mux_snapshots: HashMap<PaneId, GridSnapshot>,
+    mux_last_sizes: HashMap<PaneId, (usize, usize)>,
     next_pane_id: PaneId,
     go_to_active: bool,
     left_drawer_mode: LeftDrawerMode,
@@ -432,6 +438,9 @@ impl App {
                     delivered_to: delivered,
                 }
             }
+            _ => MuxResponse::Error {
+                message: "supported in conductty-server (--mux) mode only".to_string(),
+            },
         }
     }
 
@@ -585,8 +594,151 @@ impl App {
         }
     }
 
+    fn ensure_mux_server_and_attach(&mut self) {
+        if let Ok(MuxResponse::State { manager, snapshots }) =
+            self.rt.block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Attach))
+        {
+            self.manager = manager;
+            self.mux_snapshots = snapshots.into_iter().collect();
+        } else {
+            // サーバーが未起動ならバックグラウンドで起動して再接続
+            let server_bin = if cfg!(target_os = "windows") {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("conductty-server.exe")))
+                    .filter(|p| p.is_file())
+                    .unwrap_or_else(|| PathBuf::from("conductty-server.exe"))
+            } else {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("conductty-server")))
+                    .filter(|p| p.is_file())
+                    .unwrap_or_else(|| PathBuf::from("conductty-server"))
+            };
+            match Command::new(&server_bin).spawn() {
+                Ok(_) => {
+                    for _ in 0..20 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if let Ok(MuxResponse::State { manager, snapshots }) =
+                            self.rt.block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Attach))
+                        {
+                            self.manager = manager;
+                            self.mux_snapshots = snapshots.into_iter().collect();
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[conductty] failed to spawn {server_bin:?}: {err}");
+                }
+            }
+        }
+
+        // バックグラウンドでサーバーの画面状態を定期同期
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let mut logged_err = false;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+                match send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::PollSnapshots).await {
+                    Ok(MuxResponse::State { manager, snapshots }) => {
+                        logged_err = false;
+                        if proxy
+                            .send_event(UserEvent::MuxStateUpdated(
+                                manager,
+                                snapshots.into_iter().collect(),
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(other) => {
+                        if !logged_err {
+                            eprintln!("[conductty-mux] PollSnapshots unexpected: {other:?}");
+                            logged_err = true;
+                        }
+                    }
+                    Err(e) => {
+                        if !logged_err {
+                            eprintln!("[conductty-mux] PollSnapshots error: {e}");
+                            logged_err = true;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn send_mux_action(&mut self, req: MuxRequest) {
+        if let Ok(MuxResponse::State { manager, snapshots }) =
+            self.rt.block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &req))
+        {
+            self.manager = manager;
+            self.mux_snapshots = snapshots.into_iter().collect();
+        }
+    }
+
     fn handle_action(&mut self, action: Action) {
         let area = self.terminal_area();
+        if self.config.features.multiplexer_mode {
+            match action {
+                Action::SplitRight => {
+                    self.send_mux_action(MuxRequest::SpawnPane {
+                        kind: SpawnKind::SplitRight,
+                    });
+                    return;
+                }
+                Action::SplitDown => {
+                    self.send_mux_action(MuxRequest::SpawnPane {
+                        kind: SpawnKind::SplitDown,
+                    });
+                    return;
+                }
+                Action::NewTab => {
+                    self.send_mux_action(MuxRequest::SpawnPane {
+                        kind: SpawnKind::NewTab,
+                    });
+                    return;
+                }
+                Action::NewWorkspace => {
+                    self.send_mux_action(MuxRequest::SpawnPane {
+                        kind: SpawnKind::NewWorkspace,
+                    });
+                    self.left_drawer_selected_idx = self.manager.active_workspace;
+                    self.router.mode = InputMode::Normal;
+                    return;
+                }
+                Action::ToggleZoom => {
+                    self.send_mux_action(MuxRequest::ToggleZoom);
+                    return;
+                }
+                Action::LeftDrawerSelect => {
+                    self.send_mux_action(MuxRequest::SwitchWorkspace {
+                        idx: self.left_drawer_selected_idx,
+                    });
+                    self.router.mode = InputMode::Normal;
+                    return;
+                }
+                Action::LeftDrawerCloseWorkspace => {
+                    self.send_mux_action(MuxRequest::CloseWorkspace {
+                        idx: self.left_drawer_selected_idx,
+                    });
+                    if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
+                        self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
+                    }
+                    return;
+                }
+                Action::GotoSplit(dir) => {
+                    self.manager.active_tab_mut().goto_split(dir, area);
+                    let focused = self.manager.active_tab().focused_pane;
+                    self.send_mux_action(MuxRequest::FocusPane { pane_id: focused });
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match action {
             Action::SplitRight => {
                 if let Some(new_id) = self.spawn_pane() {
@@ -801,7 +953,11 @@ impl ApplicationHandler<UserEvent> for App {
             self.start_ipc_server();
         }
 
-        if self.panes.is_empty() {
+        if self.config.features.multiplexer_mode {
+            if self.mux_snapshots.is_empty() {
+                self.ensure_mux_server_and_attach();
+            }
+        } else if self.panes.is_empty() {
             if let Some(first_id) = self.spawn_pane() {
                 self.manager = WorkspaceManager::new(first_id);
                 // 前回セッションの Workspace 名を復元する (index 0 は Master Space 固定)
@@ -854,6 +1010,13 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("[conductty drawer error] {err}");
                 }
                 self.drawer_snapshot = snapshot;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            UserEvent::MuxStateUpdated(manager, snapshots) => {
+                self.manager = manager;
+                self.mux_snapshots = snapshots;
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1056,7 +1219,15 @@ impl ApplicationHandler<UserEvent> for App {
                     match decision {
                         InputDecision::SendToPty(bytes) => {
                             let focused = self.manager.active_tab().focused_pane;
-                            if let Some(pane) = self.panes.get_mut(&focused) {
+                            if self.config.features.multiplexer_mode {
+                                let _ = self.rt.block_on(send_request(
+                                    DEFAULT_MUX_SERVER_ADDR,
+                                    &MuxRequest::WriteBytes {
+                                        pane_id: focused,
+                                        bytes,
+                                    },
+                                ));
+                            } else if let Some(pane) = self.panes.get_mut(&focused) {
                                 if let Ok(mut g) = pane.grid.lock() {
                                     g.reset_scroll();
                                 }
@@ -1596,184 +1767,52 @@ impl ApplicationHandler<UserEvent> for App {
                                     egui::StrokeKind::Inside,
                                 );
 
-                                if let Some(runtime) = self.panes.get(pane_id) {
-                                    let target_cols =
-                                        ((rect.width - pad_x * 2.0) / char_w).floor().max(10.0)
-                                            as usize;
-                                    let target_rows =
-                                        ((rect.height - pad_y * 2.0) / row_h).floor().max(4.0)
-                                            as usize;
+                                let target_cols =
+                                    ((rect.width - pad_x * 2.0) / char_w).floor().max(10.0)
+                                        as usize;
+                                let target_rows =
+                                    ((rect.height - pad_y * 2.0) / row_h).floor().max(4.0)
+                                        as usize;
+
+                                if self.config.features.multiplexer_mode {
+                                    if self.mux_last_sizes.get(pane_id).copied()
+                                        != Some((target_cols, target_rows))
+                                    {
+                                        pending_resizes.push((*pane_id, target_cols, target_rows));
+                                    }
+                                    if let Some(snap) = self.mux_snapshots.get(pane_id) {
+                                        render_grid_snapshot(
+                                            &painter,
+                                            snap,
+                                            rect,
+                                            pad_x,
+                                            pad_y,
+                                            char_w,
+                                            row_h,
+                                            &font_id,
+                                            is_focused,
+                                            selection.filter(|(p, _, _)| p == pane_id),
+                                        );
+                                    }
+                                } else if let Some(runtime) = self.panes.get(pane_id) {
                                     if (target_cols, target_rows) != runtime.last_size {
                                         pending_resizes.push((*pane_id, target_cols, target_rows));
                                     }
 
                                     if let Ok(g) = runtime.grid.lock() {
-                                        // 選択範囲のハイライト描画 (#3d59a1)
-                                        if let Some((sel_pane, a, b)) = selection {
-                                            if sel_pane == *pane_id && a != b {
-                                                let ((sc, sr), (ec, er)) = if (a.1, a.0) <= (b.1, b.0) {
-                                                    (a, b)
-                                                } else {
-                                                    (b, a)
-                                                };
-                                                for row in sr..=er.min(g.rows.saturating_sub(1)) {
-                                                    let c_start = if row == sr { sc } else { 0 };
-                                                    let c_end = if row == er {
-                                                        ec.min(g.cols.saturating_sub(1))
-                                                    } else {
-                                                        g.cols.saturating_sub(1)
-                                                    };
-                                                    if c_end >= c_start {
-                                                        let sel_rect = Rect::from_min_size(
-                                                            Pos2::new(
-                                                                rect.x
-                                                                    + pad_x
-                                                                    + c_start as f32 * char_w,
-                                                                rect.y + pad_y + row as f32 * row_h,
-                                                            ),
-                                                            Vec2::new(
-                                                                (c_end - c_start + 1) as f32
-                                                                    * char_w,
-                                                                row_h,
-                                                            ),
-                                                        );
-                                                        painter.rect_filled(
-                                                            sel_rect,
-                                                            0.0,
-                                                            Color32::from_rgba_unmultiplied(
-                                                                0x3d, 0x59, 0xa1, 140,
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        for row in 0..g.rows {
-                                            let y = rect.y + pad_y + row as f32 * row_h;
-                                            let mut col = 0;
-                                            while col < g.cols {
-                                                let Some(first) = g.visible_cell(col, row) else {
-                                                    break;
-                                                };
-                                                let fg = first.fg;
-                                                let bg = first.bg;
-                                                let mut run = String::new();
-                                                let mut box_chars: Vec<(usize, char)> = Vec::new();
-                                                let mut non_ascii_chars: Vec<(usize, char)> =
-                                                    Vec::new();
-                                                let start_col = col;
-                                                while col < g.cols {
-                                                    if let Some(cell) = g.visible_cell(col, row) {
-                                                        if cell.fg == fg && cell.bg == bg {
-                                                            if is_box_drawing_char(cell.ch) {
-                                                                box_chars.push((col, cell.ch));
-                                                                run.push(' ');
-                                                            } else if !cell.ch.is_ascii() {
-                                                                non_ascii_chars.push((col, cell.ch));
-                                                                run.push(' ');
-                                                            } else {
-                                                                run.push(cell.ch);
-                                                            }
-                                                            col += 1;
-                                                            continue;
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-
-                                                if let Some(bg_rgb) = bg {
-                                                    let x0 = (rect.x
-                                                        + pad_x
-                                                        + start_col as f32 * char_w)
-                                                        .round();
-                                                    let x1 =
-                                                        (rect.x + pad_x + col as f32 * char_w)
-                                                            .round();
-                                                    let bg_rect = Rect::from_min_max(
-                                                        Pos2::new(x0, y.round()),
-                                                        Pos2::new(x1, (y + row_h).round()),
-                                                    );
-                                                    painter.rect_filled(
-                                                        bg_rect,
-                                                        0.0,
-                                                        Color32::from_rgb(
-                                                            bg_rgb.r, bg_rgb.g, bg_rgb.b,
-                                                        ),
-                                                    );
-                                                }
-
-                                                let fg_color = Color32::from_rgb(fg.r, fg.g, fg.b);
-                                                for (b_col, b_ch) in box_chars {
-                                                    let cell_rect = Rect::from_min_size(
-                                                        Pos2::new(
-                                                            (rect.x + pad_x + b_col as f32 * char_w)
-                                                                .round(),
-                                                            y.round(),
-                                                        ),
-                                                        Vec2::new(char_w.round(), row_h.round()),
-                                                    );
-                                                    draw_box_drawing(
-                                                        &painter,
-                                                        b_ch,
-                                                        cell_rect,
-                                                        fg_color,
-                                                    );
-                                                }
-
-                                                let trimmed = run.trim_end();
-                                                if !trimmed.is_empty() {
-                                                    let pos = Pos2::new(
-                                                        (rect.x + pad_x + start_col as f32 * char_w)
-                                                            .round(),
-                                                        y.round(),
-                                                    );
-                                                    painter.text(
-                                                        pos,
-                                                        egui::Align2::LEFT_TOP,
-                                                        trimmed,
-                                                        font_id.clone(),
-                                                        fg_color,
-                                                    );
-                                                }
-
-                                                // 日本語や Nerd Font アイコンはグリッド座標に厳密固定して描画する
-                                                let mut buf = [0u8; 4];
-                                                for (n_col, n_ch) in non_ascii_chars {
-                                                    let pos = Pos2::new(
-                                                        (rect.x + pad_x + n_col as f32 * char_w)
-                                                            .round(),
-                                                        y.round(),
-                                                    );
-                                                    let s = n_ch.encode_utf8(&mut buf);
-                                                    painter.text(
-                                                        pos,
-                                                        egui::Align2::LEFT_TOP,
-                                                        s,
-                                                        font_id.clone(),
-                                                        fg_color,
-                                                    );
-                                                }
-                                            }
-                                        }
-
-                                        if is_focused && g.scroll_offset == 0 && g.cursor_visible {
-                                            let cx = rect.x + pad_x + g.cursor_col as f32 * char_w;
-                                            let cy = rect.y + pad_y + g.cursor_row as f32 * row_h;
-                                            let cursor_rect = Rect::from_min_size(
-                                                Pos2::new(cx, cy),
-                                                Vec2::new(char_w, row_h),
-                                            );
-                                            painter.rect_filled(
-                                                cursor_rect,
-                                                1.0,
-                                                Color32::from_rgba_unmultiplied(
-                                                    0x82, 0xaa, 0xff, 160,
-                                                ),
-                                            );
-                                        }
-
-                                        // Kitty Graphics 画像の描画
+                                        let snap = g.snapshot();
+                                        render_grid_snapshot(
+                                            &painter,
+                                            &snap,
+                                            rect,
+                                            pad_x,
+                                            pad_y,
+                                            char_w,
+                                            row_h,
+                                            &font_id,
+                                            is_focused,
+                                            selection.filter(|(p, _, _)| p == pane_id),
+                                        );
                                         if self.config.features.kitty_graphics
                                             && g.scroll_offset == 0
                                             && !g.kitty.placements.is_empty()
@@ -1930,7 +1969,11 @@ impl ApplicationHandler<UserEvent> for App {
                     need_redraw = true;
                 }
                 if let Some((idx, new_name)) = commit_rename {
-                    self.manager.rename_workspace(idx, new_name);
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::RenameWorkspace { idx, name: new_name });
+                    } else {
+                        self.manager.rename_workspace(idx, new_name);
+                    }
                     self.renaming_workspace_idx = None;
                     need_redraw = true;
                 }
@@ -1942,12 +1985,16 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 if let Some(idx) = close_ws_idx {
-                    let closed = self.manager.close_workspace(idx);
-                    for pid in closed {
-                        self.panes.remove(&pid);
-                    }
-                    if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
-                        self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::CloseWorkspace { idx });
+                    } else {
+                        let closed = self.manager.close_workspace(idx);
+                        for pid in closed {
+                            self.panes.remove(&pid);
+                        }
+                        if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
+                            self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
+                        }
                     }
                     need_redraw = true;
                 }
@@ -1960,13 +2007,22 @@ impl ApplicationHandler<UserEvent> for App {
                     need_redraw = true;
                 }
                 if let Some(ws_idx) = switch_ws_target {
-                    self.manager.switch_workspace(ws_idx);
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::SwitchWorkspace { idx: ws_idx });
+                    } else {
+                        self.manager.switch_workspace(ws_idx);
+                    }
                     self.left_drawer_selected_idx = ws_idx;
                     need_redraw = true;
                 }
                 if let Some((ws_idx, tab_idx)) = switch_tab_target {
-                    self.manager.switch_workspace(ws_idx);
-                    self.manager.switch_tab(tab_idx);
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::SwitchWorkspace { idx: ws_idx });
+                        self.send_mux_action(MuxRequest::SwitchTab { idx: tab_idx });
+                    } else {
+                        self.manager.switch_workspace(ws_idx);
+                        self.manager.switch_tab(tab_idx);
+                    }
                     self.left_drawer_selected_idx = ws_idx;
                     need_redraw = true;
                 }
@@ -1975,18 +2031,26 @@ impl ApplicationHandler<UserEvent> for App {
                     need_redraw = true;
                 }
                 if let Some(t_idx) = select_tab_idx {
-                    self.manager.switch_tab(t_idx);
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::SwitchTab { idx: t_idx });
+                    } else {
+                        self.manager.switch_tab(t_idx);
+                    }
                     need_redraw = true;
                 }
                 if let Some(t_idx) = close_tab_idx {
-                    let (closed_panes, keep_running) = self.manager.close_tab(t_idx);
-                    for pid in closed_panes {
-                        self.panes.remove(&pid);
-                    }
-                    if !keep_running {
-                        self.save_session();
-                        event_loop.exit();
-                        return;
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::CloseTab { idx: t_idx });
+                    } else {
+                        let (closed_panes, keep_running) = self.manager.close_tab(t_idx);
+                        for pid in closed_panes {
+                            self.panes.remove(&pid);
+                        }
+                        if !keep_running {
+                            self.save_session();
+                            event_loop.exit();
+                            return;
+                        }
                     }
                     need_redraw = true;
                 }
@@ -2021,12 +2085,27 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(text) = send_to_pane_text {
                     let focused = self.manager.active_tab().focused_pane;
-                    if let Some(pane) = self.panes.get_mut(&focused) {
+                    if self.config.features.multiplexer_mode {
+                        self.send_mux_action(MuxRequest::WriteBytes {
+                            pane_id: focused,
+                            bytes: text.into_bytes(),
+                        });
+                    } else if let Some(pane) = self.panes.get_mut(&focused) {
                         let _ = pane.pty.write_bytes(text.as_bytes());
                     }
                 }
                 for (pane_id, cols, rows) in pending_resizes {
-                    if let Some(runtime) = self.panes.get_mut(&pane_id) {
+                    if self.config.features.multiplexer_mode {
+                        if !self.mux_snapshots.is_empty() {
+                            self.mux_last_sizes.insert(pane_id, (cols, rows));
+                            self.send_mux_action(MuxRequest::ResizePane {
+                                pane_id,
+                                cols,
+                                rows,
+                            });
+                            need_redraw = true;
+                        }
+                    } else if let Some(runtime) = self.panes.get_mut(&pane_id) {
                         runtime.last_size = (cols, rows);
                         if let Ok(mut g) = runtime.grid.lock() {
                             g.resize(cols, rows);
@@ -2126,6 +2205,149 @@ fn render_github_section(
             frame_resp.response.scroll_to_me(None);
         }
         ui.add_space(4.0);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_grid_snapshot(
+    painter: &egui::Painter,
+    snap: &GridSnapshot,
+    rect: &CoreRect,
+    pad_x: f32,
+    pad_y: f32,
+    char_w: f32,
+    row_h: f32,
+    font_id: &FontId,
+    is_focused: bool,
+    selection: Option<(PaneId, (usize, usize), (usize, usize))>,
+) {
+    let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
+
+    for row in 0..snap.rows {
+        let y = rect.y + pad_y + row as f32 * row_h;
+        let row_start = row * snap.cols;
+        let mut col = 0;
+
+        while col < snap.cols {
+            let Some(cell) = snap.cells.get(row_start + col) else {
+                break;
+            };
+            if let Some(bg_rgb) = cell.bg {
+                let mut end_col = col + 1;
+                while end_col < snap.cols {
+                    if snap
+                        .cells
+                        .get(row_start + end_col)
+                        .and_then(|c| c.bg)
+                        == Some(bg_rgb)
+                    {
+                        end_col += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let bg_rect = Rect::from_min_size(
+                    Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
+                    Vec2::new((end_col - col) as f32 * char_w, row_h),
+                );
+                painter.rect_filled(
+                    bg_rect,
+                    0.0,
+                    Color32::from_rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b),
+                );
+                col = end_col;
+            } else {
+                col += 1;
+            }
+        }
+
+        if let Some((start, end)) = sel_range {
+            for col in 0..snap.cols {
+                let pos = (row, col);
+                if pos >= start && pos <= end {
+                    let sel_rect = Rect::from_min_size(
+                        Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
+                        Vec2::new(char_w, row_h),
+                    );
+                    painter.rect_filled(
+                        sel_rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(0x3d, 0x59, 0xa1, 120),
+                    );
+                }
+            }
+        }
+
+        col = 0;
+        while col < snap.cols {
+            let Some(cell) = snap.cells.get(row_start + col) else {
+                break;
+            };
+            let ch = cell.ch;
+            if ch == ' ' || ch == '\0' {
+                col += 1;
+                continue;
+            }
+            let fg_color = Color32::from_rgb(cell.fg.r, cell.fg.g, cell.fg.b);
+            if is_box_drawing_char(ch) {
+                let cell_rect = Rect::from_min_size(
+                    Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
+                    Vec2::new(char_w, row_h),
+                );
+                if !draw_box_drawing(painter, ch, cell_rect, fg_color) {
+                    painter.text(
+                        Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
+                        egui::Align2::LEFT_TOP,
+                        ch.to_string(),
+                        font_id.clone(),
+                        fg_color,
+                    );
+                }
+                col += 1;
+            } else if ch.is_ascii() {
+                let fg_rgb = cell.fg;
+                let mut text_run = String::new();
+                let start_col = col;
+                while col < snap.cols {
+                    let Some(c) = snap.cells.get(row_start + col) else {
+                        break;
+                    };
+                    if c.ch.is_ascii() && c.ch != '\0' && c.fg == fg_rgb {
+                        text_run.push(c.ch);
+                        col += 1;
+                    } else {
+                        break;
+                    }
+                }
+                painter.text(
+                    Pos2::new(rect.x + pad_x + start_col as f32 * char_w, y),
+                    egui::Align2::LEFT_TOP,
+                    text_run,
+                    font_id.clone(),
+                    fg_color,
+                );
+            } else {
+                painter.text(
+                    Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
+                    egui::Align2::LEFT_TOP,
+                    ch.to_string(),
+                    font_id.clone(),
+                    fg_color,
+                );
+                col += 1;
+            }
+        }
+    }
+
+    if is_focused && snap.cursor_visible {
+        let cx = rect.x + pad_x + snap.cursor_col as f32 * char_w;
+        let cy = rect.y + pad_y + snap.cursor_row as f32 * row_h;
+        let cursor_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(char_w, row_h));
+        painter.rect_filled(
+            cursor_rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(0x82, 0xaa, 0xff, 160),
+        );
     }
 }
 
@@ -2496,6 +2718,9 @@ fn send_ipc_with_wsl_fallback(
     req: &MuxRequest,
     rt: &tokio::runtime::Runtime,
 ) -> Result<MuxResponse, String> {
+    if let Ok(resp) = rt.block_on(send_request(DEFAULT_MUX_SERVER_ADDR, req)) {
+        return Ok(resp);
+    }
     match rt.block_on(send_request(DEFAULT_IPC_ADDR, req)) {
         Ok(resp) => Ok(resp),
         Err(err) if cfg!(target_os = "linux") && std::env::var_os("WSL_DISTRO_NAME").is_some() => {
@@ -2634,6 +2859,8 @@ fn main() {
         egui_state: None,
         manager: WorkspaceManager::new(1),
         panes: HashMap::new(),
+        mux_snapshots: HashMap::new(),
+        mux_last_sizes: HashMap::new(),
         next_pane_id: 1,
         go_to_active: false,
         left_drawer_mode,
