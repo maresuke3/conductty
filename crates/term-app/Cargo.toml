@@ -15,6 +15,7 @@ egui-winit.workspace = true
 serde_json.workspace = true
 term-core = { path = "../term-core" }
 term-drawer = { path = "../term-drawer" }
+term-mux = { path = "../term-mux" }
 term-render = { path = "../term-render" }
 tokio.workspace = true
 wgpu.workspace = true

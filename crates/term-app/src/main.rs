@@ -18,6 +18,7 @@ use term_core::input::{
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_drawer::{DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot};
+use term_mux::{DEFAULT_IPC_ADDR, MuxRequest, MuxResponse, PaneInfo, send_request};
 use term_render::bg_from_rgb;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -31,11 +32,12 @@ const TAB_BAR_HEIGHT: f32 = 32.0;
 const RIGHT_DRAWER_WIDTH: f32 = 340.0;
 const RIGHT_BROWSER_WIDTH: f32 = 560.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum UserEvent {
     PtyOutput,
     PaneExited(PaneId),
     DrawerUpdated(DrawerSnapshot),
+    IpcRequest(MuxRequest, tokio::sync::oneshot::Sender<MuxResponse>),
 }
 
 struct PaneRuntime {
@@ -337,6 +339,102 @@ impl App {
         }
     }
 
+    fn start_ipc_server(&self) {
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            use tokio::net::TcpListener;
+
+            let Ok(listener) = TcpListener::bind(DEFAULT_IPC_ADDR).await else {
+                return;
+            };
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let proxy = proxy.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let resp = match serde_json::from_str::<MuxRequest>(&line) {
+                            Ok(req) => {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                if proxy.send_event(UserEvent::IpcRequest(req, tx)).is_err() {
+                                    MuxResponse::Error {
+                                        message: "GUI event loop closed".to_string(),
+                                    }
+                                } else {
+                                    rx.await.unwrap_or(MuxResponse::Error {
+                                        message: "IPC timeout".to_string(),
+                                    })
+                                }
+                            }
+                            Err(e) => MuxResponse::Error {
+                                message: format!("invalid request: {e}"),
+                            },
+                        };
+                        if let Ok(mut json) = serde_json::to_string(&resp) {
+                            json.push('\n');
+                            let _ = writer.write_all(json.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    fn handle_ipc_request(&mut self, req: MuxRequest) -> MuxResponse {
+        match req {
+            MuxRequest::Ping => MuxResponse::Pong,
+            MuxRequest::ListPanes => {
+                let focused = self.manager.active_tab().focused_pane;
+                let mut panes = Vec::new();
+                for ws in &self.manager.workspaces {
+                    for (t_idx, tab) in ws.tabs.iter().enumerate() {
+                        for pid in tab.all_panes() {
+                            panes.push(PaneInfo {
+                                pane_id: pid,
+                                workspace: ws.name.clone(),
+                                tab_index: t_idx + 1,
+                                focused: pid == focused,
+                            });
+                        }
+                    }
+                }
+                MuxResponse::Panes { panes }
+            }
+            MuxRequest::SendKeys {
+                pane_id,
+                text,
+                broadcast,
+            } => {
+                let mut delivered = 0;
+                if broadcast {
+                    for pane in self.panes.values_mut() {
+                        if pane.pty.write_bytes(text.as_bytes()).is_ok() {
+                            delivered += 1;
+                        }
+                    }
+                } else {
+                    let target = pane_id.unwrap_or_else(|| self.manager.active_tab().focused_pane);
+                    if let Some(pane) = self.panes.get_mut(&target) {
+                        if pane.pty.write_bytes(text.as_bytes()).is_ok() {
+                            delivered = 1;
+                        }
+                    } else {
+                        return MuxResponse::Error {
+                            message: format!("pane {target} not found"),
+                        };
+                    }
+                }
+                MuxResponse::Ok {
+                    delivered_to: delivered,
+                }
+            }
+        }
+    }
+
     fn trigger_drawer_refresh(&mut self) {
         self.drawer_snapshot.is_loading = true;
         let proxy = self.proxy.clone();
@@ -420,12 +518,24 @@ impl App {
         };
         if let Ok(text) = cb.get_text() {
             if !text.is_empty() {
+                let normalized = text.replace("\r\n", "\n");
                 let focused = self.manager.active_tab().focused_pane;
                 if let Some(pane) = self.panes.get_mut(&focused) {
-                    if let Ok(mut g) = pane.grid.lock() {
+                    let bracketed = if let Ok(mut g) = pane.grid.lock() {
                         g.reset_scroll();
+                        g.bracketed_paste
+                    } else {
+                        false
+                    };
+                    if bracketed {
+                        let mut payload = Vec::with_capacity(normalized.len() + 12);
+                        payload.extend_from_slice(b"\x1b[200~");
+                        payload.extend_from_slice(normalized.as_bytes());
+                        payload.extend_from_slice(b"\x1b[201~");
+                        let _ = pane.pty.write_bytes(&payload);
+                    } else {
+                        let _ = pane.pty.write_bytes(normalized.as_bytes());
                     }
-                    let _ = pane.pty.write_bytes(text.as_bytes());
                 }
             }
         }
@@ -688,6 +798,7 @@ impl ApplicationHandler<UserEvent> for App {
             if self.config.features.right_drawer {
                 self.trigger_drawer_refresh();
             }
+            self.start_ipc_server();
         }
 
         if self.panes.is_empty() {
@@ -743,6 +854,13 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("[conductty drawer error] {err}");
                 }
                 self.drawer_snapshot = snapshot;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            UserEvent::IpcRequest(req, reply_tx) => {
+                let resp = self.handle_ipc_request(req);
+                let _ = reply_tx.send(resp);
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1737,6 +1855,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
 
                             let mut status_parts = Vec::new();
+                            if self.config.features.multiplexer_mode {
+                                status_parts.push("MUX");
+                            }
                             if pane_mode {
                                 status_parts.push("PANE MODE (h/j/k/l: move, z: zoom, Enter/Esc: exit)");
                             }
@@ -2370,14 +2491,133 @@ fn to_core_key_event(key: &Key, mods: ModifiersState) -> Option<CoreKeyEvent> {
     })
 }
 
+fn send_ipc_with_wsl_fallback(
+    args: &[String],
+    req: &MuxRequest,
+    rt: &tokio::runtime::Runtime,
+) -> Result<MuxResponse, String> {
+    match rt.block_on(send_request(DEFAULT_IPC_ADDR, req)) {
+        Ok(resp) => Ok(resp),
+        Err(err) if cfg!(target_os = "linux") && std::env::var_os("WSL_DISTRO_NAME").is_some() => {
+            // WSL2 上で Windows 版 conductty.exe が動いている場合、Windows 側バイナリへフォワードする
+            let exe_candidates = [
+                std::path::PathBuf::from("./target/x86_64-pc-windows-gnu/debug/conductty.exe"),
+                std::path::PathBuf::from("./target/x86_64-pc-windows-gnu/release/conductty.exe"),
+                std::path::PathBuf::from("conductty.exe"),
+            ];
+            for exe in exe_candidates {
+                if exe.is_file() || exe == std::path::Path::new("conductty.exe") {
+                    if let Ok(status) = Command::new(&exe).args(&args[1..]).status() {
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
+                }
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i32> {
+    let sub = args.get(1)?.as_str();
+    match sub {
+        "panes" => {
+            match send_ipc_with_wsl_fallback(args, &MuxRequest::ListPanes, rt) {
+                Ok(MuxResponse::Panes { panes }) => {
+                    for p in panes {
+                        let mark = if p.focused { " *" } else { "" };
+                        println!("[{}] {} / Tab {}{}", p.pane_id, p.workspace, p.tab_index, mark);
+                    }
+                    Some(0)
+                }
+                Ok(other) => {
+                    eprintln!("unexpected response: {other:?}");
+                    Some(1)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    Some(1)
+                }
+            }
+        }
+        "send" => {
+            let Some(pane_str) = args.get(2) else {
+                eprintln!("usage: conductty send <pane_id> <text>");
+                return Some(2);
+            };
+            let Ok(pane_id) = pane_str.parse::<PaneId>() else {
+                eprintln!("invalid pane_id: {pane_str}");
+                return Some(2);
+            };
+            let raw_text = args.get(3).map(String::as_str).unwrap_or("");
+            let text = raw_text.replace("\\r\\n", "\r").replace("\\n", "\r").replace("\\r", "\r").replace('\n', "\r");
+            let req = MuxRequest::SendKeys {
+                pane_id: Some(pane_id),
+                text,
+                broadcast: false,
+            };
+            match send_ipc_with_wsl_fallback(args, &req, rt) {
+                Ok(MuxResponse::Ok { delivered_to }) => {
+                    println!("sent to {delivered_to} pane(s)");
+                    Some(0)
+                }
+                Ok(MuxResponse::Error { message }) => {
+                    eprintln!("error: {message}");
+                    Some(1)
+                }
+                Ok(other) => {
+                    eprintln!("unexpected response: {other:?}");
+                    Some(1)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    Some(1)
+                }
+            }
+        }
+        "broadcast" => {
+            let raw_text = args.get(2).map(String::as_str).unwrap_or("");
+            let text = raw_text.replace("\\r\\n", "\r").replace("\\n", "\r").replace("\\r", "\r").replace('\n', "\r");
+            let req = MuxRequest::SendKeys {
+                pane_id: None,
+                text,
+                broadcast: true,
+            };
+            match send_ipc_with_wsl_fallback(args, &req, rt) {
+                Ok(MuxResponse::Ok { delivered_to }) => {
+                    println!("broadcast to {delivered_to} pane(s)");
+                    Some(0)
+                }
+                Ok(other) => {
+                    eprintln!("unexpected response: {other:?}");
+                    Some(1)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    Some(1)
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn main() {
-    let config = AppConfig::load();
+    let args: Vec<String> = std::env::args().collect();
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    if let Some(code) = run_cli_subcommand(&args, &rt) {
+        std::process::exit(code);
+    }
+
+    let mut config = AppConfig::load();
+    if args.iter().any(|a| a == "--mux") {
+        config.features.multiplexer_mode = true;
+    }
     let theme = config.resolve_theme();
     let router = InputRouter::from_config(&config);
     let left_drawer_mode = config.features.left_drawer_mode;
     let right_drawer_open =
         config.features.right_drawer && config.features.right_drawer_default_open;
-    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("failed to create event loop");
