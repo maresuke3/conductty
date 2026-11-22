@@ -1,8 +1,10 @@
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,8 +20,20 @@ pub enum PtyError {
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    exited: Arc<AtomicBool>,
     pub output_rx: mpsc::Receiver<Vec<u8>>,
     pub exit_rx: mpsc::Receiver<()>,
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        if !self.exited.load(Ordering::Acquire)
+            && let Some(mut killer) = self.killer.take()
+        {
+            let _ = killer.kill();
+        }
+    }
 }
 
 impl PtySession {
@@ -82,16 +96,23 @@ impl PtySession {
             }
         });
 
+        let killer = child.clone_killer();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_clone = Arc::clone(&exited);
+
         // Windows ConPTY は子プロセス終了後もパイプを閉じないため、child.wait() で終了を検知する
         let (exit_tx, exit_rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = child.wait();
+            exited_clone.store(true, Ordering::Release);
             let _ = exit_tx.send(());
         });
 
         Ok(Self {
             master: pair.master,
             writer,
+            killer: Some(killer),
+            exited,
             output_rx: rx,
             exit_rx,
         })
@@ -112,5 +133,59 @@ impl PtySession {
                 pixel_height: 0,
             })
             .map_err(|e| PtyError::Open(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_pty_session_kills_child_and_notifies_exit() {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("sleep");
+        cmd.arg("60");
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+
+        let killer = child.clone_killer();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_clone = Arc::clone(&exited);
+        let writer = pair.master.take_writer().unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = child.wait();
+            exited_clone.store(true, Ordering::Release);
+            let _ = exit_tx.send(());
+        });
+
+        let mut session = PtySession {
+            master: pair.master,
+            writer,
+            killer: Some(killer),
+            exited,
+            output_rx: rx,
+            exit_rx,
+        };
+        let (_dummy_tx, dummy_rx) = mpsc::channel();
+        let exit_rx = std::mem::replace(&mut session.exit_rx, dummy_rx);
+        drop(session);
+
+        assert!(
+            exit_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok(),
+            "child process should terminate promptly when PtySession is dropped"
+        );
     }
 }

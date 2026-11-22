@@ -1,6 +1,3 @@
-use cosmic_text::{Attrs, Family, FontSystem};
-use term_core::config::AppearanceConfig;
-
 fn srgb_to_linear(c: u8) -> f64 {
     let s = c as f64 / 255.0;
     if s <= 0.04045 {
@@ -21,22 +18,19 @@ pub fn bg_from_rgb(rgb: [u8; 3], opacity: f32) -> wgpu::Color {
     }
 }
 
-/// TokyoNight Moon の背景色 (#222436) を wgpu の Linear 色空間へ正確に変換して返す
-pub fn tokyonight_moon_bg(opacity: f32) -> wgpu::Color {
-    bg_from_rgb([0x22, 0x24, 0x36], opacity)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// フォントフォールバック順（Cica -> FiraCode Nerd Font -> Fira Code -> システム）を組み立てる。
-pub fn build_font_system() -> FontSystem {
-    FontSystem::new()
-}
+    #[test]
+    fn bg_from_rgb_premultiplies_and_clamps_opacity() {
+        let opaque = bg_from_rgb([255, 0, 0], 1.5);
+        assert!((opaque.a - 1.0).abs() < 1e-6);
+        assert!((opaque.r - 1.0).abs() < 1e-6);
+        assert!(opaque.g.abs() < 1e-6);
 
-/// 設定ファイルの `font_families` に沿って優先フォント属性を返す。
-pub fn primary_font_attrs<'a>(config: &'a AppearanceConfig) -> Attrs<'a> {
-    let primary = config
-        .font_families
-        .first()
-        .map(|s| Family::Name(s.as_str()))
-        .unwrap_or(Family::Monospace);
-    Attrs::new().family(primary)
+        let half = bg_from_rgb([255, 255, 255], 0.5);
+        assert!((half.a - 0.5).abs() < 1e-6);
+        assert!((half.r - 0.5).abs() < 1e-6);
+    }
 }

@@ -28,7 +28,7 @@ font_thicken = true
 adjust_cell_height = 2.0
 # プリセット: "TokyoNight Moon" / "TokyoNight" / "Solarized Dark"
 theme = "TokyoNight Moon"
-background_opacity = 0.85
+background_opacity = 1.0
 window_padding_x = 10.0
 window_padding_y = 10.0
 window_padding_balance = true
@@ -40,24 +40,25 @@ window_padding_balance = true
 # accent = "#7aa2f7"
 
 [keybinds]
+prefix = "ctrl+b"
 new_tab = "ctrl+t"
-split_right = "alt+d"
-split_down = "alt+shift+d"
+new_workspace = "prefix+w"
+split_right = "prefix+v"
+split_down = "prefix+-"
 toggle_zoom = "ctrl+shift+z"
-pane_mode = "ctrl+shift+h"
+pane_mode = "prefix+h"
+pane_move_mode = "ctrl+shift+h"
+pane_resize_mode = "prefix+r"
 goto_left = "performable:ctrl+h"
 goto_down = "performable:ctrl+j"
 goto_up = "performable:ctrl+k"
 goto_right = "performable:ctrl+l"
 toggle_left_drawer = "ctrl+shift+e"
 toggle_right_drawer = "ctrl+shift+g"
-go_to = "ctrl+shift+space"
+go_to = "prefix+g"
 copy = "ctrl+shift+c"
 paste = "ctrl+v"
 reload_config = "ctrl+shift+r"
-
-[shell]
-windows_default_prog = ["wsl.exe", "--cd", "~"]
 
 [window]
 save_state = "always"
@@ -68,8 +69,12 @@ macos_option_as_alt = "left"
 # [os.macos.appearance]
 # font_size = 16.0
 #
-# [os.windows.appearance]
-# background_opacity = 0.9
+[os.windows.appearance]
+background_opacity = 0.8
+
+# Windows でデフォルトシェルに WSL2 を使う設定（不要な場合はコメントアウト）
+[os.windows.shell]
+windows_default_prog = ["wsl.exe", "--cd", "~"]
 #
 # [os.linux.features]
 # embedded_browser = false

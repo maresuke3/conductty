@@ -20,10 +20,14 @@ use term_core::input::{
 };
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::pty::PtySession;
-use term_drawer::{DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot};
+use term_drawer::{
+    DrawerSnapshot, GitHubItem, GitHubItemKind, fetch_github_snapshot, format_item_for_pane,
+    validate_http_url,
+};
 use term_mux::{
-    AgentInfo, DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MuxRequest, MuxResponse, PaneInfo,
-    SpaceInfo, SpawnKind, send_request, split_dir_for_spawn,
+    AgentInfo, DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MAX_IPC_REQUEST_BYTES, MuxRequest,
+    MuxResponse, PaneInfo, SpaceInfo, SpawnKind, parse_authenticated_request, read_bounded_line,
+    read_or_create_ipc_token, send_request, split_dir_for_spawn,
 };
 use term_render::bg_from_rgb;
 use winit::application::ApplicationHandler;
@@ -312,7 +316,7 @@ struct App {
     browser: Option<EmbeddedBrowser>,
     pending_browser_url: Option<String>,
     browser_error: Option<String>,
-    kitty_textures: HashMap<(PaneId, u32), egui::TextureHandle>,
+    kitty_textures: HashMap<(PaneId, u32), (egui::TextureHandle, u64)>,
     router: InputRouter,
     modifiers: ModifiersState,
     suppress_next_ime_commit: bool,
@@ -414,9 +418,15 @@ impl App {
     fn start_ipc_server(&self) {
         let proxy = self.proxy.clone();
         self.rt.spawn(async move {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            use std::sync::Arc;
+            use std::time::Duration;
+            use tokio::io::{AsyncWriteExt, BufReader};
             use tokio::net::TcpListener;
 
+            let Ok(ipc_token) = read_or_create_ipc_token() else {
+                return;
+            };
+            let ipc_token = Arc::new(ipc_token);
             let Ok(listener) = TcpListener::bind(DEFAULT_IPC_ADDR).await else {
                 return;
             };
@@ -425,30 +435,60 @@ impl App {
                     break;
                 };
                 let proxy = proxy.clone();
+                let ipc_token = Arc::clone(&ipc_token);
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
-                    let mut lines = BufReader::new(reader).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let resp = match serde_json::from_str::<MuxRequest>(&line) {
-                            Ok(req) => {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                if proxy.send_event(UserEvent::IpcRequest(req, tx)).is_err() {
-                                    MuxResponse::Error {
-                                        message: "GUI event loop closed".to_string(),
-                                    }
-                                } else {
-                                    rx.await.unwrap_or(MuxResponse::Error {
-                                        message: "IPC timeout".to_string(),
-                                    })
+                    let mut buf_reader = BufReader::new(reader);
+                    loop {
+                        let read_res = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            read_bounded_line(&mut buf_reader, MAX_IPC_REQUEST_BYTES),
+                        )
+                        .await;
+                        let line = match read_res {
+                            Ok(Ok(Some(line))) => line,
+                            Ok(Ok(None)) => break,
+                            Ok(Err(e)) => {
+                                if let Ok(mut json) =
+                                    serde_json::to_string(&MuxResponse::Error { message: e })
+                                {
+                                    json.push('\n');
+                                    let _ = writer.write_all(json.as_bytes()).await;
                                 }
+                                break;
                             }
-                            Err(e) => MuxResponse::Error {
-                                message: format!("invalid request: {e}"),
-                            },
+                            Err(_) => break,
                         };
+                        let (resp, should_close) =
+                            match parse_authenticated_request(&line, &ipc_token) {
+                                Ok(req) => {
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    let r = if proxy.send_event(UserEvent::IpcRequest(req, tx)).is_err()
+                                    {
+                                        MuxResponse::Error {
+                                            message: "GUI event loop closed".to_string(),
+                                        }
+                                    } else {
+                                        tokio::time::timeout(Duration::from_secs(5), rx)
+                                            .await
+                                            .ok()
+                                            .and_then(|res| res.ok())
+                                            .unwrap_or(MuxResponse::Error {
+                                                message: "IPC timeout".to_string(),
+                                            })
+                                    };
+                                    (r, false)
+                                }
+                                Err(e) => (MuxResponse::Error { message: e }, true),
+                            };
                         if let Ok(mut json) = serde_json::to_string(&resp) {
                             json.push('\n');
-                            let _ = writer.write_all(json.as_bytes()).await;
+                            if writer.write_all(json.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                        if should_close {
+                            break;
                         }
                     }
                 });
@@ -577,8 +617,7 @@ impl App {
                         message: "cannot close the last pane".to_string(),
                     };
                 }
-                self.panes.remove(&pane_id);
-                self.agent_states.remove(&pane_id);
+                self.cleanup_closed_pane(pane_id);
                 self.manager.close_pane(pane_id);
                 MuxResponse::Ok { delivered_to: 1 }
             }
@@ -595,8 +634,7 @@ impl App {
                 }
                 let closed = self.manager.close_workspace(idx);
                 for pid in closed {
-                    self.panes.remove(&pid);
-                    self.agent_states.remove(&pid);
+                    self.cleanup_closed_pane(pid);
                 }
                 if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
                     self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
@@ -902,21 +940,55 @@ impl App {
         self.go_to_selected_idx = 0;
     }
 
+    fn send_text_to_focused_pane(&mut self, text: &str) {
+        let focused = self.manager.active_tab().focused_pane;
+        if self.config.features.multiplexer_mode {
+            let bracketed = self
+                .mux_snapshots
+                .get(&focused)
+                .is_some_and(|s| s.bracketed_paste);
+            let payload = if bracketed {
+                format!("\x1b[200~{text}\x1b[201~")
+            } else {
+                text.to_string()
+            };
+            self.send_mux_action(MuxRequest::WriteBytes {
+                pane_id: focused,
+                bytes: payload.into_bytes(),
+            });
+        } else if let Some(pane) = self.panes.get_mut(&focused) {
+            let bracketed = pane
+                .grid
+                .lock()
+                .map(|g| g.bracketed_paste)
+                .unwrap_or(false);
+            if bracketed {
+                let wrapped = format!("\x1b[200~{text}\x1b[201~");
+                let _ = pane.pty.write_bytes(wrapped.as_bytes());
+            } else {
+                let _ = pane.pty.write_bytes(text.as_bytes());
+            }
+        }
+    }
+
+    fn cleanup_closed_pane(&mut self, pane_id: PaneId) {
+        self.panes.remove(&pane_id);
+        self.agent_states.remove(&pane_id);
+        self.mux_last_sizes.remove(&pane_id);
+        self.kitty_textures.retain(|(pid, _), _| *pid != pane_id);
+    }
+
     fn refresh_agent_states(&mut self) {
-        if self.last_agent_scan.elapsed() < std::time::Duration::from_millis(250)
-            && !self.agent_states.is_empty()
-        {
+        if should_throttle_agent_scan(self.last_agent_scan.elapsed()) {
             return;
         }
         self.last_agent_scan = std::time::Instant::now();
         let now_ms = self.agent_scan_start.elapsed().as_millis() as u64;
-        let mut active_ids = Vec::new();
         let mut next_states = HashMap::new();
 
         for ws in &self.manager.workspaces {
             for tab in &ws.tabs {
                 for pane_id in tab.all_panes() {
-                    active_ids.push(pane_id);
                     let snap_opt = if self.config.features.multiplexer_mode {
                         self.mux_snapshots.get(&pane_id).cloned()
                     } else {
@@ -952,6 +1024,10 @@ impl App {
                     self.send_mux_action(MuxRequest::SpawnPane {
                         kind: SpawnKind::SplitDown,
                     });
+                    return;
+                }
+                Action::ResizeSplit(dir) => {
+                    self.send_mux_action(MuxRequest::ResizeSplit { dir });
                     return;
                 }
                 Action::NewTab => {
@@ -1015,6 +1091,9 @@ impl App {
             }
             Action::GotoSplit(dir) => {
                 self.manager.active_tab_mut().goto_split(dir, area);
+            }
+            Action::ResizeSplit(dir) => {
+                self.manager.active_tab_mut().resize_focused(dir, 0.05);
             }
             Action::ToggleZoom => {
                 self.manager.active_tab_mut().toggle_zoom();
@@ -1089,7 +1168,7 @@ impl App {
                 let idx = self.left_drawer_selected_idx;
                 let closed = self.manager.close_workspace(idx);
                 for pid in closed {
-                    self.panes.remove(&pid);
+                    self.cleanup_closed_pane(pid);
                 }
                 if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
                     self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
@@ -1147,11 +1226,8 @@ impl App {
             }
             Action::DrawerSendToPane => {
                 if let Some(item) = self.selected_drawer_item() {
-                    let text = format!("[{} #{}] {} ({})", item.repo, item.number, item.title, item.url);
-                    let focused = self.manager.active_tab().focused_pane;
-                    if let Some(pane) = self.panes.get_mut(&focused) {
-                        let _ = pane.pty.write_bytes(text.as_bytes());
-                    }
+                    let text = format_item_for_pane(&item);
+                    self.send_text_to_focused_pane(&text);
                     self.right_drawer_open = false;
                     self.router.mode = InputMode::Normal;
                 }
@@ -1174,6 +1250,11 @@ impl App {
                 if !new_cfg.features.right_drawer {
                     self.right_drawer_open = false;
                     self.browser = None;
+                } else if !new_cfg.features.embedded_browser {
+                    self.browser = None;
+                }
+                if !new_cfg.features.kitty_graphics {
+                    self.kitty_textures.clear();
                 }
                 configure_fonts(&self.egui_ctx, &new_cfg.appearance.font_families);
                 if let Some(window) = &self.window {
@@ -1181,7 +1262,10 @@ impl App {
                 }
                 self.config = new_cfg;
             }
-            Action::EnterPaneMoveMode | Action::ExitPaneMoveMode => {}
+            Action::EnterPaneMoveMode
+            | Action::ExitPaneMoveMode
+            | Action::EnterPaneResizeMode
+            | Action::ExitPaneResizeMode => {}
         }
     }
 }
@@ -1198,7 +1282,7 @@ impl ApplicationHandler<UserEvent> for App {
                 .with_transparent(transparent);
             #[cfg(not(target_os = "windows"))]
             {
-                attrs = attrs.with_window_icon(load_window_icon(Some(32)));
+                attrs = attrs.with_window_icon(load_window_icon(32));
             }
             #[cfg(target_os = "windows")]
             if transparent {
@@ -1276,7 +1360,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::PaneExited(id) => {
-                self.panes.remove(&id);
+                self.cleanup_closed_pane(id);
                 if !self.manager.close_pane(id) {
                     self.save_session();
                     event_loop.exit();
@@ -1683,6 +1767,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let area = self.terminal_area();
                 let focused_pane = self.manager.active_tab().focused_pane;
                 let pane_move_mode = self.router.mode == InputMode::PaneMove;
+                let pane_resize_mode = self.router.mode == InputMode::PaneResize;
                 let prefix_mode = self.router.mode == InputMode::Prefix;
                 let zoomed = self.manager.active_tab().zoomed;
                 let pane_mode_active = self.pane_mode_active;
@@ -1690,7 +1775,11 @@ impl ApplicationHandler<UserEvent> for App {
                 let keybind_hints_open = self.keybind_hints_open;
                 let mut hints_scroll_offset = self.keybind_hints_scroll_offset;
                 let mut hints_max_scroll = self.keybind_hints_max_scroll;
-                let kb_snapshot = self.config.keybinds.clone();
+                let kb_snapshot = if keybind_hints_open {
+                    Some(self.config.keybinds.clone())
+                } else {
+                    None
+                };
                 let go_to_filtering = self.go_to_filtering;
                 let go_to_query = self.go_to_query.clone();
                 let go_to_items = if go_to_open {
@@ -1753,7 +1842,11 @@ impl ApplicationHandler<UserEvent> for App {
                     .any(|(_, _, _, _, _, st)| st.status == AgentStatus::Ask);
                 let mut jump_agent_target: Option<(usize, usize, PaneId)> = None;
                 let right_drawer_open = self.right_drawer_open;
-                let drawer_snapshot = self.drawer_snapshot.clone();
+                let drawer_snapshot = if right_drawer_open {
+                    self.drawer_snapshot.clone()
+                } else {
+                    DrawerSnapshot::default()
+                };
 
                 let (Some(window), Some(gpu), Some(egui_state)) =
                     (&self.window, &mut self.gpu, &mut self.egui_state)
@@ -1805,7 +1898,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut computed_cell_size = self.cell_size;
                 let mut computed_terminal_area: Option<CoreRect> = None;
 
-                let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                let mut full_output = self.egui_ctx.run(raw_input, |ctx| {
                     match left_drawer_mode {
                         LeftDrawerMode::Always => {
                         egui::SidePanel::left("conductty_left_drawer")
@@ -2382,12 +2475,14 @@ impl ApplicationHandler<UserEvent> for App {
 
                                 let border_color = if is_focused && prefix_mode {
                                     Color32::from_rgb(0xff, 0x9e, 0x64)
+                                } else if is_focused && pane_resize_mode {
+                                    Color32::from_rgb(0x7d, 0xcf, 0xff)
                                 } else if is_focused {
                                     Color32::from_rgb(0x7a, 0xa2, 0xf7)
                                 } else {
                                     Color32::from_rgb(0x3b, 0x42, 0x61)
                                 };
-                                let border_width = if is_focused && prefix_mode {
+                                let border_width = if is_focused && (prefix_mode || pane_resize_mode) {
                                     2.5_f32
                                 } else if is_focused {
                                     1.5_f32
@@ -2447,6 +2542,12 @@ impl ApplicationHandler<UserEvent> for App {
                                             is_focused,
                                             selection.filter(|(p, _, _)| p == pane_id),
                                         );
+                                        if self.config.features.kitty_graphics {
+                                            let pid_val = *pane_id;
+                                            self.kitty_textures.retain(|(pid, img_id), _| {
+                                                *pid != pid_val || g.kitty.images.contains_key(img_id)
+                                            });
+                                        }
                                         if self.config.features.kitty_graphics
                                             && g.scroll_offset == 0
                                             && !g.kitty.placements.is_empty()
@@ -2456,27 +2557,46 @@ impl ApplicationHandler<UserEvent> for App {
                                                 else {
                                                     continue;
                                                 };
-                                                let tex = self
+                                                let needs_upload = self
                                                     .kitty_textures
-                                                    .entry((*pane_id, p.image_id))
-                                                    .or_insert_with(|| {
-                                                        let color_img =
-                                                            egui::ColorImage::from_rgba_unmultiplied(
-                                                                [
-                                                                    img.width as usize,
-                                                                    img.height as usize,
-                                                                ],
-                                                                &img.rgba,
-                                                            );
-                                                        ctx.load_texture(
-                                                            format!(
-                                                                "kitty-{}-{}",
-                                                                pane_id, p.image_id
-                                                            ),
-                                                            color_img,
-                                                            egui::TextureOptions::LINEAR,
-                                                        )
-                                                    });
+                                                    .get(&(*pane_id, p.image_id))
+                                                    .is_none_or(|(_, gen_id)| *gen_id != img.generation);
+                                                if needs_upload {
+                                                    let expected = (img.width as usize)
+                                                        .saturating_mul(img.height as usize)
+                                                        .saturating_mul(4);
+                                                    if img.width == 0
+                                                        || img.height == 0
+                                                        || img.rgba.len() != expected
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let color_img =
+                                                        egui::ColorImage::from_rgba_unmultiplied(
+                                                            [
+                                                                img.width as usize,
+                                                                img.height as usize,
+                                                            ],
+                                                            &img.rgba,
+                                                        );
+                                                    let handle = ctx.load_texture(
+                                                        format!(
+                                                            "kitty-{}-{}",
+                                                            pane_id, p.image_id
+                                                        ),
+                                                        color_img,
+                                                        egui::TextureOptions::LINEAR,
+                                                    );
+                                                    self.kitty_textures.insert(
+                                                        (*pane_id, p.image_id),
+                                                        (handle, img.generation),
+                                                    );
+                                                }
+                                                let Some((tex, _)) =
+                                                    self.kitty_textures.get(&(*pane_id, p.image_id))
+                                                else {
+                                                    continue;
+                                                };
 
                                                 let img_w = p
                                                     .cols
@@ -2533,6 +2653,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             if pane_move_mode {
                                 status_parts.push("PANE MOVE MODE (h/j/k/l: move, z: zoom, Enter/Esc: exit)");
+                            }
+                            if pane_resize_mode {
+                                status_parts.push("PANE RESIZE MODE (h/j/k/l: resize, Enter/Esc: exit)");
                             }
                             if zoomed {
                                 status_parts.push("ZOOMED");
@@ -2737,7 +2860,7 @@ impl ApplicationHandler<UserEvent> for App {
                             });
                     }
 
-                    if keybind_hints_open {
+                    if let Some(kb_snapshot) = kb_snapshot.as_ref() {
                         let prefix_label = if kb_snapshot.prefix.trim().is_empty() {
                             "(disabled)".to_string()
                         } else {
@@ -2764,6 +2887,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     ("Toggle Zoom", kb_snapshot.toggle_zoom.clone()),
                                     ("Pane Mode (Number)", kb_snapshot.pane_mode.clone()),
                                     ("Pane Move Mode", kb_snapshot.pane_move_mode.clone()),
+                                    ("Pane Resize Mode", kb_snapshot.pane_resize_mode.clone()),
                                     ("Focus Left", kb_snapshot.goto_left.clone()),
                                     ("Focus Down", kb_snapshot.goto_down.clone()),
                                     ("Focus Up", kb_snapshot.goto_up.clone()),
@@ -2876,7 +3000,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // egui_winit が毎フレーム set_ime_allowed(false) を呼んで Windows IME (TSF) が
                 // 「あ」固定になるのを防ぐため、端末用 IME 出力を常に Some に保つ
-                let mut platform_output = full_output.platform_output.clone();
+                let mut platform_output = std::mem::take(&mut full_output.platform_output);
                 if platform_output.ime.is_none() {
                     let cursor_rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(10.0, 20.0));
                     platform_output.ime = Some(egui::output::IMEOutput {
@@ -2939,7 +3063,7 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         let closed = self.manager.close_workspace(idx);
                         for pid in closed {
-                            self.panes.remove(&pid);
+                            self.cleanup_closed_pane(pid);
                         }
                         if self.left_drawer_selected_idx >= self.manager.workspaces.len() {
                             self.left_drawer_selected_idx = self.manager.workspaces.len() - 1;
@@ -2993,7 +3117,7 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         let (closed_panes, keep_running) = self.manager.close_tab(t_idx);
                         for pid in closed_panes {
-                            self.panes.remove(&pid);
+                            self.cleanup_closed_pane(pid);
                         }
                         if !keep_running {
                             self.save_session();
@@ -3033,15 +3157,7 @@ impl ApplicationHandler<UserEvent> for App {
                     open_url(&url);
                 }
                 if let Some(text) = send_to_pane_text {
-                    let focused = self.manager.active_tab().focused_pane;
-                    if self.config.features.multiplexer_mode {
-                        self.send_mux_action(MuxRequest::WriteBytes {
-                            pane_id: focused,
-                            bytes: text.into_bytes(),
-                        });
-                    } else if let Some(pane) = self.panes.get_mut(&focused) {
-                        let _ = pane.pty.write_bytes(text.as_bytes());
-                    }
+                    self.send_text_to_focused_pane(&text);
                 }
                 for (pane_id, cols, rows) in pending_resizes {
                     if self.config.features.multiplexer_mode {
@@ -3143,10 +3259,7 @@ fn render_github_section(
                         *open_url_target = Some(item.url.clone());
                     }
                     if ui.small_button("Send to Pane").clicked() {
-                        *send_to_pane_text = Some(format!(
-                            "[{} #{}] {} ({})",
-                            item.repo, item.number, item.title, item.url
-                        ));
+                        *send_to_pane_text = Some(format_item_for_pane(item));
                     }
                 });
             });
@@ -3484,26 +3597,29 @@ fn load_saved_workspace_names() -> Option<Vec<String>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn load_window_icon(size: Option<u32>) -> Option<winit::window::Icon> {
+fn load_window_icon(size: u32) -> Option<winit::window::Icon> {
     let bytes = include_bytes!("../../../assets/app-icon-256.png");
-    let mut img = image::load_from_memory(bytes).ok()?;
-    if let Some(sz) = size {
-        img = img.resize_exact(sz, sz, image::imageops::FilterType::Lanczos3);
-    }
+    let img = image::load_from_memory(bytes)
+        .ok()?
+        .resize_exact(size, size, image::imageops::FilterType::Lanczos3);
     let rgba = img.into_rgba8();
     let (w, h) = rgba.dimensions();
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
 fn open_url(url: &str) {
+    let Ok(safe_url) = validate_http_url(url) else {
+        return;
+    };
+
     #[cfg(target_os = "macos")]
-    let _ = Command::new("open").arg(url).spawn();
+    let _ = Command::new("open").args(["--", safe_url]).spawn();
 
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", url])
+        let _ = Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", safe_url])
             .creation_flags(0x0800_0000)
             .spawn();
     }
@@ -3511,11 +3627,11 @@ fn open_url(url: &str) {
     #[cfg(target_os = "linux")]
     {
         if std::env::var_os("WSL_DISTRO_NAME").is_some() {
-            let _ = Command::new("cmd.exe")
-                .args(["/C", "start", "", url])
+            let _ = Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler", safe_url])
                 .spawn();
         } else {
-            let _ = Command::new("xdg-open").arg(url).spawn();
+            let _ = Command::new("xdg-open").arg(safe_url).spawn();
         }
     }
 }
@@ -3554,13 +3670,14 @@ fn configure_fonts(ctx: &egui::Context, families: &[String]) {
         let key = format!("conductty-jp-{jp_name}");
         if fonts.font_data.contains_key(&format!("conductty-{jp_name}")) {
             jp_fallbacks.push(format!("conductty-{jp_name}"));
-            continue;
+            break;
         }
         if let Some(bytes) = find_font_bytes(&search_dirs, jp_name) {
             fonts
                 .font_data
                 .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
             jp_fallbacks.push(key);
+            break;
         }
     }
 
@@ -3828,18 +3945,9 @@ fn send_ipc_with_wsl_fallback(
     match rt.block_on(send_request(DEFAULT_IPC_ADDR, req)) {
         Ok(resp) => Ok(resp),
         Err(err) if cfg!(target_os = "linux") && std::env::var_os("WSL_DISTRO_NAME").is_some() => {
-            // WSL2 上で Windows 版 conductty.exe が動いている場合、Windows 側バイナリへフォワードする
-            let exe_candidates = [
-                std::path::PathBuf::from("./target/x86_64-pc-windows-gnu/debug/conductty.exe"),
-                std::path::PathBuf::from("./target/x86_64-pc-windows-gnu/release/conductty.exe"),
-                std::path::PathBuf::from("conductty.exe"),
-            ];
-            for exe in exe_candidates {
-                if exe.is_file() || exe == std::path::Path::new("conductty.exe") {
-                    if let Ok(status) = Command::new(&exe).args(&args[1..]).status() {
-                        std::process::exit(status.code().unwrap_or(1));
-                    }
-                }
+            // WSL2 上で Windows 版 conductty.exe が動いている場合、PATH 上の Windows 側バイナリへフォワードする
+            if let Ok(status) = Command::new("conductty.exe").args(&args[1..]).status() {
+                std::process::exit(status.code().unwrap_or(1));
             }
             Err(err)
         }
@@ -4276,6 +4384,10 @@ fn main() {
     let _ = event_loop.run_app(&mut app);
 }
 
+fn should_throttle_agent_scan(elapsed: std::time::Duration) -> bool {
+    elapsed < std::time::Duration::from_millis(250)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4364,5 +4476,12 @@ mod tests {
             font_candidate_score("firacodenerdfontmonoregular")
                 > font_candidate_score("firacodenerdfontmonolight")
         );
+    }
+
+    #[test]
+    fn agent_scan_throttles_under_250ms_even_when_empty() {
+        assert!(should_throttle_agent_scan(std::time::Duration::from_millis(0)));
+        assert!(should_throttle_agent_scan(std::time::Duration::from_millis(249)));
+        assert!(!should_throttle_agent_scan(std::time::Duration::from_millis(250)));
     }
 }

@@ -6,6 +6,7 @@ pub enum InputMode {
     Normal,
     Prefix,
     PaneMove,
+    PaneResize,
     LeftDrawer,
     RightDrawer,
 }
@@ -49,6 +50,9 @@ pub enum Action {
     ToggleZoom,
     EnterPaneMoveMode,
     ExitPaneMoveMode,
+    EnterPaneResizeMode,
+    ExitPaneResizeMode,
+    ResizeSplit(NavDirection),
     GotoSplit(NavDirection),
     ToggleLeftDrawer,
     ToggleLeftDrawerCollapse,
@@ -200,6 +204,7 @@ impl InputRouter {
         let specs = [
             (&kb.pane_mode, Action::OpenPaneMode),
             (&kb.pane_move_mode, Action::EnterPaneMoveMode),
+            (&kb.pane_resize_mode, Action::EnterPaneResizeMode),
             (&kb.toggle_zoom, Action::ToggleZoom),
             (&kb.toggle_left_drawer, Action::ToggleLeftDrawer),
             (&kb.toggle_right_drawer, Action::ToggleRightDrawer),
@@ -227,16 +232,7 @@ impl InputRouter {
         let mut normal_bindings = Vec::new();
         let mut prefix_bindings = Vec::new();
         for (spec, action) in specs {
-            let parts: Vec<&str> = if spec.trim() == "," {
-                vec![","]
-            } else {
-                spec.split(',').collect()
-            };
-            for part in parts {
-                let p = part.trim();
-                if p.is_empty() {
-                    continue;
-                }
+            for p in split_binding_list(spec) {
                 if let Some(rest) = strip_leader_prefix(p) {
                     if let Some(b) = KeyBinding::parse(rest, action) {
                         prefix_bindings.push(b);
@@ -331,6 +327,7 @@ impl InputRouter {
         match self.mode {
             InputMode::Prefix => self.route_prefix_mode(event, ctx),
             InputMode::PaneMove => self.route_pane_move_mode(event),
+            InputMode::PaneResize => self.route_pane_resize_mode(event),
             InputMode::LeftDrawer => self.route_left_drawer_mode(event),
             InputMode::RightDrawer => self.route_right_drawer_mode(event),
             InputMode::Normal => self.route_normal_mode(event, ctx),
@@ -354,6 +351,7 @@ impl InputRouter {
                 }
                 match binding.action {
                     Action::EnterPaneMoveMode => self.mode = InputMode::PaneMove,
+                    Action::EnterPaneResizeMode => self.mode = InputMode::PaneResize,
                     Action::ToggleLeftDrawer => self.mode = InputMode::LeftDrawer,
                     Action::ToggleRightDrawer => self.mode = InputMode::RightDrawer,
                     _ => {}
@@ -478,6 +476,32 @@ impl InputRouter {
         }
     }
 
+    fn route_pane_resize_mode(&mut self, event: &KeyEvent) -> InputDecision {
+        match (&event.code, event.mods.ctrl, event.mods.shift) {
+            (KeyCode::Enter, _, _) | (KeyCode::Escape, _, _) => {
+                self.mode = InputMode::Normal;
+                InputDecision::Execute(Action::ExitPaneResizeMode)
+            }
+            (KeyCode::Char('h') | KeyCode::Char('H'), false, false)
+            | (KeyCode::Left, false, false) => {
+                InputDecision::Execute(Action::ResizeSplit(NavDirection::Left))
+            }
+            (KeyCode::Char('j') | KeyCode::Char('J'), false, false)
+            | (KeyCode::Down, false, false) => {
+                InputDecision::Execute(Action::ResizeSplit(NavDirection::Down))
+            }
+            (KeyCode::Char('k') | KeyCode::Char('K'), false, false)
+            | (KeyCode::Up, false, false) => {
+                InputDecision::Execute(Action::ResizeSplit(NavDirection::Up))
+            }
+            (KeyCode::Char('l') | KeyCode::Char('L'), false, false)
+            | (KeyCode::Right, false, false) => {
+                InputDecision::Execute(Action::ResizeSplit(NavDirection::Right))
+            }
+            _ => InputDecision::Ignore,
+        }
+    }
+
     fn route_normal_mode(
         &mut self,
         event: &KeyEvent,
@@ -494,6 +518,7 @@ impl InputRouter {
                 }
                 match binding.action {
                     Action::EnterPaneMoveMode => self.mode = InputMode::PaneMove,
+                    Action::EnterPaneResizeMode => self.mode = InputMode::PaneResize,
                     Action::ToggleLeftDrawer => self.mode = InputMode::LeftDrawer,
                     Action::ToggleRightDrawer => self.mode = InputMode::RightDrawer,
                     _ => {}
@@ -647,6 +672,52 @@ mod tests {
             router.route(&key_h, &ctx),
             InputDecision::Execute(Action::OpenPaneMode)
         );
+    }
+
+    #[test]
+    fn pane_resize_mode_prefix_r_resizes_and_exits() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.keybinds.pane_resize_mode, "prefix+r");
+        let mut router = InputRouter::from_config(&cfg);
+        let ctx = MockCtx { has_right: false };
+
+        let ctrl_b = KeyEvent {
+            code: KeyCode::Char('b'),
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+        let key_r = KeyEvent {
+            code: KeyCode::Char('r'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
+        assert_eq!(
+            router.route(&key_r, &ctx),
+            InputDecision::Execute(Action::EnterPaneResizeMode)
+        );
+        assert_eq!(router.mode, InputMode::PaneResize);
+
+        let key_l = KeyEvent {
+            code: KeyCode::Char('l'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&key_l, &ctx),
+            InputDecision::Execute(Action::ResizeSplit(NavDirection::Right))
+        );
+
+        let enter = KeyEvent {
+            code: KeyCode::Enter,
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&enter, &ctx),
+            InputDecision::Execute(Action::ExitPaneResizeMode)
+        );
+        assert_eq!(router.mode, InputMode::Normal);
     }
 
     #[test]

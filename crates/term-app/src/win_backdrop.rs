@@ -124,11 +124,6 @@ mod imp {
             None
         }
 
-        #[allow(dead_code)]
-        pub fn visual_ptr(&self) -> *mut std::ffi::c_void {
-            std::ptr::null_mut()
-        }
-
         pub fn commit(&self) {}
     }
 

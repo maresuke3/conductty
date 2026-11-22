@@ -38,6 +38,45 @@ struct GhSearchRow {
     repository: GhRepo,
 }
 
+pub fn validate_http_url(url: &str) -> Result<&str, String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("URL must use http:// or https://".to_string());
+    }
+    if trimmed.chars().any(|c| {
+        c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')
+    }) {
+        return Err("URL contains invalid characters".to_string());
+    }
+    let after_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or("");
+    if after_scheme.is_empty() || after_scheme.starts_with('/') {
+        return Err("URL host is empty".to_string());
+    }
+    Ok(trimmed)
+}
+
+pub fn sanitize_terminal_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\r' | '\n' | '\t' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn format_item_for_pane(item: &GitHubItem) -> String {
+    let repo = sanitize_terminal_text(&item.repo);
+    let title = sanitize_terminal_text(&item.title);
+    let url = sanitize_terminal_text(&item.url);
+    format!("[{repo} #{}] {title} ({url})", item.number)
+}
+
 pub fn parse_gh_search_json(
     json_str: &str,
     kind: GitHubItemKind,
@@ -45,12 +84,17 @@ pub fn parse_gh_search_json(
     let rows: Vec<GhSearchRow> = serde_json::from_str(json_str)?;
     Ok(rows
         .into_iter()
-        .map(|r| GitHubItem {
-            kind,
-            number: r.number,
-            title: r.title,
-            repo: r.repository.name_with_owner,
-            url: r.url,
+        .map(|r| {
+            let safe_url = validate_http_url(&r.url)
+                .map(str::to_string)
+                .unwrap_or_default();
+            GitHubItem {
+                kind,
+                number: r.number,
+                title: r.title,
+                repo: r.repository.name_with_owner,
+                url: safe_url,
+            }
         })
         .collect())
 }
@@ -209,5 +253,41 @@ mod tests {
         assert_eq!(items[0].number, 42);
         assert_eq!(items[0].repo, "maresuke3/conductty");
         assert_eq!(items[0].kind, GitHubItemKind::AssignedPr);
+    }
+
+    #[test]
+    fn sanitizes_pty_text_and_validates_urls() {
+        assert!(validate_http_url("https://github.com/a/b").is_ok());
+        assert!(validate_http_url("http://localhost:8080/x").is_ok());
+        assert!(validate_http_url("javascript:alert(1)").is_err());
+        assert!(validate_http_url("file:///etc/passwd").is_err());
+        assert!(validate_http_url("https://example.com/a\"&calc").is_err());
+        assert!(validate_http_url("https://example.com/\nfoo").is_err());
+
+        let item = GitHubItem {
+            kind: GitHubItemKind::AssignedPr,
+            number: 99,
+            title: "Fix bug\r\nrm -rf /\x1b[31m".to_string(),
+            repo: "org/repo\x07".to_string(),
+            url: "https://github.com/org/repo/pull/99".to_string(),
+        };
+        let formatted = format_item_for_pane(&item);
+        assert!(!formatted.contains('\n'));
+        assert!(!formatted.contains('\r'));
+        assert!(!formatted.contains('\x1b'));
+        assert!(!formatted.contains('\x07'));
+        assert_eq!(
+            formatted,
+            "[org/repo #99] Fix bug  rm -rf /[31m (https://github.com/org/repo/pull/99)"
+        );
+
+        let malicious_json = r#"[{
+            "number": 1,
+            "title": "x",
+            "url": "javascript:alert(1)",
+            "repository": { "nameWithOwner": "a/b" }
+        }]"#;
+        let parsed = parse_gh_search_json(malicious_json, GitHubItemKind::AssignedIssue).unwrap();
+        assert_eq!(parsed[0].url, "");
     }
 }

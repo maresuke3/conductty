@@ -8,7 +8,7 @@ pub enum SplitDirection {
     Vertical,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NavDirection {
     Left,
     Right,
@@ -83,6 +83,13 @@ impl Tab {
 
     pub fn toggle_zoom(&mut self) {
         self.zoomed = !self.zoomed;
+    }
+
+    pub fn resize_focused(&mut self, dir: NavDirection, step: f32) -> bool {
+        if self.zoomed {
+            return false;
+        }
+        self.layout.resize_pane(self.focused_pane, dir, step)
     }
 
     pub fn visible_rects(&self, area: Rect) -> Vec<(PaneId, Rect)> {
@@ -442,6 +449,40 @@ impl LayoutNode {
             })
             .map(|(id, _)| *id)
     }
+
+    pub fn resize_pane(&mut self, target: PaneId, dir: NavDirection, step: f32) -> bool {
+        let want_split = match dir {
+            NavDirection::Left | NavDirection::Right => SplitDirection::Horizontal,
+            NavDirection::Up | NavDirection::Down => SplitDirection::Vertical,
+        };
+        let delta = match dir {
+            NavDirection::Left | NavDirection::Up => -step.abs(),
+            NavDirection::Right | NavDirection::Down => step.abs(),
+        };
+        match self {
+            Self::Pane(_) => false,
+            Self::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                if first.contains_pane(target) && first.resize_pane(target, dir, step) {
+                    return true;
+                }
+                if second.contains_pane(target) && second.resize_pane(target, dir, step) {
+                    return true;
+                }
+                if *direction == want_split
+                    && (first.contains_pane(target) || second.contains_pane(target))
+                {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    return true;
+                }
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -521,5 +562,32 @@ mod tests {
         assert_eq!(closed, vec![2]);
         assert_eq!(mgr.workspaces.len(), 1);
         assert_eq!(mgr.active_workspace, 0);
+    }
+
+    #[test]
+    fn resize_focused_adjusts_split_ratio_and_clamps() {
+        let mut tab = Tab::new(1, 1);
+        assert!(tab.split_focused(2, SplitDirection::Horizontal));
+        assert!(tab.resize_focused(NavDirection::Left, 0.1));
+        let rects = tab.visible_rects(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 40.0,
+        });
+        assert!((rects[0].1.width - 40.0).abs() < 0.01);
+        assert!((rects[1].1.width - 60.0).abs() < 0.01);
+
+        // 極端に縮めても 0.1..=0.9 でクランプされる
+        for _ in 0..20 {
+            tab.resize_focused(NavDirection::Right, 0.1);
+        }
+        let rects_clamped = tab.visible_rects(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 40.0,
+        });
+        assert!((rects_clamped[0].1.width - 90.0).abs() < 0.01);
     }
 }

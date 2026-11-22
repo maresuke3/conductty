@@ -152,7 +152,14 @@ impl TerminalGrid {
             self.cursor_row,
             &mut replies,
         );
-        self.pending_replies.extend(replies);
+        const MAX_PENDING_REPLIES: usize = 256;
+        if !replies.is_empty() {
+            self.pending_replies.extend(replies);
+            if self.pending_replies.len() > MAX_PENDING_REPLIES {
+                let excess = self.pending_replies.len() - MAX_PENDING_REPLIES;
+                self.pending_replies.drain(..excess);
+            }
+        }
 
         let mut parser = std::mem::replace(&mut self.parser, Parser::new());
         parser.advance(self, &normal_bytes);
@@ -248,13 +255,17 @@ impl TerminalGrid {
     }
 
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
-        let new_cols = new_cols.max(1);
-        let new_rows = new_rows.max(1);
+        const MAX_GRID_DIM: usize = 1000;
+        let new_cols = new_cols.clamp(1, MAX_GRID_DIM);
+        let new_rows = new_rows.clamp(1, MAX_GRID_DIM);
         if new_cols == self.cols && new_rows == self.rows {
             return;
         }
 
-        let mut new_cells = vec![Cell::default(); new_cols * new_rows];
+        let Some(total) = new_cols.checked_mul(new_rows) else {
+            return;
+        };
+        let mut new_cells = vec![Cell::default(); total];
         let copy_cols = self.cols.min(new_cols);
         let copy_rows = self.rows.min(new_rows);
         for r in 0..copy_rows {
@@ -697,7 +708,12 @@ impl Perform for TerminalGrid {
             }
             'n' if first == 6 => {
                 let reply = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
+                const MAX_PENDING_REPLIES: usize = 256;
                 self.pending_replies.push(reply.into_bytes());
+                if self.pending_replies.len() > MAX_PENDING_REPLIES {
+                    let excess = self.pending_replies.len() - MAX_PENDING_REPLIES;
+                    self.pending_replies.drain(..excess);
+                }
             }
             'm' => self.apply_sgr(params),
             _ => {}
@@ -768,5 +784,25 @@ mod tests {
         // DCH (CSI P) deletes at cursor and shifts left
         grid.feed_bytes(b"\r\x1b[2P");
         assert_eq!(grid.cell(0, 0).unwrap().ch, 'a');
+    }
+
+    #[test]
+    fn resize_clamps_extreme_dimensions_safely() {
+        let mut grid = TerminalGrid::new(10, 5);
+        grid.resize(usize::MAX, usize::MAX);
+        assert_eq!(grid.cols, 1000);
+        assert_eq!(grid.rows, 1000);
+        grid.resize(0, 0);
+        assert_eq!(grid.cols, 1);
+        assert_eq!(grid.rows, 1);
+    }
+
+    #[test]
+    fn pending_replies_is_bounded_when_unconsumed() {
+        let mut grid = TerminalGrid::new(10, 5);
+        for _ in 0..400 {
+            grid.feed_bytes(b"\x1b[6n");
+        }
+        assert!(grid.pending_replies.len() <= 256);
     }
 }

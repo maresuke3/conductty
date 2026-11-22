@@ -1,11 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+const MAX_KITTY_APC_BYTES: usize = 32 * 1024 * 1024;
+const MAX_KITTY_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+const MAX_KITTY_DIM: u32 = 4096;
+const MAX_KITTY_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_KITTY_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_KITTY_PLACEMENTS: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct KittyImage {
     pub id: u32,
+    pub generation: u64,
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
@@ -38,6 +46,9 @@ pub struct KittyState {
     chunk_buf: Vec<u8>,
     chunk_params: HashMap<String, String>,
     next_auto_id: u32,
+    next_generation: u64,
+    image_order: VecDeque<u32>,
+    total_image_bytes: usize,
     pub images: HashMap<u32, KittyImage>,
     pub placements: Vec<KittyPlacement>,
 }
@@ -93,6 +104,9 @@ impl KittyState {
                 ApcScanState::InKittyApc => {
                     if b == 0x1b {
                         state = ApcScanState::InKittyEsc;
+                    } else if self.apc_buf.len() >= MAX_KITTY_APC_BYTES {
+                        self.apc_buf = Vec::new();
+                        state = ApcScanState::Normal;
                     } else {
                         self.apc_buf.push(b);
                     }
@@ -101,6 +115,9 @@ impl KittyState {
                     if b == b'\\' {
                         let cmd = std::mem::take(&mut self.apc_buf);
                         self.handle_kitty_command(&cmd, cursor_col, cursor_row, replies);
+                        state = ApcScanState::Normal;
+                    } else if self.apc_buf.len().saturating_add(2) > MAX_KITTY_APC_BYTES {
+                        self.apc_buf = Vec::new();
                         state = ApcScanState::Normal;
                     } else {
                         self.apc_buf.push(0x1b);
@@ -142,6 +159,21 @@ impl KittyState {
         if self.chunk_buf.is_empty() {
             self.chunk_params = params;
         }
+        if self.chunk_buf.len().saturating_add(payload.len()) > MAX_KITTY_CHUNK_BYTES {
+            let quiet: u8 = self
+                .chunk_params
+                .get("q")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if quiet < 2 {
+                if let Some(id) = self.chunk_params.get("i").and_then(|s| s.parse::<u32>().ok()) {
+                    replies.push(format!("\x1b_Gi={id};EINVAL:payload too large\x1b\\").into_bytes());
+                }
+            }
+            self.chunk_buf = Vec::new();
+            self.chunk_params.clear();
+            return;
+        }
         self.chunk_buf.extend_from_slice(payload.as_bytes());
         if more_chunks {
             return;
@@ -158,13 +190,15 @@ impl KittyState {
                     self.placements.clear();
                     if delete_mode == "A" {
                         self.images.clear();
+                        self.image_order.clear();
+                        self.total_image_bytes = 0;
                     }
                 }
                 "i" | "I" => {
                     if let Some(id) = eff_params.get("i").and_then(|s| s.parse::<u32>().ok()) {
                         self.placements.retain(|p| p.image_id != id);
                         if delete_mode == "I" {
-                            self.images.remove(&id);
+                            self.remove_image(id);
                         }
                     }
                 }
@@ -182,13 +216,15 @@ impl KittyState {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(|| {
                 let id = self.next_auto_id;
-                self.next_auto_id += 1;
+                self.next_auto_id = self.next_auto_id.wrapping_add(1).max(1);
                 id
             });
 
         if action == "t" || action == "T" {
-            if let Some(img) = decode_kitty_image(id, &eff_params, &full_payload) {
-                self.images.insert(id, img);
+            self.next_generation = self.next_generation.wrapping_add(1);
+            let generation = self.next_generation;
+            if let Some(img) = decode_kitty_image(id, generation, &eff_params, &full_payload) {
+                self.insert_image_with_budget(img);
             } else {
                 if quiet < 2 {
                     replies.push(format!("\x1b_Gi={id};EINVAL:decode failed\x1b\\").into_bytes());
@@ -200,6 +236,10 @@ impl KittyState {
         if action == "T" || action == "p" {
             let cols = eff_params.get("c").and_then(|s| s.parse::<usize>().ok());
             let rows = eff_params.get("r").and_then(|s| s.parse::<usize>().ok());
+            if self.placements.len() >= MAX_KITTY_PLACEMENTS {
+                let excess = self.placements.len() + 1 - MAX_KITTY_PLACEMENTS;
+                self.placements.drain(..excess);
+            }
             self.placements.push(KittyPlacement {
                 image_id: id,
                 col: cursor_col,
@@ -213,10 +253,47 @@ impl KittyState {
             replies.push(format!("\x1b_Gi={id};OK\x1b\\").into_bytes());
         }
     }
+
+    fn remove_image(&mut self, id: u32) {
+        if let Some(old) = self.images.remove(&id) {
+            self.total_image_bytes = self.total_image_bytes.saturating_sub(old.rgba.len());
+        }
+        self.image_order.retain(|&eid| eid != id);
+    }
+
+    fn insert_image_with_budget(&mut self, img: KittyImage) {
+        self.remove_image(img.id);
+        let new_bytes = img.rgba.len();
+        while self.total_image_bytes.saturating_add(new_bytes) > MAX_KITTY_CACHE_BYTES {
+            let Some(oldest_id) = self.image_order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.images.remove(&oldest_id) {
+                self.total_image_bytes = self.total_image_bytes.saturating_sub(old.rgba.len());
+            }
+            self.placements.retain(|p| p.image_id != oldest_id);
+        }
+        self.total_image_bytes = self.total_image_bytes.saturating_add(new_bytes);
+        self.image_order.push_back(img.id);
+        self.images.insert(img.id, img);
+    }
+}
+
+fn checked_rgba_len(width: u32, height: u32) -> Option<(usize, usize)> {
+    if width == 0 || height == 0 || width > MAX_KITTY_DIM || height > MAX_KITTY_DIM {
+        return None;
+    }
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    let rgba_len = pixels.checked_mul(4)?;
+    if rgba_len > MAX_KITTY_IMAGE_BYTES {
+        return None;
+    }
+    Some((pixels, rgba_len))
 }
 
 fn decode_kitty_image(
     id: u32,
+    generation: u64,
     params: &HashMap<String, String>,
     b64_payload: &[u8],
 ) -> Option<KittyImage> {
@@ -225,11 +302,22 @@ fn decode_kitty_image(
 
     match fmt {
         "100" => {
-            // PNG
-            let img = image::load_from_memory(&raw).ok()?.to_rgba8();
+            // PNG: デコード前に寸法・メモリ上限を設定して展開ボムを防止する
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(MAX_KITTY_DIM);
+            limits.max_image_height = Some(MAX_KITTY_DIM);
+            limits.max_alloc = Some(MAX_KITTY_IMAGE_BYTES as u64);
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(&raw),
+                image::ImageFormat::Png,
+            );
+            reader.limits(limits);
+            let img = reader.decode().ok()?.to_rgba8();
             let (width, height) = img.dimensions();
+            checked_rgba_len(width, height)?;
             Some(KittyImage {
                 id,
+                generation,
                 width,
                 height,
                 rgba: img.into_raw(),
@@ -238,8 +326,13 @@ fn decode_kitty_image(
         "32" => {
             let width = params.get("s").and_then(|s| s.parse::<u32>().ok())?;
             let height = params.get("v").and_then(|s| s.parse::<u32>().ok())?;
+            let (_, expected_len) = checked_rgba_len(width, height)?;
+            if raw.len() != expected_len {
+                return None;
+            }
             Some(KittyImage {
                 id,
+                generation,
                 width,
                 height,
                 rgba: raw,
@@ -248,12 +341,18 @@ fn decode_kitty_image(
         "24" => {
             let width = params.get("s").and_then(|s| s.parse::<u32>().ok())?;
             let height = params.get("v").and_then(|s| s.parse::<u32>().ok())?;
-            let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+            let (pixels, rgba_len) = checked_rgba_len(width, height)?;
+            let expected_rgb_len = pixels.checked_mul(3)?;
+            if raw.len() != expected_rgb_len {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(rgba_len);
             for chunk in raw.chunks_exact(3) {
                 rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             Some(KittyImage {
                 id,
+                generation,
                 width,
                 height,
                 rgba,
@@ -266,6 +365,68 @@ fn decode_kitty_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_mismatched_dimensions_without_panic() {
+        let mut kitty = KittyState::new();
+        let mut replies = Vec::new();
+        // s=100, v=100 なのに 4 バイトしか送らない不正ペイロード
+        let payload = BASE64.encode([1u8, 2, 3, 4]);
+        let seq = format!("\x1b_Gi=7,a=T,f=32,s=100,v=100;{payload}\x1b\\");
+        kitty.filter_and_process(seq.as_bytes(), 0, 0, &mut replies);
+
+        assert!(kitty.images.is_empty());
+        assert!(kitty.placements.is_empty());
+        assert_eq!(replies.len(), 1);
+        assert!(String::from_utf8_lossy(&replies[0]).contains("EINVAL"));
+    }
+
+    #[test]
+    fn rejects_overflow_or_zero_dimensions() {
+        let mut kitty = KittyState::new();
+        let mut replies = Vec::new();
+        let payload = BASE64.encode([0u8; 3]);
+        let seq = format!("\x1b_Gi=8,a=t,f=24,s=4294967295,v=4294967295;{payload}\x1b\\");
+        kitty.filter_and_process(seq.as_bytes(), 0, 0, &mut replies);
+        assert!(kitty.images.is_empty());
+
+        let zero_seq = format!("\x1b_Gi=9,a=t,f=32,s=0,v=10;{payload}\x1b\\");
+        kitty.filter_and_process(zero_seq.as_bytes(), 0, 0, &mut replies);
+        assert!(kitty.images.is_empty());
+    }
+
+    #[test]
+    fn decodes_valid_rgb_and_rgba_and_evicts_on_budget() {
+        let mut kitty = KittyState::new();
+        let mut replies = Vec::new();
+        let rgb = BASE64.encode([10u8, 20, 30, 40, 50, 60]);
+        let seq = format!("\x1b_Gi=1,a=T,f=24,s=2,v=1;{rgb}\x1b\\");
+        kitty.filter_and_process(seq.as_bytes(), 1, 2, &mut replies);
+
+        let img = kitty.images.get(&1).expect("image 1 stored");
+        assert_eq!(img.rgba, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+        assert_eq!(kitty.placements.len(), 1);
+        assert_eq!(kitty.total_image_bytes, 8);
+
+        // 上書き時は generation が進み、バイト数が二重加算されない
+        let rgba = BASE64.encode([1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let seq2 = format!("\x1b_Gi=1,a=t,f=32,s=2,v=1;{rgba}\x1b\\");
+        kitty.filter_and_process(seq2.as_bytes(), 0, 0, &mut replies);
+        assert_eq!(kitty.images.get(&1).unwrap().generation, 2);
+        assert_eq!(kitty.total_image_bytes, 8);
+    }
+
+    #[test]
+    fn caps_oversized_apc_buffer() {
+        let mut kitty = KittyState::new();
+        let mut replies = Vec::new();
+        kitty.filter_and_process(b"\x1b_G", 0, 0, &mut replies);
+        let chunk = vec![b'A'; MAX_KITTY_APC_BYTES + 16];
+        let out = kitty.filter_and_process(&chunk, 0, 0, &mut replies);
+        assert!(kitty.apc_buf.is_empty());
+        assert_eq!(kitty.scan_state, Some(ApcScanState::Normal));
+        assert!(!out.is_empty());
+    }
 
     #[test]
     fn extracts_chunked_kitty_rgba_and_replies_ok() {
@@ -281,5 +442,47 @@ mod tests {
         assert_eq!(kitty.placements.len(), 1);
         assert_eq!((kitty.placements[0].col, kitty.placements[0].row), (2, 3));
         assert_eq!(replies, vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn evicts_oldest_images_on_budget_and_handles_delete_and_caps() {
+        let mut kitty = KittyState::new();
+        let mut replies = Vec::new();
+        // 32 MiB * 4 = 128 MiB -> 5枚目で最古の画像が LRU 退避される
+        for i in 1..=5u32 {
+            let img = KittyImage {
+                id: i,
+                generation: i as u64,
+                width: 4096,
+                height: 2048,
+                rgba: vec![0u8; 32 * 1024 * 1024],
+            };
+            kitty.insert_image_with_budget(img);
+        }
+        assert!(!kitty.images.contains_key(&1));
+        assert!(kitty.images.contains_key(&5));
+        assert!(kitty.total_image_bytes <= MAX_KITTY_CACHE_BYTES);
+
+        // a=d,d=I で個別削除・バイト数減算
+        kitty.filter_and_process(b"\x1b_Ga=d,d=I,i=5\x1b\\", 0, 0, &mut replies);
+        assert!(!kitty.images.contains_key(&5));
+        assert_eq!(kitty.total_image_bytes, 96 * 1024 * 1024);
+
+        // a=d,d=A で全削除
+        kitty.filter_and_process(b"\x1b_Ga=d,d=A\x1b\\", 0, 0, &mut replies);
+        assert!(kitty.images.is_empty());
+        assert_eq!(kitty.total_image_bytes, 0);
+
+        // placements 上限キャップ
+        for _ in 0..(MAX_KITTY_PLACEMENTS + 20) {
+            kitty.filter_and_process(b"\x1b_Ga=p,i=1,q=2\x1b\\", 0, 0, &mut replies);
+        }
+        assert_eq!(kitty.placements.len(), MAX_KITTY_PLACEMENTS);
+
+        // f=100 は非 PNG データを拒否する
+        let non_png = BASE64.encode(b"NOT_A_PNG_HEADER");
+        let seq = format!("\x1b_Gi=77,a=t,f=100;{non_png}\x1b\\");
+        kitty.filter_and_process(seq.as_bytes(), 0, 0, &mut replies);
+        assert!(!kitty.images.contains_key(&77));
     }
 }

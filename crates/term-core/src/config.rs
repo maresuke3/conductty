@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -353,12 +354,17 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
-fn resolve_include_path(base_dir: &Path, inc: &str) -> PathBuf {
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+fn resolve_include_path(base_dir: &Path, inc: &str) -> Result<PathBuf, String> {
+    if matches!(inc.as_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]) {
+        return Err(format!("UNC include path is not allowed: {inc}"));
+    }
     let inc_path = Path::new(inc);
-    if inc_path.is_absolute() || inc.starts_with("\\\\") {
-        inc_path.to_path_buf()
+    if inc_path.is_absolute() {
+        Ok(inc_path.to_path_buf())
     } else {
-        base_dir.join(inc_path)
+        Ok(base_dir.join(inc_path))
     }
 }
 
@@ -367,6 +373,7 @@ fn apply_os_overrides(
     target_os: TargetOs,
     base_dir: Option<&Path>,
     depth: u8,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), String> {
     let Some(root_map) = val.as_table_mut() else {
         return Ok(());
@@ -384,8 +391,9 @@ fn apply_os_overrides(
                 base_dir,
                 section.get("include").and_then(|v| v.as_str()).map(str::to_string),
             ) {
-                let resolved = resolve_include_path(dir, &inc);
-                let mut included = load_toml_with_include_for_os(&resolved, depth + 1, target_os)?;
+                let resolved = resolve_include_path(dir, &inc)?;
+                let mut included =
+                    load_toml_with_include_inner(&resolved, depth + 1, target_os, visited)?;
                 merge_toml(&mut included, section);
                 section = included;
             }
@@ -405,6 +413,31 @@ fn load_toml_with_include_for_os(
     depth: u8,
     target_os: TargetOs,
 ) -> Result<toml::Value, String> {
+    let mut visited = HashSet::new();
+    load_toml_with_include_inner(path, depth, target_os, &mut visited)
+}
+
+fn load_toml_with_include_inner(
+    path: &Path,
+    depth: u8,
+    target_os: TargetOs,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<toml::Value, String> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical.clone()) {
+        return Err(format!("cyclic config include detected: {}", path.display()));
+    }
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("config metadata error ({}): {e}", path.display()))?;
+    if !meta.is_file() {
+        visited.remove(&canonical);
+        return Err(format!("config is not a regular file: {}", path.display()));
+    }
+    if meta.len() > MAX_CONFIG_FILE_BYTES {
+        visited.remove(&canonical);
+        return Err(format!("config file too large ({} bytes): {}", meta.len(), path.display()));
+    }
+
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("config read error ({}): {e}", path.display()))?;
     let mut val: toml::Value = raw
@@ -414,13 +447,15 @@ fn load_toml_with_include_for_os(
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     if depth < 5 {
         if let Some(inc) = val.get("include").and_then(|v| v.as_str()) {
-            let resolved = resolve_include_path(base_dir, inc);
-            let mut base = load_toml_with_include_for_os(&resolved, depth + 1, target_os)?;
+            let resolved = resolve_include_path(base_dir, inc)?;
+            let mut base =
+                load_toml_with_include_inner(&resolved, depth + 1, target_os, visited)?;
             merge_toml(&mut base, val);
             val = base;
         }
     }
-    apply_os_overrides(&mut val, target_os, Some(base_dir), depth)?;
+    apply_os_overrides(&mut val, target_os, Some(base_dir), depth + 1, visited)?;
+    visited.remove(&canonical);
     Ok(val)
 }
 
@@ -462,7 +497,8 @@ impl AppConfig {
 
     pub fn from_toml_str_for_os(raw: &str, target_os: TargetOs) -> Result<Self, toml::de::Error> {
         let mut val: toml::Value = toml::from_str(raw)?;
-        let _ = apply_os_overrides(&mut val, target_os, None, 0);
+        let mut visited = HashSet::new();
+        let _ = apply_os_overrides(&mut val, target_os, None, 0, &mut visited);
         val.try_into()
     }
 
@@ -704,5 +740,36 @@ windows_default_prog = ["wsl.exe", "--cd", "~"]
 
         let mac = AppConfig::from_toml_str_for_os(raw, TargetOs::MacOs).unwrap();
         assert_eq!(mac.shell.windows_default_prog, vec!["powershell.exe"]);
+    }
+
+    #[test]
+    fn include_rejects_unc_paths_and_cycles() {
+        for bad in [
+            r"\\evil-server\share\a.toml",
+            "//evil-server/share/a.toml",
+            r"\/evil-server/share/a.toml",
+            r"/\evil-server\share\a.toml",
+        ] {
+            let err = resolve_include_path(Path::new("/tmp"), bad).unwrap_err();
+            assert!(err.contains("UNC"), "expected UNC rejection for {bad}");
+        }
+
+        let dir = std::env::temp_dir().join("conductty_test_cycle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.toml");
+        let b_path = dir.join("b.toml");
+        let big_path = dir.join("big.toml");
+        std::fs::write(&a_path, "include = \"b.toml\"\n").unwrap();
+        std::fs::write(&b_path, "include = \"a.toml\"\n").unwrap();
+        std::fs::write(&big_path, vec![b'#'; (MAX_CONFIG_FILE_BYTES as usize) + 16]).unwrap();
+
+        let cycle_err = load_toml_with_include(&a_path, 0).unwrap_err();
+        assert!(cycle_err.contains("cyclic"));
+        let big_err = load_toml_with_include(&big_path, 0).unwrap_err();
+        assert!(big_err.contains("too large"));
+        let dir_err = load_toml_with_include(&dir, 0).unwrap_err();
+        assert!(dir_err.contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

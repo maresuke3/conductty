@@ -10,10 +10,11 @@ use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::layout::{PaneId, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_mux::{
-    AgentInfo, DEFAULT_MUX_SERVER_ADDR, MuxRequest, MuxResponse, PaneInfo, SpaceInfo, SpawnKind,
+    AgentInfo, DEFAULT_MUX_SERVER_ADDR, MAX_IPC_REQUEST_BYTES, MuxRequest, MuxResponse, PaneInfo,
+    SpaceInfo, SpawnKind, parse_authenticated_request, read_bounded_line, read_or_create_ipc_token,
     split_dir_for_spawn,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 struct ServerPane {
@@ -77,13 +78,18 @@ impl ServerState {
     fn cleanup_exited_panes(&mut self) {
         let mut exited = Vec::new();
         for (&id, pane) in &self.panes {
-            if pane.exit_rx_try_recv() {
+            if pane.pty.exit_rx.try_recv().is_ok() {
                 exited.push(id);
             }
         }
         for id in exited {
             self.panes.remove(&id);
-            self.manager.close_pane(id);
+            self.agent_states.remove(&id);
+            if !self.manager.close_pane(id) {
+                if let Some(new_id) = self.spawn_pane() {
+                    self.manager = WorkspaceManager::new(new_id);
+                }
+            }
         }
     }
 
@@ -233,6 +239,8 @@ impl ServerState {
                 cols,
                 rows,
             } => {
+                let cols = cols.clamp(1, 1000);
+                let rows = rows.clamp(1, 1000);
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     if let Ok(mut g) = pane.grid.lock() {
                         g.resize(cols, rows);
@@ -326,7 +334,19 @@ impl ServerState {
                 }
             }
             MuxRequest::CloseTab { idx } => {
-                let (closed, _) = self.manager.close_tab(idx);
+                if self.manager.active_workspace().tabs.len() <= 1
+                    && self.manager.workspaces.len() <= 1
+                {
+                    return MuxResponse::Error {
+                        message: "cannot close last tab".to_string(),
+                    };
+                }
+                let (closed, keep_running) = self.manager.close_tab(idx);
+                if !keep_running {
+                    return MuxResponse::Error {
+                        message: "cannot close last tab".to_string(),
+                    };
+                }
                 for pid in closed {
                     self.panes.remove(&pid);
                     self.agent_states.remove(&pid);
@@ -355,6 +375,13 @@ impl ServerState {
                     snapshots: self.collect_snapshots(),
                 }
             }
+            MuxRequest::ResizeSplit { dir } => {
+                self.manager.active_tab_mut().resize_focused(dir, 0.05);
+                MuxResponse::State {
+                    manager: self.manager.clone(),
+                    snapshots: self.collect_snapshots(),
+                }
+            }
             MuxRequest::ToggleZoom => {
                 self.manager.active_tab_mut().toggle_zoom();
                 MuxResponse::State {
@@ -366,19 +393,10 @@ impl ServerState {
     }
 }
 
-trait TryExitExt {
-    fn exit_rx_try_recv(&self) -> bool;
-}
-
-impl TryExitExt for ServerPane {
-    fn exit_rx_try_recv(&self) -> bool {
-        self.pty.exit_rx.try_recv().is_ok()
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let config = AppConfig::load();
+    let ipc_token = Arc::new(read_or_create_ipc_token().expect("failed to init IPC token"));
     let state = Arc::new(Mutex::new(ServerState::new(config)));
     let listener = TcpListener::bind(DEFAULT_MUX_SERVER_ADDR)
         .await
@@ -391,29 +409,49 @@ async fn main() {
             break;
         };
         let state = Arc::clone(&state);
+        let ipc_token = Arc::clone(&ipc_token);
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let resp = match serde_json::from_str::<MuxRequest>(&line) {
+            let mut buf_reader = BufReader::new(reader);
+            loop {
+                let read_res = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    read_bounded_line(&mut buf_reader, MAX_IPC_REQUEST_BYTES),
+                )
+                .await;
+                let line = match read_res {
+                    Ok(Ok(Some(line))) => line,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        if let Ok(mut json) = serde_json::to_string(&MuxResponse::Error { message: e }) {
+                            json.push('\n');
+                            let _ = writer.write_all(json.as_bytes()).await;
+                        }
+                        break;
+                    }
+                    Err(_) => break,
+                };
+                let (resp, should_close) = match parse_authenticated_request(&line, &ipc_token) {
                     Ok(req) => {
-                        if let Ok(mut guard) = state.lock() {
+                        let r = if let Ok(mut guard) = state.lock() {
                             guard.handle_request(req)
                         } else {
                             MuxResponse::Error {
                                 message: "server state poisoned".to_string(),
                             }
-                        }
+                        };
+                        (r, false)
                     }
-                    Err(e) => MuxResponse::Error {
-                        message: format!("invalid request: {e}"),
-                    },
+                    Err(e) => (MuxResponse::Error { message: e }, true),
                 };
                 if let Ok(mut json) = serde_json::to_string(&resp) {
                     json.push('\n');
                     if writer.write_all(json.as_bytes()).await.is_err() {
                         break;
                     }
+                }
+                if should_close {
+                    break;
                 }
             }
         });

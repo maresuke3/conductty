@@ -8,6 +8,7 @@ name = "conductty-server"
 path = "src/bin/conductty_server.rs"
 
 [dependencies]
+getrandom = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 term-core = { path = "../term-core" }

@@ -18,8 +18,9 @@ mod imp {
     use wry::{WebView, WebViewBuilder};
 
     pub struct EmbeddedBrowser {
-        window: Arc<Window>,
+        // WebView を先に drop してからホスト Window を破棄する
         webview: WebView,
+        window: Arc<Window>,
         pub url: String,
     }
 
@@ -54,15 +55,17 @@ mod imp {
                     .map_err(|e| format!("Preview ウィンドウ作成失敗: {e}"))?,
             );
 
+            let safe_url = term_drawer::validate_http_url(url)?.to_string();
             let webview = WebViewBuilder::new()
-                .with_url(url)
+                .with_url(&safe_url)
+                .with_navigation_handler(|nav_url| term_drawer::validate_http_url(&nav_url).is_ok())
                 .build(&window)
                 .map_err(|e| format!("WebView 起動失敗: {e}"))?;
 
             Ok(Self {
                 window,
                 webview,
-                url: url.to_string(),
+                url: safe_url,
             })
         }
 
@@ -85,8 +88,10 @@ mod imp {
         }
 
         pub fn load_url(&mut self, url: &str) {
-            self.url = url.to_string();
-            let _ = self.webview.load_url(url);
+            if let Ok(safe_url) = term_drawer::validate_http_url(url) {
+                self.url = safe_url.to_string();
+                let _ = self.webview.load_url(safe_url);
+            }
         }
     }
 }
@@ -105,12 +110,10 @@ mod imp {
         pub fn open(
             _event_loop: &ActiveEventLoop,
             _parent: &Window,
-            url: &str,
+            _url: &str,
             _bounds: BrowserBounds,
         ) -> Result<Self, String> {
-            Ok(Self {
-                url: url.to_string(),
-            })
+            Err("Embedded browser is not supported on this OS".to_string())
         }
 
         pub fn window_id(&self) -> WindowId {
