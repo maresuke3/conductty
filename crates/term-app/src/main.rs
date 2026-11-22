@@ -9,6 +9,7 @@ use std::thread;
 
 use browser::{BrowserBounds, EmbeddedBrowser};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
+use term_core::agent::{AgentStatus, PaneAgentState, detect_pane_agent, snapshot_visible_lines};
 use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme};
 use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::input::{
@@ -239,6 +240,9 @@ struct App {
     go_to_filtering: bool,
     go_to_query: String,
     go_to_selected_idx: usize,
+    agent_states: HashMap<PaneId, PaneAgentState>,
+    agent_scan_start: std::time::Instant,
+    last_agent_scan: std::time::Instant,
     left_drawer_mode: LeftDrawerMode,
     left_drawer_selected_idx: usize,
     renaming_workspace_idx: Option<usize>,
@@ -683,22 +687,60 @@ impl App {
         }
     }
 
-    fn jump_to_go_to_item(&mut self, item: &GoToItem) {
+    fn jump_to_pane(&mut self, ws_idx: usize, tab_idx: usize, pane_id: PaneId) {
         if self.config.features.multiplexer_mode {
-            self.send_mux_action(MuxRequest::SwitchWorkspace { idx: item.ws_idx });
-            self.send_mux_action(MuxRequest::SwitchTab { idx: item.tab_idx });
-            self.send_mux_action(MuxRequest::FocusPane {
-                pane_id: item.pane_id,
-            });
+            self.send_mux_action(MuxRequest::SwitchWorkspace { idx: ws_idx });
+            self.send_mux_action(MuxRequest::SwitchTab { idx: tab_idx });
+            self.send_mux_action(MuxRequest::FocusPane { pane_id });
         } else {
-            self.manager.switch_workspace(item.ws_idx);
-            self.manager.switch_tab(item.tab_idx);
-            self.manager.active_tab_mut().focused_pane = item.pane_id;
+            self.manager.switch_workspace(ws_idx);
+            self.manager.switch_tab(tab_idx);
+            self.manager.active_tab_mut().focused_pane = pane_id;
         }
-        self.left_drawer_selected_idx = item.ws_idx;
+        self.left_drawer_selected_idx = ws_idx;
+    }
+
+    fn jump_to_go_to_item(&mut self, item: &GoToItem) {
+        self.jump_to_pane(item.ws_idx, item.tab_idx, item.pane_id);
         self.go_to_open = false;
         self.go_to_query.clear();
         self.go_to_selected_idx = 0;
+    }
+
+    fn refresh_agent_states(&mut self) {
+        if self.last_agent_scan.elapsed() < std::time::Duration::from_millis(250)
+            && !self.agent_states.is_empty()
+        {
+            return;
+        }
+        self.last_agent_scan = std::time::Instant::now();
+        let now_ms = self.agent_scan_start.elapsed().as_millis() as u64;
+        let mut active_ids = Vec::new();
+        let mut next_states = HashMap::new();
+
+        for ws in &self.manager.workspaces {
+            for tab in &ws.tabs {
+                for pane_id in tab.all_panes() {
+                    active_ids.push(pane_id);
+                    let snap_opt = if self.config.features.multiplexer_mode {
+                        self.mux_snapshots.get(&pane_id).cloned()
+                    } else {
+                        self.panes
+                            .get(&pane_id)
+                            .and_then(|rt| rt.grid.lock().ok().map(|g| g.snapshot()))
+                    };
+                    let Some(snap) = snap_opt else {
+                        continue;
+                    };
+                    let (lines, hash) = snapshot_visible_lines(&snap);
+                    let prev = self.agent_states.get(&pane_id);
+                    if let Some(detected) = detect_pane_agent(&lines, hash, now_ms, prev) {
+                        next_states.insert(pane_id, detected);
+                    }
+                }
+            }
+        }
+        self.agent_states = next_states;
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -1369,6 +1411,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.refresh_agent_states();
                 let area = self.terminal_area();
                 let visible_panes = self.manager.active_tab().visible_rects(area);
                 let focused_pane = self.manager.active_tab().focused_pane;
@@ -1413,6 +1456,31 @@ impl ApplicationHandler<UserEvent> for App {
                     .iter()
                     .map(|ws| (ws.name.clone(), ws.tabs.len(), ws.active_tab, ws.pane_count()))
                     .collect();
+                let mut agent_entries: Vec<(usize, String, usize, PaneId, bool, PaneAgentState)> =
+                    Vec::new();
+                for (ws_idx, ws) in self.manager.workspaces.iter().enumerate() {
+                    for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+                        for pane_id in tab.all_panes() {
+                            if let Some(st) = self.agent_states.get(&pane_id) {
+                                let is_focused = ws_idx == active_ws_idx
+                                    && tab_idx == ws.active_tab
+                                    && pane_id == tab.focused_pane;
+                                agent_entries.push((
+                                    ws_idx,
+                                    ws.name.clone(),
+                                    tab_idx,
+                                    pane_id,
+                                    is_focused,
+                                    st.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                let has_ask_agent = agent_entries
+                    .iter()
+                    .any(|(_, _, _, _, _, st)| st.status == AgentStatus::Ask);
+                let mut jump_agent_target: Option<(usize, usize, PaneId)> = None;
                 let right_drawer_open = self.right_drawer_open;
                 let drawer_snapshot = self.drawer_snapshot.clone();
 
@@ -1605,6 +1673,129 @@ impl ApplicationHandler<UserEvent> for App {
                                             });
                                         ui.add_space(4.0);
                                     }
+
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "AI Agents ({})",
+                                                agent_entries.len()
+                                            ))
+                                            .strong()
+                                            .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
+                                        );
+                                        if has_ask_agent {
+                                            ui.label(
+                                                egui::RichText::new("ASK")
+                                                    .small()
+                                                    .strong()
+                                                    .color(Color32::from_rgb(0xff, 0x9e, 0x64)),
+                                            );
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    if agent_entries.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("No active agents detected")
+                                                .small()
+                                                .color(Color32::from_rgb(0x63, 0x6d, 0xa6)),
+                                        );
+                                    } else {
+                                        for (ws_idx, ws_name, tab_idx, pane_id, is_focused, st) in
+                                            &agent_entries
+                                        {
+                                            let badge_color = match st.status {
+                                                AgentStatus::Ask => {
+                                                    Color32::from_rgb(0xff, 0x9e, 0x64)
+                                                }
+                                                AgentStatus::Running => {
+                                                    Color32::from_rgb(0x7d, 0xcf, 0xff)
+                                                }
+                                                AgentStatus::Waiting => {
+                                                    Color32::from_rgb(0xff, 0xc7, 0x77)
+                                                }
+                                                AgentStatus::Done => {
+                                                    Color32::from_rgb(0xc3, 0xe8, 0x8d)
+                                                }
+                                            };
+                                            let card_fill = if *is_focused {
+                                                Color32::from_rgb(0x3b, 0x42, 0x61)
+                                            } else {
+                                                Color32::from_rgb(0x2f, 0x33, 0x4d)
+                                            };
+                                            let card_stroke = if st.status == AgentStatus::Ask {
+                                                Stroke::new(1.5_f32, badge_color)
+                                            } else if *is_focused {
+                                                Stroke::new(
+                                                    1.0_f32,
+                                                    Color32::from_rgb(0x7a, 0xa2, 0xf7),
+                                                )
+                                            } else {
+                                                Stroke::NONE
+                                            };
+                                            let resp = egui::Frame::new()
+                                                .fill(card_fill)
+                                                .stroke(card_stroke)
+                                                .corner_radius(4.0)
+                                                .inner_margin(7.0)
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.horizontal(|ui| {
+                                                        egui::Frame::new()
+                                                            .fill(badge_color)
+                                                            .corner_radius(3.0)
+                                                            .inner_margin(egui::Margin::symmetric(
+                                                                5, 1,
+                                                            ))
+                                                            .show(ui, |ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(
+                                                                        st.status.badge(),
+                                                                    )
+                                                                    .small()
+                                                                    .strong()
+                                                                    .color(Color32::from_rgb(
+                                                                        0x1e, 0x20, 0x30,
+                                                                    )),
+                                                                );
+                                                            });
+                                                        ui.label(
+                                                            egui::RichText::new(st.kind.label())
+                                                                .strong()
+                                                                .color(Color32::from_rgb(
+                                                                    0xc8, 0xd3, 0xf5,
+                                                                )),
+                                                        );
+                                                    });
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "{ws_name} / T{} · P{}",
+                                                            tab_idx + 1,
+                                                            pane_id
+                                                        ))
+                                                        .small()
+                                                        .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                    );
+                                                    if !st.summary.is_empty() {
+                                                        ui.label(
+                                                            egui::RichText::new(&st.summary)
+                                                                .small()
+                                                                .monospace()
+                                                                .color(Color32::from_rgb(
+                                                                    0xa9, 0xb1, 0xd6,
+                                                                )),
+                                                        );
+                                                    }
+                                                })
+                                                .response;
+                                            if resp.interact(egui::Sense::click()).clicked() {
+                                                jump_agent_target =
+                                                    Some((*ws_idx, *tab_idx, *pane_id));
+                                            }
+                                            ui.add_space(4.0);
+                                        }
+                                    }
                                 });
 
                                 ui.separator();
@@ -1630,6 +1821,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 ui.vertical_centered(|ui| {
                                     if ui.button(">").clicked() {
                                         toggle_left_collapse = true;
+                                    }
+                                    if has_ask_agent {
+                                        ui.label(
+                                            egui::RichText::new("!")
+                                                .strong()
+                                                .color(Color32::from_rgb(0xff, 0x9e, 0x64)),
+                                        );
                                     }
                                     ui.add_space(6.0);
                                     for (idx, (_, _, _, _)) in ws_summaries.iter().enumerate() {
@@ -2284,6 +2482,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 let mut need_redraw = egui_wants_repaint;
+                if let Some((ws_idx, tab_idx, pane_id)) = jump_agent_target {
+                    self.jump_to_pane(ws_idx, tab_idx, pane_id);
+                    need_redraw = true;
+                }
                 if let Some(item) = go_to_click_target {
                     self.jump_to_go_to_item(&item);
                     need_redraw = true;
@@ -3229,6 +3431,9 @@ fn main() {
         go_to_filtering: false,
         go_to_query: String::new(),
         go_to_selected_idx: 0,
+        agent_states: HashMap::new(),
+        agent_scan_start: std::time::Instant::now(),
+        last_agent_scan: std::time::Instant::now(),
         left_drawer_mode,
         left_drawer_selected_idx: 0,
         renaming_workspace_idx: None,
