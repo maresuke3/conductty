@@ -90,6 +90,7 @@ pub struct KeybindsConfig {
     pub copy: String,
     pub paste: String,
     pub reload_config: String,
+    pub keybind_hints: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +167,7 @@ impl Default for ThemeColorsConfig {
 impl Default for KeybindsConfig {
     fn default() -> Self {
         Self {
-            prefix: String::new(),
+            prefix: "ctrl+b".to_string(),
             new_tab: "ctrl+t".to_string(),
             split_right: "alt+d".to_string(),
             split_down: "alt+shift+d".to_string(),
@@ -188,6 +189,7 @@ impl Default for KeybindsConfig {
             copy: "ctrl+shift+c".to_string(),
             paste: "ctrl+v".to_string(),
             reload_config: "ctrl+shift+r".to_string(),
+            keybind_hints: "prefix+?".to_string(),
         }
     }
 }

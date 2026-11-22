@@ -70,6 +70,7 @@ pub enum Action {
     Copy,
     Paste,
     ReloadConfig,
+    ToggleKeybindHints,
     OpenSelectPane,
     OpenGoTo,
 }
@@ -213,6 +214,7 @@ impl InputRouter {
             (&kb.copy, Action::Copy),
             (&kb.paste, Action::Paste),
             (&kb.reload_config, Action::ReloadConfig),
+            (&kb.keybind_hints, Action::ToggleKeybindHints),
         ];
 
         let prefix_trigger = if kb.prefix.trim().is_empty() {
@@ -790,5 +792,32 @@ mod tests {
         assert_eq!(router.route_go_to(&j, true), None);
         assert_eq!(router.route_go_to(&q, true), None);
         assert_eq!(router.route_go_to(&ctrl_j, true), Some(GoToCommand::Next));
+    }
+
+    #[test]
+    fn default_prefix_ctrl_b_opens_keybind_hints() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.keybinds.prefix, "ctrl+b");
+        let mut router = InputRouter::from_config(&cfg);
+        let ctx = MockCtx { has_right: false };
+
+        let ctrl_b = KeyEvent {
+            code: KeyCode::Char('b'),
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+        assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
+        assert_eq!(router.mode, InputMode::Prefix);
+
+        let qmark = KeyEvent {
+            code: KeyCode::Char('?'),
+            mods: mods(false, false, true),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&qmark, &ctx),
+            InputDecision::Execute(Action::ToggleKeybindHints)
+        );
+        assert_eq!(router.mode, InputMode::Normal);
     }
 }

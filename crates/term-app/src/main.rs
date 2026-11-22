@@ -240,6 +240,9 @@ struct App {
     go_to_filtering: bool,
     go_to_query: String,
     go_to_selected_idx: usize,
+    keybind_hints_open: bool,
+    keybind_hints_scroll_offset: f32,
+    keybind_hints_max_scroll: f32,
     agent_states: HashMap<PaneId, PaneAgentState>,
     agent_scan_start: std::time::Instant,
     last_agent_scan: std::time::Instant,
@@ -958,6 +961,12 @@ impl App {
             Action::OpenSelectPane => {
                 self.select_pane_active = !self.select_pane_active;
             }
+            Action::ToggleKeybindHints => {
+                self.keybind_hints_open = !self.keybind_hints_open;
+                if self.keybind_hints_open {
+                    self.keybind_hints_scroll_offset = 0.0;
+                }
+            }
             Action::OpenGoTo => {
                 self.go_to_open = !self.go_to_open;
                 if self.go_to_open {
@@ -1472,6 +1481,53 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                if self.keybind_hints_open {
+                    let ctrl = self.modifiers.control_key();
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.keybind_hints_open = false;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            self.keybind_hints_scroll_offset =
+                                (self.keybind_hints_scroll_offset + 28.0)
+                                    .min(self.keybind_hints_max_scroll);
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.keybind_hints_scroll_offset =
+                                (self.keybind_hints_scroll_offset - 28.0).max(0.0);
+                        }
+                        Key::Character(s) if s == "q" || s == "Q" || s == "?" => {
+                            self.keybind_hints_open = false;
+                        }
+                        Key::Character(s)
+                            if (s == "j" && !ctrl)
+                                || (ctrl && (s.eq_ignore_ascii_case("j") || s.eq_ignore_ascii_case("n"))) =>
+                        {
+                            self.keybind_hints_scroll_offset =
+                                (self.keybind_hints_scroll_offset + 28.0)
+                                    .min(self.keybind_hints_max_scroll);
+                        }
+                        Key::Character(s)
+                            if (s == "k" && !ctrl)
+                                || (ctrl && (s.eq_ignore_ascii_case("k") || s.eq_ignore_ascii_case("p"))) =>
+                        {
+                            self.keybind_hints_scroll_offset =
+                                (self.keybind_hints_scroll_offset - 28.0).max(0.0);
+                        }
+                        Key::Character(s) if s == "g" && !ctrl => {
+                            self.keybind_hints_scroll_offset = 0.0;
+                        }
+                        Key::Character(s) if s == "G" && !ctrl => {
+                            self.keybind_hints_scroll_offset = self.keybind_hints_max_scroll;
+                        }
+                        _ => {}
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
                 if self.select_pane_active {
                     if let Key::Character(s) = &event.logical_key {
                         if let Ok(num) = s.parse::<PaneId>() {
@@ -1551,6 +1607,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let zoomed = self.manager.active_tab().zoomed;
                 let select_pane_active = self.select_pane_active;
                 let go_to_open = self.go_to_open;
+                let keybind_hints_open = self.keybind_hints_open;
+                let mut hints_scroll_offset = self.keybind_hints_scroll_offset;
+                let mut hints_max_scroll = self.keybind_hints_max_scroll;
+                let kb_snapshot = self.config.keybinds.clone();
                 let go_to_filtering = self.go_to_filtering;
                 let go_to_query = self.go_to_query.clone();
                 let go_to_items = if go_to_open {
@@ -2576,9 +2636,135 @@ impl ApplicationHandler<UserEvent> for App {
                                 );
                             });
                     }
+
+                    if keybind_hints_open {
+                        let prefix_label = if kb_snapshot.prefix.trim().is_empty() {
+                            "(disabled)".to_string()
+                        } else {
+                            kb_snapshot.prefix.clone()
+                        };
+                        let sections: Vec<(&str, Vec<(&str, String)>)> = vec![
+                            (
+                                "Prefix & General",
+                                vec![
+                                    ("Prefix / Leader", prefix_label),
+                                    ("Keybind Hints", kb_snapshot.keybind_hints.clone()),
+                                    ("Reload Config", kb_snapshot.reload_config.clone()),
+                                    ("Copy", kb_snapshot.copy.clone()),
+                                    ("Paste", kb_snapshot.paste.clone()),
+                                ],
+                            ),
+                            (
+                                "Panes & Tabs",
+                                vec![
+                                    ("New Tab", kb_snapshot.new_tab.clone()),
+                                    ("Split Right", kb_snapshot.split_right.clone()),
+                                    ("Split Down", kb_snapshot.split_down.clone()),
+                                    ("Toggle Zoom", kb_snapshot.toggle_zoom.clone()),
+                                    ("Pane Mode", kb_snapshot.pane_mode.clone()),
+                                    ("Focus Left", kb_snapshot.goto_left.clone()),
+                                    ("Focus Down", kb_snapshot.goto_down.clone()),
+                                    ("Focus Up", kb_snapshot.goto_up.clone()),
+                                    ("Focus Right", kb_snapshot.goto_right.clone()),
+                                ],
+                            ),
+                            (
+                                "Navigation & Drawers",
+                                vec![
+                                    ("Go To (Space/Pane)", kb_snapshot.go_to.clone()),
+                                    ("Select Pane (Number)", kb_snapshot.select_pane.clone()),
+                                    ("Left Drawer (Spaces/AI)", kb_snapshot.toggle_left_drawer.clone()),
+                                    ("Right Drawer (GitHub)", kb_snapshot.toggle_right_drawer.clone()),
+                                ],
+                            ),
+                            (
+                                "Go To Modal",
+                                vec![
+                                    ("Next Item", kb_snapshot.go_to_next.clone()),
+                                    ("Prev Item", kb_snapshot.go_to_prev.clone()),
+                                    ("Jump / Select", kb_snapshot.go_to_select.clone()),
+                                    ("Filter Mode", kb_snapshot.go_to_filter.clone()),
+                                    ("Close Modal", kb_snapshot.go_to_close.clone()),
+                                ],
+                            ),
+                        ];
+                        egui::Window::new("keybind_hints_modal")
+                            .title_bar(false)
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                            .fixed_size(Vec2::new(560.0, 460.0))
+                            .frame(
+                                egui::Frame::window(&ctx.style())
+                                    .fill(Color32::from_rgb(0x1e, 0x20, 0x30))
+                                    .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0xff, 0x9e, 0x64)))
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin::same(16)),
+                            )
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Keybind Hints (Current Config)")
+                                            .strong()
+                                            .size(15.0)
+                                            .color(Color32::from_rgb(0xff, 0x9e, 0x64)),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new("j/k: scroll   Esc: close")
+                                                    .small()
+                                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.separator();
+                                let scroll_out = egui::ScrollArea::vertical()
+                                    .max_height(390.0)
+                                    .auto_shrink([false, false])
+                                    .vertical_scroll_offset(hints_scroll_offset)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        for (heading, rows) in &sections {
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new(*heading)
+                                                    .strong()
+                                                    .size(13.0)
+                                                    .color(Color32::from_rgb(0x82, 0xaa, 0xff)),
+                                            );
+                                            for (label, keys) in rows {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!("{label:<24}"))
+                                                            .monospace()
+                                                            .size(12.5)
+                                                            .color(Color32::from_rgb(0xa9, 0xb1, 0xd6)),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(keys)
+                                                            .monospace()
+                                                            .strong()
+                                                            .size(12.5)
+                                                            .color(Color32::from_rgb(0xc3, 0xe8, 0x8d)),
+                                                    );
+                                                });
+                                            }
+                                        }
+                                    });
+                                hints_scroll_offset = scroll_out.state.offset.y;
+                                hints_max_scroll = (scroll_out.content_size.y
+                                    - scroll_out.inner_rect.height())
+                                .max(0.0);
+                            });
+                    }
                 });
 
                 self.cell_size = computed_cell_size;
+                self.keybind_hints_scroll_offset = hints_scroll_offset;
+                self.keybind_hints_max_scroll = hints_max_scroll;
                 let egui_wants_repaint = full_output
                     .viewport_output
                     .get(&egui::ViewportId::ROOT)
@@ -3822,6 +4008,9 @@ fn main() {
         go_to_filtering: false,
         go_to_query: String::new(),
         go_to_selected_idx: 0,
+        keybind_hints_open: false,
+        keybind_hints_scroll_offset: 0.0,
+        keybind_hints_max_scroll: 0.0,
         agent_states: HashMap::new(),
         agent_scan_start: std::time::Instant::now(),
         last_agent_scan: std::time::Instant::now(),
