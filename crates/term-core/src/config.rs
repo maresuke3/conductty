@@ -356,8 +356,16 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
 
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
+fn is_wsl_unc_path(inc: &str) -> bool {
+    let norm: String = inc
+        .chars()
+        .map(|c| if c == '/' { '\\' } else { c.to_ascii_lowercase() })
+        .collect();
+    norm.starts_with("\\\\wsl.localhost\\") || norm.starts_with("\\\\wsl$\\")
+}
+
 fn resolve_include_path(base_dir: &Path, inc: &str) -> Result<PathBuf, String> {
-    if matches!(inc.as_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]) {
+    if matches!(inc.as_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]) && !is_wsl_unc_path(inc) {
         return Err(format!("UNC include path is not allowed: {inc}"));
     }
     let inc_path = Path::new(inc);
@@ -752,6 +760,18 @@ windows_default_prog = ["wsl.exe", "--cd", "~"]
         ] {
             let err = resolve_include_path(Path::new("/tmp"), bad).unwrap_err();
             assert!(err.contains("UNC"), "expected UNC rejection for {bad}");
+        }
+
+        // Windows から WSL 上の設定を include するローカル WSL パスは許可する
+        for wsl in [
+            r"\\wsl.localhost\Ubuntu\home\user\config.conductty",
+            r"\\WSL$\Ubuntu\home\user\config.conductty",
+            "//wsl.localhost/Ubuntu/home/user/config.conductty",
+        ] {
+            assert!(
+                resolve_include_path(Path::new("/tmp"), wsl).is_ok(),
+                "expected WSL UNC path to be allowed: {wsl}"
+            );
         }
 
         let dir = std::env::temp_dir().join("conductty_test_cycle");
