@@ -145,6 +145,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.dmg
 
   release:
     name: Create GitHub Release
@@ -160,7 +161,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          sha256sum *.tar.gz *.zip *.dmg > SHA256SUMS.txt
 
       - name: Determine release tag
         id: tag
@@ -179,4 +180,5 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.dmg
             dist/SHA256SUMS.txt
