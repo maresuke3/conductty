@@ -65,25 +65,9 @@ fn panel_color(r: u8, g: u8, b: u8, opacity: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
-fn create_wgpu_surface(
-    instance: &wgpu::Instance,
-    window: Arc<Window>,
-    direct_comp: &Option<win_backdrop::DirectCompState>,
-) -> wgpu::Surface<'static> {
-    #[cfg(target_os = "windows")]
-    if let Some(dc) = direct_comp {
-        return unsafe {
-            instance
-                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(
-                    dc.visual_ptr(),
-                ))
-                .expect("failed to create DirectComposition wgpu surface")
-        };
-    }
-    let _ = direct_comp;
-    instance
-        .create_surface(window)
-        .expect("failed to create wgpu surface")
+enum RenderStatus {
+    Ok,
+    Reconfigure,
 }
 
 struct GpuState {
@@ -92,38 +76,42 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     egui_renderer: egui_wgpu::Renderer,
-    direct_comp: Option<win_backdrop::DirectCompState>,
 }
 
 impl GpuState {
     fn new(window: Arc<Window>, rt: &tokio::runtime::Runtime, transparent: bool) -> Self {
         let size = window.inner_size();
-        let direct_comp = if cfg!(target_os = "windows") && transparent {
-            win_backdrop::DirectCompState::new(&window)
-        } else {
-            None
-        };
-        let instance_desc = if direct_comp.is_some() {
+        let instance_desc = if cfg!(target_os = "windows") && transparent {
             wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::DX12,
-                ..wgpu::InstanceDescriptor::from_env_or_default()
+                backend_options: wgpu::BackendOptions {
+                    dx12: wgpu::Dx12BackendOptions {
+                        presentation_system: wgpu::Dx12SwapchainKind::DxgiFromVisual,
+                        ..wgpu::Dx12BackendOptions::from_env_or_default()
+                    },
+                    ..wgpu::BackendOptions::from_env_or_default()
+                },
+                ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
             }
         } else {
-            wgpu::InstanceDescriptor::from_env_or_default()
+            wgpu::InstanceDescriptor::new_without_display_handle_from_env()
         };
-        let instance = wgpu::Instance::new(&instance_desc);
-        let surface = create_wgpu_surface(&instance, window, &direct_comp);
+        let instance = wgpu::Instance::new(instance_desc);
+        let surface = instance
+            .create_surface(window)
+            .expect("failed to create wgpu surface");
 
         let adapter = rt
             .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                ..Default::default()
             }))
             .expect("failed to find suitable GPU adapter");
 
         let (device, queue) = rt
-            .block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .expect("failed to create wgpu device");
 
         let caps = surface.get_capabilities(&adapter);
@@ -157,6 +145,7 @@ impl GpuState {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::default(),
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
@@ -165,11 +154,9 @@ impl GpuState {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        if let Some(dc) = &direct_comp {
-            dc.commit();
-        }
 
-        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let egui_renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
 
         Self {
             surface,
@@ -177,7 +164,6 @@ impl GpuState {
             queue,
             config,
             egui_renderer,
-            direct_comp,
         }
     }
 
@@ -188,9 +174,6 @@ impl GpuState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        if let Some(dc) = &self.direct_comp {
-            dc.commit();
-        }
     }
 
     fn render_egui(
@@ -199,8 +182,21 @@ impl GpuState {
         egui_ctx: &egui::Context,
         full_output: egui::FullOutput,
         bg: wgpu::Color,
-    ) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.surface.get_current_texture()?;
+    ) -> RenderStatus {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                return RenderStatus::Reconfigure;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return RenderStatus::Ok;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                eprintln!("wgpu surface validation error");
+                return RenderStatus::Ok;
+            }
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -213,9 +209,11 @@ impl GpuState {
         let clipped_primitives =
             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
-        for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, *id, image_delta);
+        for (id, image_deltas) in &full_output.textures_delta.set {
+            for image_delta in image_deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, image_delta);
+            }
         }
 
         let mut encoder = self
@@ -238,6 +236,7 @@ impl GpuState {
                     label: Some("conductty-main-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(bg),
@@ -247,6 +246,7 @@ impl GpuState {
                     depth_stencil_attachment: None,
                     occlusion_query_set: None,
                     timestamp_writes: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
 
@@ -255,12 +255,12 @@ impl GpuState {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
 
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
-        Ok(())
+        RenderStatus::Ok
     }
 }
 
@@ -1905,18 +1905,18 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut computed_cell_size = self.cell_size;
                 let mut computed_terminal_area: Option<CoreRect> = None;
 
-                let mut full_output = self.egui_ctx.run(raw_input, |ctx| {
+                let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                     match left_drawer_mode {
                         LeftDrawerMode::Always => {
-                        egui::SidePanel::left("conductty_left_drawer")
-                            .exact_width(LEFT_DRAWER_WIDTH)
+                        egui::Panel::left("conductty_left_drawer")
+                            .exact_size(LEFT_DRAWER_WIDTH)
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
                                     .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .inner_margin(12.0),
                             )
-                            .show(ctx, |ui| {
+                            .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.heading(
                                         egui::RichText::new("Workspaces")
@@ -2182,15 +2182,15 @@ impl ApplicationHandler<UserEvent> for App {
                             });
                         }
                         LeftDrawerMode::Collapsed => {
-                        egui::SidePanel::left("conductty_left_rail")
-                            .exact_width(LEFT_RAIL_WIDTH)
+                        egui::Panel::left("conductty_left_rail")
+                            .exact_size(LEFT_RAIL_WIDTH)
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
                                     .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .inner_margin(4.0),
                             )
-                            .show(ctx, |ui| {
+                            .show(ui, |ui| {
                                 ui.vertical_centered(|ui| {
                                     if ui.button(">").clicked() {
                                         toggle_left_collapse = true;
@@ -2221,15 +2221,15 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     if right_drawer_open {
-                        egui::SidePanel::right("conductty_right_drawer")
-                            .exact_width(drawer_panel_w)
+                        egui::Panel::right("conductty_right_drawer")
+                            .exact_size(drawer_panel_w)
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
                                     .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .inner_margin(12.0),
                             )
-                            .show(ctx, |ui| {
+                            .show(ui, |ui| {
                                 if let Some(url) = &browser_url {
                                     ui.horizontal(|ui| {
                                         if ui.button("<- List").clicked() {
@@ -2364,14 +2364,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     if active_tabs.len() > 1 {
-                        egui::TopBottomPanel::top("conductty_tab_bar")
-                            .exact_height(TAB_BAR_HEIGHT)
+                        egui::Panel::top("conductty_tab_bar")
+                            .exact_size(TAB_BAR_HEIGHT)
                             .frame(
                                 egui::Frame::new()
                                     .fill(panel_color(0x18, 0x1a, 0x28, ui_opacity))
                                     .inner_margin(egui::Margin::symmetric(8, 4)),
                             )
-                            .show(ctx, |ui| {
+                            .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     for (t_idx, (_tab_id, title)) in active_tabs.iter().enumerate() {
                                         let is_active = t_idx == active_tab_idx;
@@ -2448,7 +2448,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
+                        .show(ui, |ui| {
                             let panel_rect = ui.max_rect();
                             let actual_area = CoreRect {
                                 x: panel_rect.min.x,
@@ -2460,7 +2460,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let visible_panes = self.manager.active_tab().visible_rects(actual_area);
 
                             let font_id = FontId::new(font_size, FontFamily::Monospace);
-                            let (char_w, row_h) = ui.fonts(|f| {
+                            let (char_w, row_h) = ui.fonts_mut(|f| {
                                 let w = f
                                     .glyph_width(&font_id, 'M')
                                     .max(f.glyph_width(&font_id, 'W'))
@@ -2586,7 +2586,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                             ],
                                                             &img.rgba,
                                                         );
-                                                    let handle = ctx.load_texture(
+                                                    let handle = ui.ctx().load_texture(
                                                         format!(
                                                             "kitty-{}-{}",
                                                             pane_id, p.image_id
@@ -2721,13 +2721,13 @@ impl ApplicationHandler<UserEvent> for App {
                             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                             .fixed_size(Vec2::new(520.0, 420.0))
                             .frame(
-                                egui::Frame::window(&ctx.style())
+                                egui::Frame::window(ui.style())
                                     .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0x7a, 0xa2, 0xf7)))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::same(14)),
                             )
-                            .show(ctx, |ui| {
+                            .show(ui.ctx(), |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(if go_to_filtering {
@@ -2927,13 +2927,13 @@ impl ApplicationHandler<UserEvent> for App {
                             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                             .fixed_size(Vec2::new(560.0, 460.0))
                             .frame(
-                                egui::Frame::window(&ctx.style())
+                                egui::Frame::window(ui.style())
                                     .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
                                     .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0xff, 0x9e, 0x64)))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::same(16)),
                             )
-                            .show(ctx, |ui| {
+                            .show(ui.ctx(), |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new("Keybind Hints (Current Config)")
@@ -2986,7 +2986,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             }
                                         }
                                     });
-                                hints_scroll_offset = scroll_out.state.offset.y;
+                                hints_scroll_offset = scroll_out.state.clamped_offset().y;
                                 hints_max_scroll = (scroll_out.content_size.y
                                     - scroll_out.inner_rect.height())
                                 .max(0.0);
@@ -3012,8 +3012,10 @@ impl ApplicationHandler<UserEvent> for App {
                     let cursor_rect =
                         Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(10.0, 20.0));
                     platform_output.ime = Some(egui::output::IMEOutput {
+                        purpose: egui::IMEPurpose::Terminal,
                         rect: cursor_rect,
                         cursor_rect,
+                        should_interrupt_composition: false,
                     });
                 }
                 egui_state.handle_platform_output(window, platform_output);
@@ -3026,13 +3028,11 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 bg.a = bg_alpha.clamp(0.0, 1.0) as f64;
                 match gpu.render_egui(window, &self.egui_ctx, full_output, bg) {
-                    Ok(()) => {}
-                    Err(wgpu::SurfaceError::Lost) => {
+                    RenderStatus::Ok => {}
+                    RenderStatus::Reconfigure => {
                         let size = window.inner_size();
                         gpu.resize(size.width, size.height);
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                    Err(err) => eprintln!("wgpu render error: {err:?}"),
                 }
 
                 let mut need_redraw = egui_wants_repaint;
