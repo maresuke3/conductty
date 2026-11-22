@@ -25,9 +25,12 @@ use term_mux::{
 };
 use term_render::bg_from_rgb;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    ElementState, Ime, KeyEvent as WinitKeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode as WinitKeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const LEFT_DRAWER_WIDTH: f32 = 240.0;
@@ -265,10 +268,15 @@ struct App {
     kitty_textures: HashMap<(PaneId, u32), egui::TextureHandle>,
     router: InputRouter,
     modifiers: ModifiersState,
+    suppress_next_ime_commit: bool,
+    last_terminal_area: Option<CoreRect>,
 }
 
 impl App {
     fn terminal_area(&self) -> CoreRect {
+        if let Some(area) = self.last_terminal_area {
+            return area;
+        }
         let (w, h) = if let Some(window) = &self.window {
             let size = window.inner_size();
             let scale = window.scale_factor() as f32;
@@ -1297,6 +1305,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.modifiers = ModifiersState::empty();
             }
             WindowEvent::Resized(size) => {
+                self.last_terminal_area = None;
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
@@ -1380,6 +1389,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                if self.suppress_next_ime_commit {
+                    self.suppress_next_ime_commit = false;
+                    return;
+                }
+                if self.modifiers.alt_key() && self.router.macos_left_option_as_alt {
+                    return;
+                }
                 if self.go_to_open {
                     if self.go_to_filtering {
                         self.go_to_query.push_str(&text);
@@ -1411,7 +1427,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 if self.go_to_open {
                     let items = filtered_go_to_items(&self.manager, &self.go_to_query);
-                    let core_ev = to_core_key_event(&event.logical_key, self.modifiers);
+                    let core_ev = to_core_key_event(&event, self.modifiers);
                     if let Some(cmd) = core_ev
                         .as_ref()
                         .and_then(|ev| self.router.route_go_to(ev, self.go_to_filtering))
@@ -1559,7 +1575,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if let Some(core_ev) = to_core_key_event(&event.logical_key, self.modifiers) {
+                if let Some(core_ev) = to_core_key_event(&event, self.modifiers) {
                     let area = self.terminal_area();
                     let decision = {
                         let ctx = TabNavCtx {
@@ -1571,6 +1587,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                     match decision {
                         InputDecision::SendToPty(bytes) => {
+                            self.suppress_next_ime_commit = false;
                             let focused = self.manager.active_tab().focused_pane;
                             if self.config.features.multiplexer_mode {
                                 let _ = self.rt.block_on(send_request(
@@ -1588,9 +1605,12 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         InputDecision::Execute(action) => {
+                            self.suppress_next_ime_commit = true;
                             self.handle_action(action);
                         }
-                        InputDecision::Ignore => {}
+                        InputDecision::Ignore => {
+                            self.suppress_next_ime_commit = false;
+                        }
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -1600,7 +1620,6 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 self.refresh_agent_states();
                 let area = self.terminal_area();
-                let visible_panes = self.manager.active_tab().visible_rects(area);
                 let focused_pane = self.manager.active_tab().focused_pane;
                 let pane_mode = self.router.mode == InputMode::Pane;
                 let prefix_mode = self.router.mode == InputMode::Prefix;
@@ -1722,6 +1741,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let selection = self.selection;
                 let mut computed_cell_size = self.cell_size;
+                let mut computed_terminal_area: Option<CoreRect> = None;
 
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
                     match left_drawer_mode {
@@ -2267,9 +2287,27 @@ impl ApplicationHandler<UserEvent> for App {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ctx, |ui| {
+                            let panel_rect = ui.max_rect();
+                            let actual_area = CoreRect {
+                                x: panel_rect.min.x,
+                                y: panel_rect.min.y,
+                                width: panel_rect.width().max(100.0),
+                                height: panel_rect.height().max(80.0),
+                            };
+                            computed_terminal_area = Some(actual_area);
+                            let visible_panes = self.manager.active_tab().visible_rects(actual_area);
+
                             let font_id = FontId::new(font_size, FontFamily::Monospace);
-                            let char_w = ui.fonts(|f| f.glyph_width(&font_id, 'M'));
-                            let row_h = font_size + cell_extra_h + 2.0;
+                            let (char_w, row_h) = ui.fonts(|f| {
+                                let w = f
+                                    .glyph_width(&font_id, 'M')
+                                    .max(f.glyph_width(&font_id, 'W'))
+                                    .max(f.glyph_width(&font_id, '0'))
+                                    .max(font_size * 0.5);
+                                let h = (f.row_height(&font_id).max(font_size) + cell_extra_h)
+                                    .ceil();
+                                (w, h)
+                            });
                             computed_cell_size = (char_w, row_h);
 
                             for (pane_id, rect) in &visible_panes {
@@ -2448,12 +2486,12 @@ impl ApplicationHandler<UserEvent> for App {
                             if self.config.features.right_drawer && !right_drawer_open {
                                 status_parts.push("Ctrl+Shift+G: GitHub");
                             }
-                            let mut right_edge = area.x + area.width - 14.0;
+                            let mut right_edge = actual_area.x + actual_area.width - 14.0;
                             if prefix_mode {
                                 let badge_w = 64.0;
                                 let badge_h = 22.0;
                                 let badge_rect = Rect::from_min_size(
-                                    Pos2::new(right_edge - badge_w, area.y + 8.0),
+                                    Pos2::new(right_edge - badge_w, actual_area.y + 8.0),
                                     Vec2::new(badge_w, badge_h),
                                 );
                                 ui.painter().rect_filled(
@@ -2472,7 +2510,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             if !status_parts.is_empty() {
                                 let label = status_parts.join(" | ");
-                                let top_right = Pos2::new(right_edge, area.y + 10.0);
+                                let top_right = Pos2::new(right_edge, actual_area.y + 10.0);
                                 ui.painter().text(
                                     top_right,
                                     egui::Align2::RIGHT_TOP,
@@ -2763,6 +2801,9 @@ impl ApplicationHandler<UserEvent> for App {
                 });
 
                 self.cell_size = computed_cell_size;
+                if let Some(actual_area) = computed_terminal_area {
+                    self.last_terminal_area = Some(actual_area);
+                }
                 self.keybind_hints_scroll_offset = hints_scroll_offset;
                 self.keybind_hints_max_scroll = hints_max_scroll;
                 let egui_wants_repaint = full_output
@@ -3148,33 +3189,13 @@ fn render_grid_snapshot(
                     );
                 }
                 col += 1;
-            } else if ch.is_ascii() {
-                let fg_rgb = cell.fg;
-                let mut text_run = String::new();
-                let start_col = col;
-                while col < snap.cols {
-                    let Some(c) = snap.cells.get(row_start + col) else {
-                        break;
-                    };
-                    if c.ch.is_ascii() && c.ch != '\0' && c.fg == fg_rgb {
-                        text_run.push(c.ch);
-                        col += 1;
-                    } else {
-                        break;
-                    }
-                }
-                painter.text(
-                    Pos2::new(rect.x + pad_x + start_col as f32 * char_w, y),
-                    egui::Align2::LEFT_TOP,
-                    text_run,
-                    font_id.clone(),
-                    fg_color,
-                );
             } else {
+                let mut ch_buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut ch_buf);
                 painter.text(
                     Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
                     egui::Align2::LEFT_TOP,
-                    ch.to_string(),
+                    s,
                     font_id.clone(),
                     fg_color,
                 );
@@ -3514,27 +3535,67 @@ fn font_search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn find_font_bytes(dirs: &[PathBuf], family: &str) -> Option<Vec<u8>> {
-    let normalized = family.replace(' ', "").to_lowercase();
-    for dir in dirs {
-        if let Some(bytes) = scan_dir_for_font(dir, &normalized, 0) {
-            return Some(bytes);
-        }
+fn font_candidate_score(fname: &str) -> i32 {
+    let mut score = 0;
+    if fname.contains("regular") {
+        score += 40;
     }
-    None
+    if fname.contains("mono") {
+        score += 15;
+    }
+    if fname.contains("propo") {
+        score -= 100;
+    }
+    if fname.contains("italic") || fname.contains("oblique") {
+        score -= 50;
+    }
+    if fname.contains("bold")
+        || fname.contains("semibold")
+        || fname.contains("extrabold")
+        || fname.contains("black")
+        || fname.contains("heavy")
+    {
+        score -= 30;
+    }
+    if fname.contains("light")
+        || fname.contains("thin")
+        || fname.contains("medium")
+        || fname.contains("retina")
+    {
+        score -= 15;
+    }
+    if fname.ends_with("vf") {
+        score -= 40;
+    }
+    score
 }
 
-fn scan_dir_for_font(dir: &PathBuf, target: &str, depth: usize) -> Option<Vec<u8>> {
-    if depth > 3 || !dir.is_dir() {
-        return None;
+fn find_font_bytes(dirs: &[PathBuf], family: &str) -> Option<Vec<u8>> {
+    let normalized = family.replace(' ', "").to_lowercase();
+    let mut best: Option<(i32, PathBuf)> = None;
+    for dir in dirs {
+        collect_best_font(dir, &normalized, 0, &mut best);
     }
-    let entries = std::fs::read_dir(dir).ok()?;
+    let (_, path) = best?;
+    std::fs::read(&path).ok()
+}
+
+fn collect_best_font(
+    dir: &PathBuf,
+    target: &str,
+    depth: usize,
+    best: &mut Option<(i32, PathBuf)>,
+) {
+    if depth > 3 || !dir.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(found) = scan_dir_for_font(&path, target, depth + 1) {
-                return Some(found);
-            }
+            collect_best_font(&path, target, depth + 1, best);
         } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             let ext_lower = ext.to_lowercase();
             if ext_lower == "ttf" || ext_lower == "otf" {
@@ -3545,42 +3606,122 @@ fn scan_dir_for_font(dir: &PathBuf, target: &str, depth: usize) -> Option<Vec<u8
                     .replace([' ', '-', '_'], "")
                     .to_lowercase();
                 if fname.contains(target) {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        return Some(bytes);
+                    let score = font_candidate_score(&fname);
+                    let replace = match best {
+                        Some((best_score, _)) => score > *best_score,
+                        None => true,
+                    };
+                    if replace {
+                        *best = Some((score, path));
                     }
                 }
             }
         }
     }
-    None
 }
 
-fn to_core_key_event(key: &Key, mods: ModifiersState) -> Option<CoreKeyEvent> {
-    let code = match key {
+fn key_to_core_code(key: &Key, mods: ModifiersState) -> Option<CoreKeyCode> {
+    match key {
         Key::Character(s) => {
             let mut chars = s.chars();
             let ch = chars.next()?;
             if ch == ' ' {
-                CoreKeyCode::Space
+                Some(CoreKeyCode::Space)
             } else if mods.control_key() && ('\x01'..='\x1a').contains(&ch) {
                 // Windows winit は Ctrl+文字 を制御文字 (\x01..\x1a) として渡すことがあるため英字に戻す
                 let letter = (b'a' + (ch as u8 - 1)) as char;
-                CoreKeyCode::Char(letter)
+                Some(CoreKeyCode::Char(letter))
             } else {
-                CoreKeyCode::Char(ch)
+                Some(CoreKeyCode::Char(ch))
             }
         }
-        Key::Named(NamedKey::Enter) => CoreKeyCode::Enter,
-        Key::Named(NamedKey::Escape) => CoreKeyCode::Escape,
-        Key::Named(NamedKey::Backspace) => CoreKeyCode::Backspace,
-        Key::Named(NamedKey::Tab) => CoreKeyCode::Tab,
-        Key::Named(NamedKey::Space) => CoreKeyCode::Space,
-        Key::Named(NamedKey::ArrowUp) => CoreKeyCode::Up,
-        Key::Named(NamedKey::ArrowDown) => CoreKeyCode::Down,
-        Key::Named(NamedKey::ArrowLeft) => CoreKeyCode::Left,
-        Key::Named(NamedKey::ArrowRight) => CoreKeyCode::Right,
+        Key::Named(NamedKey::Enter) => Some(CoreKeyCode::Enter),
+        Key::Named(NamedKey::Escape) => Some(CoreKeyCode::Escape),
+        Key::Named(NamedKey::Backspace) => Some(CoreKeyCode::Backspace),
+        Key::Named(NamedKey::Tab) => Some(CoreKeyCode::Tab),
+        Key::Named(NamedKey::Space) => Some(CoreKeyCode::Space),
+        Key::Named(NamedKey::ArrowUp) => Some(CoreKeyCode::Up),
+        Key::Named(NamedKey::ArrowDown) => Some(CoreKeyCode::Down),
+        Key::Named(NamedKey::ArrowLeft) => Some(CoreKeyCode::Left),
+        Key::Named(NamedKey::ArrowRight) => Some(CoreKeyCode::Right),
+        _ => None,
+    }
+}
+
+fn physical_key_to_core_code(physical_key: PhysicalKey) -> Option<CoreKeyCode> {
+    let PhysicalKey::Code(code) = physical_key else {
+        return None;
+    };
+    let ch = match code {
+        WinitKeyCode::KeyA => 'a',
+        WinitKeyCode::KeyB => 'b',
+        WinitKeyCode::KeyC => 'c',
+        WinitKeyCode::KeyD => 'd',
+        WinitKeyCode::KeyE => 'e',
+        WinitKeyCode::KeyF => 'f',
+        WinitKeyCode::KeyG => 'g',
+        WinitKeyCode::KeyH => 'h',
+        WinitKeyCode::KeyI => 'i',
+        WinitKeyCode::KeyJ => 'j',
+        WinitKeyCode::KeyK => 'k',
+        WinitKeyCode::KeyL => 'l',
+        WinitKeyCode::KeyM => 'm',
+        WinitKeyCode::KeyN => 'n',
+        WinitKeyCode::KeyO => 'o',
+        WinitKeyCode::KeyP => 'p',
+        WinitKeyCode::KeyQ => 'q',
+        WinitKeyCode::KeyR => 'r',
+        WinitKeyCode::KeyS => 's',
+        WinitKeyCode::KeyT => 't',
+        WinitKeyCode::KeyU => 'u',
+        WinitKeyCode::KeyV => 'v',
+        WinitKeyCode::KeyW => 'w',
+        WinitKeyCode::KeyX => 'x',
+        WinitKeyCode::KeyY => 'y',
+        WinitKeyCode::KeyZ => 'z',
+        WinitKeyCode::Digit0 => '0',
+        WinitKeyCode::Digit1 => '1',
+        WinitKeyCode::Digit2 => '2',
+        WinitKeyCode::Digit3 => '3',
+        WinitKeyCode::Digit4 => '4',
+        WinitKeyCode::Digit5 => '5',
+        WinitKeyCode::Digit6 => '6',
+        WinitKeyCode::Digit7 => '7',
+        WinitKeyCode::Digit8 => '8',
+        WinitKeyCode::Digit9 => '9',
+        WinitKeyCode::Backquote => return Some(CoreKeyCode::Backquote),
+        WinitKeyCode::Space => return Some(CoreKeyCode::Space),
         _ => return None,
     };
+    Some(CoreKeyCode::Char(ch))
+}
+
+fn resolve_core_key_code(
+    logical_key: &Key,
+    unmodified_key: &Key,
+    physical_key: PhysicalKey,
+    mods: ModifiersState,
+) -> Option<CoreKeyCode> {
+    // macOS では Option(Alt)+d が '∂'、Option+Shift+d が 'Î' のように
+    // logical_key が特殊文字や Dead キーに変化するため、修飾キー押下時は
+    // key_without_modifiers() を優先し、さらに物理キーへフォールバックする。
+    let has_shortcut_mod = mods.alt_key() || mods.control_key() || mods.super_key();
+    if has_shortcut_mod || matches!(logical_key, Key::Dead(_)) {
+        if let Some(code) = key_to_core_code(unmodified_key, mods) {
+            if !matches!(code, CoreKeyCode::Char(c) if !c.is_ascii()) {
+                return Some(code);
+            }
+        }
+        if let Some(code) = physical_key_to_core_code(physical_key) {
+            return Some(code);
+        }
+    }
+    key_to_core_code(logical_key, mods)
+}
+
+fn to_core_key_event(event: &WinitKeyEvent, mods: ModifiersState) -> Option<CoreKeyEvent> {
+    let unmodified = event.key_without_modifiers();
+    let code = resolve_core_key_code(&event.logical_key, &unmodified, event.physical_key, mods)?;
 
     Some(CoreKeyEvent {
         code,
@@ -4033,6 +4174,99 @@ fn main() {
         kitty_textures: HashMap::new(),
         router,
         modifiers: ModifiersState::empty(),
+        suppress_next_ime_commit: false,
+        last_terminal_area: None,
     };
     let _ = event_loop.run_app(&mut app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoNav;
+    impl PerformableContext for NoNav {
+        fn can_goto_split(&self, _dir: NavDirection) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn macos_option_d_and_option_shift_d_trigger_split_actions() {
+        let mut router = InputRouter::default();
+
+        // macOS Option+d produces logical_key = "∂", key_without_modifiers = "d"
+        let alt_mods = ModifiersState::ALT;
+        let code_right = resolve_core_key_code(
+            &Key::Character("∂".into()),
+            &Key::Character("d".into()),
+            PhysicalKey::Code(WinitKeyCode::KeyD),
+            alt_mods,
+        )
+        .unwrap();
+        let ev_right = CoreKeyEvent {
+            code: code_right,
+            mods: Modifiers {
+                ctrl: false,
+                alt: true,
+                shift: false,
+                logo: false,
+            },
+            left_alt: true,
+        };
+        assert_eq!(
+            router.route(&ev_right, &NoNav),
+            InputDecision::Execute(Action::SplitRight)
+        );
+
+        // macOS Option+Shift+d produces logical_key = "Î", key_without_modifiers = "d"
+        let alt_shift_mods = ModifiersState::ALT | ModifiersState::SHIFT;
+        let code_down = resolve_core_key_code(
+            &Key::Character("Î".into()),
+            &Key::Character("d".into()),
+            PhysicalKey::Code(WinitKeyCode::KeyD),
+            alt_shift_mods,
+        )
+        .unwrap();
+        let ev_down = CoreKeyEvent {
+            code: code_down,
+            mods: Modifiers {
+                ctrl: false,
+                alt: true,
+                shift: true,
+                logo: false,
+            },
+            left_alt: true,
+        };
+        assert_eq!(
+            router.route(&ev_down, &NoNav),
+            InputDecision::Execute(Action::SplitDown)
+        );
+    }
+
+    #[test]
+    fn shift_symbol_preserves_logical_key_for_prefix_hints() {
+        let code = resolve_core_key_code(
+            &Key::Character("?".into()),
+            &Key::Character("/".into()),
+            PhysicalKey::Code(WinitKeyCode::Slash),
+            ModifiersState::SHIFT,
+        )
+        .unwrap();
+        assert_eq!(code, CoreKeyCode::Char('?'));
+    }
+
+    #[test]
+    fn font_scoring_prefers_regular_mono_over_bold_italic_propo() {
+        assert!(font_candidate_score("cicaregular") > font_candidate_score("cicabold"));
+        assert!(font_candidate_score("cicaregular") > font_candidate_score("cicabolditalic"));
+        assert!(
+            font_candidate_score("firacodenerdfontmonoregular")
+                > font_candidate_score("firacodenerdfontproporegular")
+        );
+        assert!(
+            font_candidate_score("firacodenerdfontmonoregular")
+                > font_candidate_score("firacodenerdfontmonolight")
+        );
+    }
 }

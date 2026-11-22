@@ -111,6 +111,8 @@ pub struct TerminalGrid {
     current_bg: Option<Rgb>,
     current_bold: bool,
     current_reverse: bool,
+    pending_wrap: bool,
+    saved_cursor: (usize, usize),
     alt_screen: Option<(Vec<Cell>, usize, usize)>,
     parser: Parser,
 }
@@ -135,6 +137,8 @@ impl TerminalGrid {
             current_bg: None,
             current_bold: false,
             current_reverse: false,
+            pending_wrap: false,
+            saved_cursor: (0, 0),
             alt_screen: None,
             parser: Parser::new(),
         }
@@ -233,7 +237,9 @@ impl TerminalGrid {
             let mut line = String::new();
             for col in c_start..=c_end {
                 if let Some(cell) = self.visible_cell(col, row) {
-                    line.push(cell.ch);
+                    if cell.ch != '\0' {
+                        line.push(cell.ch);
+                    }
                 }
             }
             lines.push(line.trim_end().to_string());
@@ -261,6 +267,20 @@ impl TerminalGrid {
         self.cells = new_cells;
         self.cursor_col = self.cursor_col.min(new_cols - 1);
         self.cursor_row = self.cursor_row.min(new_rows - 1);
+        self.pending_wrap = false;
+    }
+
+    fn clear_wide_overlap(&mut self, row: usize, col: usize) {
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let idx = row * self.cols + col;
+        if self.cells[idx].ch == '\0' && col > 0 {
+            self.cells[idx - 1].ch = ' ';
+            self.cells[idx].ch = ' ';
+        } else if col + 1 < self.cols && self.cells[idx + 1].ch == '\0' {
+            self.cells[idx + 1].ch = ' ';
+        }
     }
 
     fn newline(&mut self) {
@@ -350,9 +370,59 @@ impl TerminalGrid {
     }
 }
 
+fn char_display_width(c: char) -> usize {
+    let cp = c as u32;
+    // 制御文字・ゼロ幅文字・結合文字
+    if cp < 0x20
+        || (0x7f..=0x9f).contains(&cp)
+        || (0x0300..=0x036f).contains(&cp)
+        || (0x1ab0..=0x1aff).contains(&cp)
+        || (0x1dc0..=0x1dff).contains(&cp)
+        || (0x200b..=0x200f).contains(&cp)
+        || (0x20d0..=0x20ff).contains(&cp)
+        || (0xfe00..=0xfe0f).contains(&cp)
+        || (0xfe20..=0xfe2f).contains(&cp)
+        || cp == 0xfeff
+    {
+        return 0;
+    }
+    // 東アジア全角文字 (CJK / ひらがな / カタカナ / 全角英数記号 / ハングル / 絵文字)
+    let is_wide = (0x1100..=0x115f).contains(&cp)
+        || cp == 0x2329
+        || cp == 0x232a
+        || (0x2e80..=0x303e).contains(&cp)
+        || (0x3040..=0x33ff).contains(&cp)
+        || (0x3400..=0x4dbf).contains(&cp)
+        || (0x4e00..=0x9fff).contains(&cp)
+        || (0xa000..=0xa4cf).contains(&cp)
+        || (0xac00..=0xd7a3).contains(&cp)
+        || (0xf900..=0xfaff).contains(&cp)
+        || (0xfe10..=0xfe19).contains(&cp)
+        || (0xfe30..=0xfe6f).contains(&cp)
+        || (0xff00..=0xff60).contains(&cp)
+        || (0xffe0..=0xffe6).contains(&cp)
+        || (0x1f300..=0x1f9ff).contains(&cp)
+        || (0x1fa00..=0x1faff).contains(&cp)
+        || (0x20000..=0x3fffd).contains(&cp);
+    if is_wide { 2 } else { 1 }
+}
+
 impl Perform for TerminalGrid {
     fn print(&mut self, c: char) {
-        if self.cursor_col >= self.cols {
+        let width = char_display_width(c);
+        if width == 0 {
+            return;
+        }
+        if self.pending_wrap || self.cursor_col >= self.cols {
+            self.cursor_col = 0;
+            self.newline();
+            self.pending_wrap = false;
+        }
+        if width == 2 && self.cols >= 2 && self.cursor_col + 1 >= self.cols {
+            let idx = self.cursor_row * self.cols + self.cursor_col;
+            if let Some(cell) = self.cells.get_mut(idx) {
+                *cell = Cell::default();
+            }
             self.cursor_col = 0;
             self.newline();
         }
@@ -366,6 +436,8 @@ impl Perform for TerminalGrid {
         } else {
             (self.current_fg, self.current_bg)
         };
+
+        self.clear_wide_overlap(self.cursor_row, self.cursor_col);
         let idx = self.cursor_row * self.cols + self.cursor_col;
         if let Some(cell) = self.cells.get_mut(idx) {
             *cell = Cell {
@@ -375,19 +447,62 @@ impl Perform for TerminalGrid {
                 bold: self.current_bold,
             };
         }
-        self.cursor_col += 1;
+
+        if width == 2 && self.cursor_col + 1 < self.cols {
+            self.clear_wide_overlap(self.cursor_row, self.cursor_col + 1);
+            if let Some(cont) = self.cells.get_mut(idx + 1) {
+                *cont = Cell {
+                    ch: '\0',
+                    fg,
+                    bg,
+                    bold: self.current_bold,
+                };
+            }
+            if self.cursor_col + 2 >= self.cols {
+                self.cursor_col = self.cols - 1;
+                self.pending_wrap = true;
+            } else {
+                self.cursor_col += 2;
+            }
+        } else if self.cursor_col + 1 >= self.cols {
+            self.pending_wrap = true;
+        } else {
+            self.cursor_col += 1;
+        }
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' => self.newline(),
-            b'\r' => self.cursor_col = 0,
+            b'\n' => {
+                self.pending_wrap = false;
+                self.newline();
+            }
+            b'\r' => {
+                self.pending_wrap = false;
+                self.cursor_col = 0;
+            }
             0x08 => {
+                self.pending_wrap = false;
                 self.cursor_col = self.cursor_col.saturating_sub(1);
             }
             b'\t' => {
+                self.pending_wrap = false;
                 let next = ((self.cursor_col / 8) + 1) * 8;
                 self.cursor_col = next.min(self.cols - 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        match byte {
+            b'7' => {
+                self.saved_cursor = (self.cursor_col, self.cursor_row);
+            }
+            b'8' => {
+                self.cursor_col = self.saved_cursor.0.min(self.cols - 1);
+                self.cursor_row = self.saved_cursor.1.min(self.rows - 1);
+                self.pending_wrap = false;
             }
             _ => {}
         }
@@ -401,13 +516,42 @@ impl Perform for TerminalGrid {
             .unwrap_or(0) as usize;
         let is_private = intermediates.contains(&b'?');
         match action {
-            'A' => self.cursor_row = self.cursor_row.saturating_sub(first.max(1)),
-            'B' => self.cursor_row = (self.cursor_row + first.max(1)).min(self.rows - 1),
-            'C' => self.cursor_col = (self.cursor_col + first.max(1)).min(self.cols - 1),
-            'D' => self.cursor_col = self.cursor_col.saturating_sub(first.max(1)),
-            'G' => self.cursor_col = first.saturating_sub(1).min(self.cols - 1),
-            'd' => self.cursor_row = first.saturating_sub(1).min(self.rows - 1),
+            'A' => {
+                self.pending_wrap = false;
+                self.cursor_row = self.cursor_row.saturating_sub(first.max(1));
+            }
+            'B' => {
+                self.pending_wrap = false;
+                self.cursor_row = (self.cursor_row + first.max(1)).min(self.rows - 1);
+            }
+            'C' => {
+                self.pending_wrap = false;
+                self.cursor_col = (self.cursor_col + first.max(1)).min(self.cols - 1);
+            }
+            'D' => {
+                self.pending_wrap = false;
+                self.cursor_col = self.cursor_col.saturating_sub(first.max(1));
+            }
+            'E' => {
+                self.pending_wrap = false;
+                self.cursor_row = (self.cursor_row + first.max(1)).min(self.rows - 1);
+                self.cursor_col = 0;
+            }
+            'F' => {
+                self.pending_wrap = false;
+                self.cursor_row = self.cursor_row.saturating_sub(first.max(1));
+                self.cursor_col = 0;
+            }
+            'G' | '`' => {
+                self.pending_wrap = false;
+                self.cursor_col = first.saturating_sub(1).min(self.cols - 1);
+            }
+            'd' => {
+                self.pending_wrap = false;
+                self.cursor_row = first.saturating_sub(1).min(self.rows - 1);
+            }
             'H' | 'f' => {
+                self.pending_wrap = false;
                 let mut it = params.iter();
                 let r = it
                     .next()
@@ -421,6 +565,36 @@ impl Perform for TerminalGrid {
                     .max(1) as usize;
                 self.cursor_row = (r - 1).min(self.rows - 1);
                 self.cursor_col = (c - 1).min(self.cols - 1);
+            }
+            's' if !is_private => {
+                self.saved_cursor = (self.cursor_col, self.cursor_row);
+            }
+            'u' if !is_private => {
+                self.cursor_col = self.saved_cursor.0.min(self.cols - 1);
+                self.cursor_row = self.saved_cursor.1.min(self.rows - 1);
+                self.pending_wrap = false;
+            }
+            'P' => {
+                // DCH: Delete N characters at cursor, shifting remaining cells left
+                let n = first.max(1).min(self.cols - self.cursor_col);
+                let row_start = self.cursor_row * self.cols;
+                let start = row_start + self.cursor_col;
+                let row_end = row_start + self.cols;
+                self.cells[start..row_end].rotate_left(n);
+                for c in &mut self.cells[row_end - n..row_end] {
+                    *c = Cell::default();
+                }
+            }
+            '@' => {
+                // ICH: Insert N blank characters at cursor, shifting remaining cells right
+                let n = first.max(1).min(self.cols - self.cursor_col);
+                let row_start = self.cursor_row * self.cols;
+                let start = row_start + self.cursor_col;
+                let row_end = row_start + self.cols;
+                self.cells[start..row_end].rotate_right(n);
+                for c in &mut self.cells[start..start + n] {
+                    *c = Cell::default();
+                }
             }
             'J' => match first {
                 0 => {
@@ -579,5 +753,20 @@ mod tests {
         let mut grid = TerminalGrid::new(10, 3);
         grid.feed_bytes(b"hello\r\nworld");
         assert_eq!(grid.extract_text((1, 0), (3, 1)), "ello\nworl");
+    }
+
+    #[test]
+    fn wide_chars_occupy_two_cells_and_dch_ich_work() {
+        let mut grid = TerminalGrid::new(10, 2);
+        grid.feed_bytes("あa".as_bytes());
+        assert_eq!(grid.cell(0, 0).unwrap().ch, 'あ');
+        assert_eq!(grid.cell(1, 0).unwrap().ch, '\0');
+        assert_eq!(grid.cell(2, 0).unwrap().ch, 'a');
+        assert_eq!(grid.cursor_col, 3);
+        assert_eq!(grid.extract_text((0, 0), (2, 0)), "あa");
+
+        // DCH (CSI P) deletes at cursor and shifts left
+        grid.feed_bytes(b"\r\x1b[2P");
+        assert_eq!(grid.cell(0, 0).unwrap().ch, 'a');
     }
 }
