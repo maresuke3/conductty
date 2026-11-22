@@ -285,7 +285,7 @@ struct App {
     mux_snapshots: HashMap<PaneId, GridSnapshot>,
     mux_last_sizes: HashMap<PaneId, (usize, usize)>,
     next_pane_id: PaneId,
-    select_pane_active: bool,
+    pane_mode_active: bool,
     go_to_open: bool,
     go_to_filtering: bool,
     go_to_query: String,
@@ -1019,8 +1019,8 @@ impl App {
             Action::ToggleZoom => {
                 self.manager.active_tab_mut().toggle_zoom();
             }
-            Action::OpenSelectPane => {
-                self.select_pane_active = !self.select_pane_active;
+            Action::OpenPaneMode => {
+                self.pane_mode_active = !self.pane_mode_active;
             }
             Action::ToggleKeybindHints => {
                 self.keybind_hints_open = !self.keybind_hints_open;
@@ -1181,7 +1181,7 @@ impl App {
                 }
                 self.config = new_cfg;
             }
-            Action::EnterPaneMode | Action::ExitPaneMode => {}
+            Action::EnterPaneMoveMode | Action::ExitPaneMoveMode => {}
         }
     }
 }
@@ -1465,7 +1465,7 @@ impl ApplicationHandler<UserEvent> for App {
                             window.request_redraw();
                         }
                     }
-                } else if self.router.mode == InputMode::Normal && !self.select_pane_active {
+                } else if self.router.mode == InputMode::Normal && !self.pane_mode_active {
                     let focused = self.manager.active_tab().focused_pane;
                     if self.config.features.multiplexer_mode {
                         self.send_mux_action(MuxRequest::WriteBytes {
@@ -1605,7 +1605,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self.select_pane_active {
+                if self.pane_mode_active {
                     if let Key::Character(s) = &event.logical_key {
                         if let Ok(num) = s.parse::<PaneId>() {
                             let exists = if self.config.features.multiplexer_mode {
@@ -1619,7 +1619,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 } else {
                                     self.manager.active_tab_mut().focused_pane = num;
                                 }
-                                self.select_pane_active = false;
+                                self.pane_mode_active = false;
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
                                 }
@@ -1628,7 +1628,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
-                        self.select_pane_active = false;
+                        self.pane_mode_active = false;
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
@@ -1682,10 +1682,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.refresh_agent_states();
                 let area = self.terminal_area();
                 let focused_pane = self.manager.active_tab().focused_pane;
-                let pane_mode = self.router.mode == InputMode::Pane;
+                let pane_move_mode = self.router.mode == InputMode::PaneMove;
                 let prefix_mode = self.router.mode == InputMode::Prefix;
                 let zoomed = self.manager.active_tab().zoomed;
-                let select_pane_active = self.select_pane_active;
+                let pane_mode_active = self.pane_mode_active;
                 let go_to_open = self.go_to_open;
                 let keybind_hints_open = self.keybind_hints_open;
                 let mut hints_scroll_offset = self.keybind_hints_scroll_offset;
@@ -2508,7 +2508,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
                                 }
 
-                                if select_pane_active {
+                                if pane_mode_active {
                                     let badge_pos = Pos2::new(rect.x + 14.0, rect.y + 14.0);
                                     let badge_rect =
                                         Rect::from_min_size(badge_pos, Vec2::new(36.0, 28.0));
@@ -2531,14 +2531,14 @@ impl ApplicationHandler<UserEvent> for App {
                             if self.config.features.multiplexer_mode {
                                 status_parts.push("MUX");
                             }
-                            if pane_mode {
-                                status_parts.push("PANE MODE (h/j/k/l: move, z: zoom, Enter/Esc: exit)");
+                            if pane_move_mode {
+                                status_parts.push("PANE MOVE MODE (h/j/k/l: move, z: zoom, Enter/Esc: exit)");
                             }
                             if zoomed {
                                 status_parts.push("ZOOMED");
                             }
-                            if select_pane_active {
-                                status_parts.push("SELECT PANE (press pane number)");
+                            if pane_mode_active {
+                                status_parts.push("PANE MODE (press pane number, Esc: exit)");
                             }
                             if self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed
                                 && left_drawer_mode != LeftDrawerMode::Always
@@ -2762,7 +2762,8 @@ impl ApplicationHandler<UserEvent> for App {
                                     ("Split Right", kb_snapshot.split_right.clone()),
                                     ("Split Down", kb_snapshot.split_down.clone()),
                                     ("Toggle Zoom", kb_snapshot.toggle_zoom.clone()),
-                                    ("Pane Mode", kb_snapshot.pane_mode.clone()),
+                                    ("Pane Mode (Number)", kb_snapshot.pane_mode.clone()),
+                                    ("Pane Move Mode", kb_snapshot.pane_move_mode.clone()),
                                     ("Focus Left", kb_snapshot.goto_left.clone()),
                                     ("Focus Down", kb_snapshot.goto_down.clone()),
                                     ("Focus Up", kb_snapshot.goto_up.clone()),
@@ -2773,7 +2774,6 @@ impl ApplicationHandler<UserEvent> for App {
                                 "Navigation & Drawers",
                                 vec![
                                     ("Go To (Space/Pane)", kb_snapshot.go_to.clone()),
-                                    ("Select Pane (Number)", kb_snapshot.select_pane.clone()),
                                     ("Left Drawer (Spaces/AI)", kb_snapshot.toggle_left_drawer.clone()),
                                     ("Right Drawer (GitHub)", kb_snapshot.toggle_right_drawer.clone()),
                                 ],
@@ -4240,7 +4240,7 @@ fn main() {
         mux_snapshots: HashMap::new(),
         mux_last_sizes: HashMap::new(),
         next_pane_id: 1,
-        select_pane_active: false,
+        pane_mode_active: false,
         go_to_open: false,
         go_to_filtering: false,
         go_to_query: String::new(),

@@ -5,7 +5,7 @@ use crate::layout::NavDirection;
 pub enum InputMode {
     Normal,
     Prefix,
-    Pane,
+    PaneMove,
     LeftDrawer,
     RightDrawer,
 }
@@ -47,8 +47,8 @@ pub enum Action {
     SplitRight,
     SplitDown,
     ToggleZoom,
-    EnterPaneMode,
-    ExitPaneMode,
+    EnterPaneMoveMode,
+    ExitPaneMoveMode,
     GotoSplit(NavDirection),
     ToggleLeftDrawer,
     ToggleLeftDrawerCollapse,
@@ -71,7 +71,7 @@ pub enum Action {
     Paste,
     ReloadConfig,
     ToggleKeybindHints,
-    OpenSelectPane,
+    OpenPaneMode,
     OpenGoTo,
 }
 
@@ -198,11 +198,11 @@ impl InputRouter {
     pub fn from_config(config: &AppConfig) -> Self {
         let kb = &config.keybinds;
         let specs = [
-            (&kb.pane_mode, Action::EnterPaneMode),
+            (&kb.pane_mode, Action::OpenPaneMode),
+            (&kb.pane_move_mode, Action::EnterPaneMoveMode),
             (&kb.toggle_zoom, Action::ToggleZoom),
             (&kb.toggle_left_drawer, Action::ToggleLeftDrawer),
             (&kb.toggle_right_drawer, Action::ToggleRightDrawer),
-            (&kb.select_pane, Action::OpenSelectPane),
             (&kb.go_to, Action::OpenGoTo),
             (&kb.new_tab, Action::NewTab),
             (&kb.new_workspace, Action::NewWorkspace),
@@ -330,7 +330,7 @@ impl InputRouter {
     pub fn route(&mut self, event: &KeyEvent, ctx: &impl PerformableContext) -> InputDecision {
         match self.mode {
             InputMode::Prefix => self.route_prefix_mode(event, ctx),
-            InputMode::Pane => self.route_pane_mode(event),
+            InputMode::PaneMove => self.route_pane_move_mode(event),
             InputMode::LeftDrawer => self.route_left_drawer_mode(event),
             InputMode::RightDrawer => self.route_right_drawer_mode(event),
             InputMode::Normal => self.route_normal_mode(event, ctx),
@@ -353,7 +353,7 @@ impl InputRouter {
                     }
                 }
                 match binding.action {
-                    Action::EnterPaneMode => self.mode = InputMode::Pane,
+                    Action::EnterPaneMoveMode => self.mode = InputMode::PaneMove,
                     Action::ToggleLeftDrawer => self.mode = InputMode::LeftDrawer,
                     Action::ToggleRightDrawer => self.mode = InputMode::RightDrawer,
                     _ => {}
@@ -452,11 +452,11 @@ impl InputRouter {
         }
     }
 
-    fn route_pane_mode(&mut self, event: &KeyEvent) -> InputDecision {
+    fn route_pane_move_mode(&mut self, event: &KeyEvent) -> InputDecision {
         match (&event.code, event.mods.ctrl, event.mods.shift) {
             (KeyCode::Enter, _, _) | (KeyCode::Escape, _, _) => {
                 self.mode = InputMode::Normal;
-                InputDecision::Execute(Action::ExitPaneMode)
+                InputDecision::Execute(Action::ExitPaneMoveMode)
             }
             (KeyCode::Char('h') | KeyCode::Char('H'), false, false) => {
                 InputDecision::Execute(Action::GotoSplit(NavDirection::Left))
@@ -493,7 +493,7 @@ impl InputRouter {
                     }
                 }
                 match binding.action {
-                    Action::EnterPaneMode => self.mode = InputMode::Pane,
+                    Action::EnterPaneMoveMode => self.mode = InputMode::PaneMove,
                     Action::ToggleLeftDrawer => self.mode = InputMode::LeftDrawer,
                     Action::ToggleRightDrawer => self.mode = InputMode::RightDrawer,
                     _ => {}
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_mode_captures_and_ignores_unknown_keys() {
+    fn pane_move_mode_captures_and_ignores_unknown_keys() {
         let mut router = InputRouter::default();
         let ctx = MockCtx { has_right: false };
 
@@ -600,9 +600,9 @@ mod tests {
         };
         assert_eq!(
             router.route(&enter_mode, &ctx),
-            InputDecision::Execute(Action::EnterPaneMode)
+            InputDecision::Execute(Action::EnterPaneMoveMode)
         );
-        assert_eq!(router.mode, InputMode::Pane);
+        assert_eq!(router.mode, InputMode::PaneMove);
 
         // catch_all = ignore
         let random = KeyEvent {
@@ -620,9 +620,33 @@ mod tests {
         };
         assert_eq!(
             router.route(&esc, &ctx),
-            InputDecision::Execute(Action::ExitPaneMode)
+            InputDecision::Execute(Action::ExitPaneMoveMode)
         );
         assert_eq!(router.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn pane_mode_prefix_h_opens_number_picker() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.keybinds.pane_mode, "prefix+h");
+        let mut router = InputRouter::from_config(&cfg);
+        let ctx = MockCtx { has_right: false };
+
+        let ctrl_b = KeyEvent {
+            code: KeyCode::Char('b'),
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+        let key_h = KeyEvent {
+            code: KeyCode::Char('h'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
+        assert_eq!(
+            router.route(&key_h, &ctx),
+            InputDecision::Execute(Action::OpenPaneMode)
+        );
     }
 
     #[test]
