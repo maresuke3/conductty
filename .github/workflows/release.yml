@@ -27,38 +27,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  plan:
+    name: Plan Release Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sums: ${{ steps.meta.outputs.sums }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+    steps:
+      - name: Determine release tag and target matrix
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            PLAT="${{ inputs.platform }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            case "${TAG}" in
+              *-windows) PLAT="windows" ;;
+              *-macos)   PLAT="macos" ;;
+              *-linux)   PLAT="linux" ;;
+              *)         PLAT="all" ;;
+            esac
+          fi
+          if [ "${PLAT}" = "all" ]; then
+            SUMS="SHA256SUMS.txt"
+          else
+            SUMS="SHA256SUMS-${PLAT}.txt"
+          fi
+
+          LINUX='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest","archive":"tar.gz"}'
+          MAC_ARM='{"target":"aarch64-apple-darwin","os":"macos-latest","archive":"tar.gz"}'
+          MAC_X64='{"target":"x86_64-apple-darwin","os":"macos-latest","archive":"tar.gz"}'
+          WIN='{"target":"x86_64-pc-windows-msvc","os":"windows-latest","archive":"zip"}'
+
+          case "${PLAT}" in
+            linux)   MATRIX="{\"include\":[${LINUX}]}" ;;
+            macos)   MATRIX="{\"include\":[${MAC_ARM},${MAC_X64}]}" ;;
+            windows) MATRIX="{\"include\":[${WIN}]}" ;;
+            *)       MATRIX="{\"include\":[${LINUX},${MAC_ARM},${MAC_X64},${WIN}]}" ;;
+          esac
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sums=${SUMS}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: plan
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: linux
-            target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-          - platform: macos
-            target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-          - platform: macos
-            target: x86_64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-          - platform: windows
-            target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-
-    if: >-
-      (github.event_name == 'workflow_dispatch' && (inputs.platform == 'all' || inputs.platform == matrix.platform)) ||
-      (github.event_name == 'push' && (
-        (endsWith(github.ref_name, '-windows') && matrix.platform == 'windows') ||
-        (endsWith(github.ref_name, '-macos') && matrix.platform == 'macos') ||
-        (endsWith(github.ref_name, '-linux') && matrix.platform == 'linux') ||
-        (!endsWith(github.ref_name, '-windows') && !endsWith(github.ref_name, '-macos') && !endsWith(github.ref_name, '-linux'))
-      ))
-
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -91,10 +110,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-          fi
+          TAG="${{ needs.plan.outputs.tag }}"
           STAGE="conductty-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
           cp "target/${{ matrix.target }}/release/conductty" "dist/${STAGE}/"
@@ -106,10 +122,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-          fi
+          TAG="${{ needs.plan.outputs.tag }}"
           BASE_VER="${TAG#v}"
           BASE_VER="${BASE_VER%-macos}"
           APP_DIR="dist/Conductty.app"
@@ -151,7 +164,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $tag = "${{ needs.plan.outputs.tag }}"
           $stage = "conductty-$tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/conductty.exe" "dist/$stage/"
@@ -174,7 +187,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -183,29 +196,6 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Determine release tag and checksum filename
-        id: meta
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-            PLAT="${{ inputs.platform }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-            case "${TAG}" in
-              *-windows) PLAT="windows" ;;
-              *-macos)   PLAT="macos" ;;
-              *-linux)   PLAT="linux" ;;
-              *)         PLAT="all" ;;
-            esac
-          fi
-          if [ "${PLAT}" = "all" ]; then
-            SUMS="SHA256SUMS.txt"
-          else
-            SUMS="SHA256SUMS-${PLAT}.txt"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "sums=${SUMS}" >> "$GITHUB_OUTPUT"
-
       - name: Generate SHA256SUMS
         shell: bash
         run: |
@@ -213,13 +203,13 @@ jobs:
           shopt -s nullglob
           FILES=(*.tar.gz *.zip *.dmg)
           if [ ${#FILES[@]} -gt 0 ]; then
-            sha256sum "${FILES[@]}" > "${{ steps.meta.outputs.sums }}"
+            sha256sum "${FILES[@]}" > "${{ needs.plan.outputs.sums }}"
           fi
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ needs.plan.outputs.tag }}
           generate_release_notes: true
           files: |
             dist/*.tar.gz
