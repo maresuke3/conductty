@@ -199,11 +199,38 @@ macos_option_as_alt = "left"
 
 ## リリース手順
 
-`v*` 形式のタグをプッシュすると GitHub Actions（[`.github/workflows/release.yml`](.github/workflows/release.yml)）が各 OS 向けバイナリをビルドし、GitHub Release を自動作成します。
+通常の `main` ブランチへの push ではリリースビルドは走りません。リリースタグの push または GitHub Actions の `workflow_dispatch` によって、GitHub Actions（[`.github/workflows/release.yml`](.github/workflows/release.yml)）上でビルドと GitHub Release 作成を実行します。
+
+### 1. 3 OS 一斉リリース（Windows / macOS / Linux）
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
+```
+
+### 2. OS 個別リリース（Windows のみ / macOS のみ / Linux のみ）
+
+#### 方法A: OS サフィックス付きタグで個別リリース
+
+```bash
+# Windows のみビルド・リリース
+git tag v0.1.0-windows && git push origin v0.1.0-windows
+
+# macOS (.dmg / .tar.gz) のみビルド・リリース
+git tag v0.1.0-macos && git push origin v0.1.0-macos
+
+# Linux のみビルド・リリース
+git tag v0.1.0-linux && git push origin v0.1.0-linux
+```
+
+#### 方法B: 同一タグ（例: `v0.1.0`）に対して特定 OS だけビルド・追加反映
+
+GitHub の Actions 画面（`Release` ワークフローの **Run workflow**）または `gh` CLI から `platform`（`all` / `windows` / `macos` / `linux`）を指定して実行できます。
+
+```bash
+gh workflow run release.yml -f tag=v0.1.0 -f platform=windows
+gh workflow run release.yml -f tag=v0.1.0 -f platform=macos
+gh workflow run release.yml -f tag=v0.1.0 -f platform=linux
 ```
 
 ---
