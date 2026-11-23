@@ -176,6 +176,8 @@ pub struct TerminalGrid {
     current_bold: bool,
     current_reverse: bool,
     pending_wrap: bool,
+    scroll_top: usize,
+    scroll_bottom: usize,
     saved_cursor: (usize, usize),
     alt_screen: Option<(Vec<Cell>, usize, usize)>,
     parser: Parser,
@@ -202,6 +204,8 @@ impl TerminalGrid {
             current_bold: false,
             current_reverse: false,
             pending_wrap: false,
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
             saved_cursor: (0, 0),
             alt_screen: None,
             parser: Parser::new(),
@@ -326,19 +330,138 @@ impl TerminalGrid {
         let Some(total) = new_cols.checked_mul(new_rows) else {
             return;
         };
-        let mut new_cells = vec![Cell::default(); total];
-        let copy_cols = self.cols.min(new_cols);
-        let copy_rows = self.rows.min(new_rows);
-        for r in 0..copy_rows {
-            for c in 0..copy_cols {
-                new_cells[r * new_cols + c] = self.cells[r * self.cols + c];
+
+        if self.alt_screen.is_some() {
+            let mut new_cells = vec![Cell::default(); total];
+            let copy_cols = self.cols.min(new_cols);
+            let copy_rows = self.rows.min(new_rows);
+            for r in 0..copy_rows {
+                for c in 0..copy_cols {
+                    new_cells[r * new_cols + c] = self.cells[r * self.cols + c];
+                }
+            }
+            self.cols = new_cols;
+            self.rows = new_rows;
+            self.cells = new_cells;
+            self.cursor_col = self.cursor_col.min(new_cols - 1);
+            self.cursor_row = self.cursor_row.min(new_rows - 1);
+            self.scroll_top = 0;
+            self.scroll_bottom = new_rows - 1;
+            self.pending_wrap = false;
+            return;
+        }
+
+        let default_cell = Cell::default();
+        let mut last_active_row = self.cursor_row.min(self.rows.saturating_sub(1));
+        for r in (0..self.rows).rev() {
+            let row_slice = &self.cells[r * self.cols..(r + 1) * self.cols];
+            if row_slice.iter().any(|c| *c != default_cell) {
+                last_active_row = last_active_row.max(r);
+                break;
             }
         }
+
+        let mut reflowed: Vec<Vec<Cell>> = Vec::with_capacity(last_active_row + 1);
+        let mut new_cursor_row = 0usize;
+        let mut new_cursor_col = self.cursor_col.min(new_cols - 1);
+
+        for r in 0..=last_active_row {
+            let row_slice = &self.cells[r * self.cols..(r + 1) * self.cols];
+            let mut content_len = row_slice
+                .iter()
+                .rposition(|c| *c != default_cell)
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+            let is_cursor_row = r == self.cursor_row;
+            if is_cursor_row {
+                content_len = content_len.max(self.cursor_col.min(self.cols));
+            }
+
+            if content_len == 0 {
+                if is_cursor_row {
+                    new_cursor_row = reflowed.len();
+                    new_cursor_col = 0;
+                }
+                reflowed.push(vec![default_cell; new_cols]);
+                continue;
+            }
+
+            let mut cur_line = vec![default_cell; new_cols];
+            let mut dst_col = 0usize;
+            let mut src_col = 0usize;
+            let mut cursor_placed = false;
+
+            while src_col < content_len {
+                let is_wide_start = src_col + 1 < self.cols
+                    && row_slice[src_col + 1].ch == '\0'
+                    && row_slice[src_col].ch != '\0';
+                let cell_width = if is_wide_start { 2 } else { 1 };
+
+                if dst_col + cell_width > new_cols && dst_col > 0 {
+                    reflowed.push(cur_line);
+                    cur_line = vec![default_cell; new_cols];
+                    dst_col = 0;
+                }
+
+                if is_cursor_row && !cursor_placed && src_col == self.cursor_col {
+                    new_cursor_row = reflowed.len();
+                    new_cursor_col = dst_col.min(new_cols - 1);
+                    cursor_placed = true;
+                }
+
+                cur_line[dst_col] = row_slice[src_col];
+                if is_wide_start && dst_col + 1 < new_cols {
+                    if is_cursor_row && !cursor_placed && src_col + 1 == self.cursor_col {
+                        new_cursor_row = reflowed.len();
+                        new_cursor_col = (dst_col + 1).min(new_cols - 1);
+                        cursor_placed = true;
+                    }
+                    cur_line[dst_col + 1] = row_slice[src_col + 1];
+                    dst_col += 2;
+                    src_col += 2;
+                } else {
+                    dst_col += 1;
+                    src_col += 1;
+                }
+            }
+
+            if is_cursor_row && !cursor_placed {
+                if dst_col >= new_cols {
+                    reflowed.push(cur_line);
+                    cur_line = vec![default_cell; new_cols];
+                    dst_col = 0;
+                }
+                new_cursor_row = reflowed.len();
+                new_cursor_col = dst_col.min(new_cols - 1);
+            }
+
+            reflowed.push(cur_line);
+        }
+
+        if reflowed.len() > new_rows {
+            let overflow = reflowed.len() - new_rows;
+            for line in reflowed.drain(..overflow) {
+                if self.scrollback.len() >= MAX_SCROLLBACK {
+                    self.scrollback.pop_front();
+                }
+                self.scrollback.push_back(line);
+            }
+            new_cursor_row = new_cursor_row.saturating_sub(overflow);
+        }
+
+        let mut new_cells = vec![default_cell; total];
+        for (r, line) in reflowed.into_iter().take(new_rows).enumerate() {
+            let start = r * new_cols;
+            new_cells[start..start + new_cols].copy_from_slice(&line);
+        }
+
         self.cols = new_cols;
         self.rows = new_rows;
         self.cells = new_cells;
-        self.cursor_col = self.cursor_col.min(new_cols - 1);
-        self.cursor_row = self.cursor_row.min(new_rows - 1);
+        self.cursor_col = new_cursor_col.min(new_cols - 1);
+        self.cursor_row = new_cursor_row.min(new_rows - 1);
+        self.scroll_top = 0;
+        self.scroll_bottom = new_rows - 1;
         self.pending_wrap = false;
     }
 
@@ -355,24 +478,71 @@ impl TerminalGrid {
         }
     }
 
-    fn newline(&mut self) {
-        if self.cursor_row + 1 < self.rows {
-            self.cursor_row += 1;
-        } else {
-            let top_row = self.cells[..self.cols].to_vec();
-            if self.scrollback.len() >= MAX_SCROLLBACK {
-                self.scrollback.pop_front();
-            }
-            self.scrollback.push_back(top_row);
-            if self.scroll_offset > 0 {
-                self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len());
-            }
+    fn scroll_up_region(&mut self, top: usize, bottom: usize, count: usize) {
+        let top = top.min(self.rows.saturating_sub(1));
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        if top > bottom {
+            return;
+        }
+        let region_rows = bottom - top + 1;
+        let n = count.clamp(1, region_rows);
 
-            self.cells.rotate_left(self.cols);
-            let start = (self.rows - 1) * self.cols;
-            for c in &mut self.cells[start..] {
-                *c = Cell::default();
+        if top == 0 && bottom + 1 == self.rows && self.alt_screen.is_none() {
+            for r in 0..n {
+                let row_slice = self.cells[r * self.cols..(r + 1) * self.cols].to_vec();
+                if self.scrollback.len() >= MAX_SCROLLBACK {
+                    self.scrollback.pop_front();
+                }
+                self.scrollback.push_back(row_slice);
+                if self.scroll_offset > 0 {
+                    self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len());
+                }
             }
+        }
+
+        let start = top * self.cols;
+        let end = (bottom + 1) * self.cols;
+        let shift = n * self.cols;
+        self.cells[start..end].rotate_left(shift);
+        for c in &mut self.cells[end - shift..end] {
+            *c = Cell::default();
+        }
+    }
+
+    fn scroll_down_region(&mut self, top: usize, bottom: usize, count: usize) {
+        let top = top.min(self.rows.saturating_sub(1));
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        if top > bottom {
+            return;
+        }
+        let region_rows = bottom - top + 1;
+        let n = count.clamp(1, region_rows);
+        let start = top * self.cols;
+        let end = (bottom + 1) * self.cols;
+        let shift = n * self.cols;
+        self.cells[start..end].rotate_right(shift);
+        for c in &mut self.cells[start..start + shift] {
+            *c = Cell::default();
+        }
+    }
+
+    fn newline(&mut self) {
+        let bottom = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if self.cursor_row == bottom {
+            self.scroll_up_region(self.scroll_top, bottom, 1);
+        } else if self.cursor_row + 1 < self.rows {
+            self.cursor_row += 1;
+        }
+    }
+
+    fn reverse_index(&mut self) {
+        self.pending_wrap = false;
+        let top = self.scroll_top.min(self.rows.saturating_sub(1));
+        let bottom = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if self.cursor_row == top {
+            self.scroll_down_region(top, bottom, 1);
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
         }
     }
 
@@ -579,6 +749,27 @@ impl Perform for TerminalGrid {
                 self.cursor_row = self.saved_cursor.1.min(self.rows - 1);
                 self.pending_wrap = false;
             }
+            b'D' => {
+                self.pending_wrap = false;
+                self.newline();
+            }
+            b'E' => {
+                self.pending_wrap = false;
+                self.cursor_col = 0;
+                self.newline();
+            }
+            b'M' => {
+                self.reverse_index();
+            }
+            b'c' => {
+                self.clear_all();
+                self.cursor_col = 0;
+                self.cursor_row = 0;
+                self.scroll_top = 0;
+                self.scroll_bottom = self.rows.saturating_sub(1);
+                self.pending_wrap = false;
+                self.reset_sgr();
+            }
             _ => {}
         }
     }
@@ -730,14 +921,48 @@ impl Perform for TerminalGrid {
                 }
             }
             'M' => {
-                // DL: Delete N lines at cursor_row
-                let n = first.max(1).min(self.rows - self.cursor_row);
-                let start = self.cursor_row * self.cols;
-                self.cells[start..].rotate_left(n * self.cols);
-                let clear_start = self.cells.len() - n * self.cols;
-                for c in &mut self.cells[clear_start..] {
-                    *c = Cell::default();
+                // DL: Delete N lines at cursor_row within scroll region
+                let bottom = self.scroll_bottom.min(self.rows - 1);
+                if self.cursor_row <= bottom {
+                    self.scroll_up_region(self.cursor_row, bottom, first.max(1));
                 }
+            }
+            'S' if !is_private => {
+                // SU: Scroll Up N lines
+                self.scroll_up_region(self.scroll_top, self.scroll_bottom, first.max(1));
+            }
+            'T' if !is_private => {
+                // SD: Scroll Down N lines
+                self.scroll_down_region(self.scroll_top, self.scroll_bottom, first.max(1));
+            }
+            'r' if !is_private => {
+                // DECSTBM: Set Top and Bottom Margins
+                let mut it = params.iter();
+                let top = it
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let bottom = it
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(self.rows as u16) as usize;
+                let top_idx = (top - 1).min(self.rows - 1);
+                let bottom_idx = if bottom == 0 {
+                    self.rows - 1
+                } else {
+                    (bottom - 1).min(self.rows - 1)
+                };
+                if top_idx < bottom_idx {
+                    self.scroll_top = top_idx;
+                    self.scroll_bottom = bottom_idx;
+                } else {
+                    self.scroll_top = 0;
+                    self.scroll_bottom = self.rows - 1;
+                }
+                self.cursor_col = 0;
+                self.cursor_row = 0;
+                self.pending_wrap = false;
             }
             'h' if is_private && first == 25 => {
                 self.cursor_visible = true;
@@ -869,5 +1094,42 @@ mod tests {
             grid.feed_bytes(b"\x1b[6n");
         }
         assert!(grid.pending_replies.len() <= 256);
+    }
+
+    #[test]
+    fn resize_reflows_long_lines_and_keeps_cursor_aligned_with_prompt() {
+        let mut grid = TerminalGrid::new(20, 6);
+        grid.feed_bytes(b"0123456789abcdefghij\r\n> ");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (2, 1));
+        assert_eq!(grid.cell(0, 1).unwrap().ch, '>');
+
+        // SplitRight (width halved from 20 -> 10): row 0 wraps into 2 rows, so `> ` moves to row 2
+        grid.resize(10, 6);
+        assert_eq!(grid.cell(0, 2).unwrap().ch, '>');
+        assert_eq!((grid.cursor_col, grid.cursor_row), (2, 2));
+
+        // Typing after resize prints right next to `> ` on row 2
+        grid.feed_bytes(b"ls");
+        assert_eq!(grid.extract_text((0, 2), (4, 2)), "> ls");
+    }
+
+    #[test]
+    fn resize_vertical_shrink_scrolls_top_rows_to_preserve_cursor_row() {
+        let mut grid = TerminalGrid::new(10, 6);
+        grid.feed_bytes(b"line1\r\nline2\r\nline3\r\nline4\r\n> ");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (2, 4));
+
+        // SplitDown (height halved from 6 -> 3): top rows scroll into scrollback and `> ` stays on bottom row 2
+        grid.resize(10, 3);
+        assert_eq!(grid.scrollback.len(), 2);
+        assert_eq!(grid.cell(0, 2).unwrap().ch, '>');
+        assert_eq!((grid.cursor_col, grid.cursor_row), (2, 2));
+    }
+
+    #[test]
+    fn reverse_index_and_scroll_commands_keep_cursor_aligned() {
+        let mut grid = TerminalGrid::new(10, 4);
+        grid.feed_bytes(b"\r\n> \r\nstatus\x1bM\r\x1b[2Cok");
+        assert_eq!(grid.extract_text((0, 1), (4, 1)), "> ok");
     }
 }

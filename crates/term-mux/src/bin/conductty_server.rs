@@ -48,10 +48,20 @@ impl ServerState {
     }
 
     fn spawn_pane(&mut self) -> Option<PaneId> {
+        self.spawn_pane_sized(120, 36)
+    }
+
+    fn spawn_pane_sized(&mut self, cols: usize, rows: usize) -> Option<PaneId> {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
+        let cols = cols.clamp(10, 1000);
+        let rows = rows.clamp(4, 1000);
 
-        let mut pty = match PtySession::spawn(120, 36, &self.config.shell.windows_default_prog) {
+        let mut pty = match PtySession::spawn(
+            cols as u16,
+            rows as u16,
+            &self.config.shell.windows_default_prog,
+        ) {
             Ok(p) => p,
             Err(err) => {
                 eprintln!("[conductty-server] PtySession::spawn failed: {err}");
@@ -60,7 +70,7 @@ impl ServerState {
         };
         let (_, dummy_rx) = std::sync::mpsc::channel();
         let rx = std::mem::replace(&mut pty.output_rx, dummy_rx);
-        let grid = Arc::new(Mutex::new(TerminalGrid::new(120, 36)));
+        let grid = Arc::new(Mutex::new(TerminalGrid::new(cols, rows)));
         let grid_clone = Arc::clone(&grid);
 
         thread::spawn(move || {
@@ -250,11 +260,28 @@ impl ServerState {
                 MuxResponse::Ok { delivered_to: 1 }
             }
             MuxRequest::SpawnPane { kind } => {
-                if let Some(new_id) = self.spawn_pane() {
+                let focused_id = self.manager.active_tab().focused_pane;
+                let (base_cols, base_rows) = self
+                    .panes
+                    .get(&focused_id)
+                    .and_then(|p| p.grid.lock().ok().map(|g| (g.cols, g.rows)))
+                    .unwrap_or((120, 36));
+                let (new_cols, new_rows) = match kind {
+                    SpawnKind::SplitRight => ((base_cols / 2).max(10), base_rows),
+                    SpawnKind::SplitDown => (base_cols, (base_rows / 2).max(4)),
+                    SpawnKind::NewTab | SpawnKind::NewWorkspace => (base_cols, base_rows),
+                };
+                if let Some(new_id) = self.spawn_pane_sized(new_cols, new_rows) {
                     match kind {
                         SpawnKind::SplitRight | SpawnKind::SplitDown => {
                             if let Some(dir) = split_dir_for_spawn(kind) {
                                 self.manager.active_tab_mut().split_focused(new_id, dir);
+                                if let Some(old_pane) = self.panes.get_mut(&focused_id) {
+                                    if let Ok(mut g) = old_pane.grid.lock() {
+                                        g.resize(new_cols, new_rows);
+                                    }
+                                    let _ = old_pane.pty.resize(new_cols as u16, new_rows as u16);
+                                }
                             }
                         }
                         SpawnKind::NewTab => {

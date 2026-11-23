@@ -389,18 +389,91 @@ impl App {
         }
     }
 
+    fn grid_size_for_rect(&self, rect: CoreRect) -> (usize, usize) {
+        let (char_w, row_h) = self.cell_size;
+        let pad_x = self.config.appearance.window_padding_x;
+        let pad_y = self.config.appearance.window_padding_y;
+        let cols = ((rect.width - pad_x * 2.0) / char_w.max(1.0))
+            .floor()
+            .max(10.0) as usize;
+        let rows = ((rect.height - pad_y * 2.0) / row_h.max(1.0))
+            .floor()
+            .max(4.0) as usize;
+        (cols, rows)
+    }
+
+    fn expected_pane_grid_size(&self, split: Option<SplitDirection>) -> (usize, usize) {
+        let area = self.terminal_area();
+        if let Some(dir) = split {
+            let focused = self.manager.active_tab().focused_pane;
+            let base_rect = self
+                .manager
+                .active_tab()
+                .visible_rects(area)
+                .into_iter()
+                .find(|(pid, _)| *pid == focused)
+                .map(|(_, r)| r)
+                .unwrap_or(area);
+            let split_rect = match dir {
+                SplitDirection::Horizontal => CoreRect {
+                    width: base_rect.width * 0.5,
+                    ..base_rect
+                },
+                SplitDirection::Vertical => CoreRect {
+                    height: base_rect.height * 0.5,
+                    ..base_rect
+                },
+            };
+            self.grid_size_for_rect(split_rect)
+        } else {
+            self.grid_size_for_rect(area)
+        }
+    }
+
+    fn sync_visible_pane_sizes(&mut self) {
+        if self.config.features.multiplexer_mode {
+            return;
+        }
+        let area = self.terminal_area();
+        let visible = self.manager.active_tab().visible_rects(area);
+        let sizes: Vec<(PaneId, (usize, usize))> = visible
+            .into_iter()
+            .map(|(pid, rect)| (pid, self.grid_size_for_rect(rect)))
+            .collect();
+        for (pid, (cols, rows)) in sizes {
+            if let Some(runtime) = self.panes.get_mut(&pid)
+                && runtime.last_size != (cols, rows)
+            {
+                runtime.last_size = (cols, rows);
+                if let Ok(mut g) = runtime.grid.lock() {
+                    g.resize(cols, rows);
+                }
+                let _ = runtime.pty.resize(cols as u16, rows as u16);
+            }
+        }
+    }
+
     fn spawn_pane(&mut self) -> Option<PaneId> {
+        self.spawn_pane_for_split(None)
+    }
+
+    fn spawn_pane_for_split(&mut self, split: Option<SplitDirection>) -> Option<PaneId> {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
+        let (cols, rows) = self.expected_pane_grid_size(split);
 
-        match PtySession::spawn(120, 36, &self.config.shell.windows_default_prog) {
+        match PtySession::spawn(
+            cols as u16,
+            rows as u16,
+            &self.config.shell.windows_default_prog,
+        ) {
             Ok(mut pty) => {
                 let (_, dummy_rx) = std::sync::mpsc::channel();
                 let rx = std::mem::replace(&mut pty.output_rx, dummy_rx);
                 let (_, dummy_exit_rx) = std::sync::mpsc::channel();
                 let exit_rx = std::mem::replace(&mut pty.exit_rx, dummy_exit_rx);
 
-                let grid = Arc::new(Mutex::new(TerminalGrid::new(120, 36)));
+                let grid = Arc::new(Mutex::new(TerminalGrid::new(cols, rows)));
                 let grid_clone = Arc::clone(&grid);
                 let proxy_out = self.proxy.clone();
                 thread::spawn(move || {
@@ -423,7 +496,7 @@ impl App {
                     PaneRuntime {
                         pty,
                         grid,
-                        last_size: (120, 36),
+                        last_size: (cols, rows),
                     },
                 );
                 Some(id)
@@ -591,15 +664,17 @@ impl App {
                 }
             }
             MuxRequest::SpawnPane { kind } => {
-                let Some(new_id) = self.spawn_pane() else {
+                let split_dir = split_dir_for_spawn(kind);
+                let Some(new_id) = self.spawn_pane_for_split(split_dir) else {
                     return MuxResponse::Error {
                         message: "failed to spawn pane".to_string(),
                     };
                 };
                 match kind {
                     SpawnKind::SplitRight | SpawnKind::SplitDown => {
-                        if let Some(dir) = split_dir_for_spawn(kind) {
+                        if let Some(dir) = split_dir {
                             self.manager.active_tab_mut().split_focused(new_id, dir);
+                            self.sync_visible_pane_sizes();
                         }
                     }
                     SpawnKind::NewTab => {
@@ -1147,17 +1222,19 @@ impl App {
 
         match action {
             Action::SplitRight => {
-                if let Some(new_id) = self.spawn_pane() {
+                if let Some(new_id) = self.spawn_pane_for_split(Some(SplitDirection::Horizontal)) {
                     self.manager
                         .active_tab_mut()
                         .split_focused(new_id, SplitDirection::Horizontal);
+                    self.sync_visible_pane_sizes();
                 }
             }
             Action::SplitDown => {
-                if let Some(new_id) = self.spawn_pane() {
+                if let Some(new_id) = self.spawn_pane_for_split(Some(SplitDirection::Vertical)) {
                     self.manager
                         .active_tab_mut()
                         .split_focused(new_id, SplitDirection::Vertical);
+                    self.sync_visible_pane_sizes();
                 }
             }
             Action::GotoSplit(dir) => {
