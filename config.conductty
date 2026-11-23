@@ -90,7 +90,7 @@ enabled = true
 [plugins.config]
 # デフォルトのメモ保存先ディレクトリ（未設定時は ~/notes を自動作成）
 default_dir = "~/notes"
-dirs = ["~/notes", "./docs"]
+dirs = ["~/work/obsidian_git/", "./docs"]
 limit = 30
 
 # OS 別の条件分岐上書き（config.conductty 内で OS ごとに一部だけ変えたい場合）

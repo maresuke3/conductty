@@ -90,6 +90,7 @@ pub struct DrawerSection {
     pub id: String,
     pub title: String,
     pub accent: Option<String>,
+    pub actions: Vec<DrawerCustomAction>,
     pub items: Vec<DrawerItem>,
 }
 
