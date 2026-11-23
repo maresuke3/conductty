@@ -1396,6 +1396,21 @@ impl App {
                     } else if item.body.as_ref().is_some_and(|b| !b.is_empty()) {
                         self.right_drawer_open = true;
                         self.drawer_preview_item = Some(item);
+                    } else if let Some(first_act) = item.actions.first() {
+                        if first_act.needs_input {
+                            self.drawer_input_action = Some((
+                                first_act.id.clone(),
+                                Some(item.id.clone()),
+                                first_act.input_placeholder.clone().unwrap_or_default(),
+                            ));
+                            self.drawer_input_buf.clear();
+                        } else {
+                            self.trigger_drawer_action(
+                                first_act.id.clone(),
+                                Some(item.id.clone()),
+                                None,
+                            );
+                        }
                     }
                 }
             }

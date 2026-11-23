@@ -88,6 +88,8 @@ args = []
 enabled = true
 
 [plugins.config]
+# デフォルトのメモ保存先ディレクトリ（未設定時は ~/notes を自動作成）
+default_dir = "~/notes"
 dirs = ["~/notes", "./docs"]
 limit = 30
 
