@@ -158,7 +158,16 @@ jobs:
           </plist>
           EOF
 
-          hdiutil create -volname "Conductty" -srcfolder "${APP_DIR}" -ov -format UDZO "dist/Conductty-${TAG}-${{ matrix.target }}.dmg"
+          chmod +x "${APP_DIR}/Contents/MacOS/"*
+          codesign --force --deep --sign - "${APP_DIR}"
+
+          STAGE_DIR="dist/dmg-${{ matrix.target }}"
+          rm -rf "${STAGE_DIR}"
+          mkdir -p "${STAGE_DIR}"
+          cp -R "${APP_DIR}" "${STAGE_DIR}/"
+          ln -s /Applications "${STAGE_DIR}/Applications"
+
+          hdiutil create -volname "Conductty" -srcfolder "${STAGE_DIR}" -ov -format UDZO "dist/Conductty-${TAG}-${{ matrix.target }}.dmg"
 
       - name: Package artifacts (Windows)
         if: matrix.archive == 'zip'
