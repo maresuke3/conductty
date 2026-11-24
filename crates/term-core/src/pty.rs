@@ -66,6 +66,23 @@ impl PtySession {
             unix_shell_command()
         };
         cmd.env("TERM", "xterm-256color");
+        cmd.env("TERM_PROGRAM", "conductty");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        if cfg!(target_os = "windows") {
+            let mut wslenv = std::env::var("WSLENV").unwrap_or_default();
+            for key in ["TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
+                if !wslenv
+                    .split(':')
+                    .any(|item| item.split('/').next() == Some(key))
+                {
+                    if !wslenv.is_empty() {
+                        wslenv.push(':');
+                    }
+                    wslenv.push_str(key);
+                }
+            }
+            cmd.env("WSLENV", wslenv);
+        }
 
         let mut child = pair
             .slave

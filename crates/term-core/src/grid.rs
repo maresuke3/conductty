@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 use vte::{Params, Parser, Perform};
 
-use crate::kitty::KittyState;
+use crate::kitty::{KittySegment, KittyState};
 
 const MAX_SCROLLBACK: usize = 2000;
 
@@ -214,9 +214,30 @@ impl TerminalGrid {
 
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         let mut replies = Vec::new();
-        let normal_bytes =
-            self.kitty
-                .filter_and_process(bytes, self.cursor_col, self.cursor_row, &mut replies);
+        let segments = self.kitty.split_stream(bytes);
+        let mut parser = std::mem::replace(&mut self.parser, Parser::new());
+
+        for seg in segments {
+            match seg {
+                KittySegment::Normal(normal_bytes) => {
+                    parser.advance(self, &normal_bytes);
+                }
+                KittySegment::Command(cmd) => {
+                    self.kitty.handle_kitty_command(
+                        &cmd,
+                        self.cursor_col,
+                        self.cursor_row,
+                        &mut replies,
+                    );
+                }
+                KittySegment::ITerm(cmd) => {
+                    self.kitty
+                        .handle_iterm_command(&cmd, self.cursor_col, self.cursor_row);
+                }
+            }
+        }
+        self.parser = parser;
+
         const MAX_PENDING_REPLIES: usize = 256;
         if !replies.is_empty() {
             self.pending_replies.extend(replies);
@@ -225,10 +246,6 @@ impl TerminalGrid {
                 self.pending_replies.drain(..excess);
             }
         }
-
-        let mut parser = std::mem::replace(&mut self.parser, Parser::new());
-        parser.advance(self, &normal_bytes);
-        self.parser = parser;
     }
 
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
@@ -498,6 +515,7 @@ impl TerminalGrid {
                     self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len());
                 }
             }
+            self.kitty.scroll_up_placements(n, MAX_SCROLLBACK);
         }
 
         let start = top * self.cols;

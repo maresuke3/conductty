@@ -2947,14 +2947,33 @@ impl ApplicationHandler<UserEvent> for App {
                                             });
                                         }
                                         if self.config.features.kitty_graphics
-                                            && g.scroll_offset == 0
                                             && !g.kitty.placements.is_empty()
                                         {
+                                            let clip_rect = Rect::from_min_size(
+                                                Pos2::new(rect.x, rect.y),
+                                                Vec2::new(rect.width, rect.height),
+                                            );
+                                            let clipped = painter.with_clip_rect(clip_rect);
                                             for p in &g.kitty.placements {
                                                 let Some(img) = g.kitty.images.get(&p.image_id)
                                                 else {
                                                     continue;
                                                 };
+                                                let display_row = p.row + g.scroll_offset as isize;
+                                                let est_rows = p
+                                                    .rows
+                                                    .map(|r| r as isize)
+                                                    .unwrap_or_else(|| {
+                                                        ((img.height as f32 / row_h.max(1.0))
+                                                            .ceil()
+                                                            as isize)
+                                                            .max(1)
+                                                    });
+                                                if display_row + est_rows <= 0
+                                                    || display_row >= g.rows as isize
+                                                {
+                                                    continue;
+                                                }
                                                 let needs_upload = self
                                                     .kitty_textures
                                                     .get(&(*pane_id, p.image_id))
@@ -3006,13 +3025,13 @@ impl ApplicationHandler<UserEvent> for App {
                                                     .unwrap_or(img.height as f32);
                                                 let img_pos = Pos2::new(
                                                     rect.x + pad_x + p.col as f32 * char_w,
-                                                    rect.y + pad_y + p.row as f32 * row_h,
+                                                    rect.y + pad_y + display_row as f32 * row_h,
                                                 );
                                                 let img_rect = Rect::from_min_size(
                                                     img_pos,
                                                     Vec2::new(img_w, img_h),
                                                 );
-                                                painter.image(
+                                                clipped.image(
                                                     tex.id(),
                                                     img_rect,
                                                     Rect::from_min_max(

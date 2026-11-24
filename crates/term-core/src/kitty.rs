@@ -23,9 +23,16 @@ pub struct KittyImage {
 pub struct KittyPlacement {
     pub image_id: u32,
     pub col: usize,
-    pub row: usize,
+    pub row: isize,
     pub cols: Option<usize>,
     pub rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KittySegment {
+    Normal(Vec<u8>),
+    Command(Vec<u8>),
+    ITerm(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +42,9 @@ enum ApcScanState {
     InApcStart,
     InKittyApc,
     InKittyEsc,
+    InOscStart(usize),
+    InITermOsc,
+    InITermEsc,
 }
 
 /// バイトストリームから Kitty Graphics APC (`ESC _ G ... ESC \`) を抽出し、
@@ -62,16 +72,10 @@ impl KittyState {
         }
     }
 
-    /// 入力バイト列から Kitty APC を分離し、通常の VT バイト列を返す。
-    /// 受信した Kitty コマンドの (応答バイト列, 配置する際の現在カーソル位置) を処理する。
-    pub fn filter_and_process(
-        &mut self,
-        bytes: &[u8],
-        cursor_col: usize,
-        cursor_row: usize,
-        replies: &mut Vec<Vec<u8>>,
-    ) -> Vec<u8> {
-        let mut normal_out = Vec::with_capacity(bytes.len());
+    /// 入力バイト列から Kitty APC を分離し、通常の VT バイト列と Kitty コマンドを出現順に返す。
+    pub fn split_stream(&mut self, bytes: &[u8]) -> Vec<KittySegment> {
+        let mut segments = Vec::new();
+        let mut normal_buf = Vec::new();
         let mut state = self.scan_state.unwrap_or(ApcScanState::Normal);
 
         for &b in bytes {
@@ -80,24 +84,77 @@ impl KittyState {
                     if b == 0x1b {
                         state = ApcScanState::EscSeen;
                     } else {
-                        normal_out.push(b);
+                        normal_buf.push(b);
                     }
                 }
                 ApcScanState::EscSeen => {
                     if b == b'_' {
                         state = ApcScanState::InApcStart;
+                    } else if b == b']' {
+                        state = ApcScanState::InOscStart(0);
                     } else {
-                        normal_out.push(0x1b);
-                        normal_out.push(b);
+                        normal_buf.push(0x1b);
+                        normal_buf.push(b);
                         state = ApcScanState::Normal;
+                    }
+                }
+                ApcScanState::InOscStart(pos) => {
+                    const PREFIX: &[u8] = b"1337;";
+                    if b == PREFIX[pos] {
+                        if pos + 1 == PREFIX.len() {
+                            if !normal_buf.is_empty() {
+                                segments
+                                    .push(KittySegment::Normal(std::mem::take(&mut normal_buf)));
+                            }
+                            self.apc_buf.clear();
+                            state = ApcScanState::InITermOsc;
+                        } else {
+                            state = ApcScanState::InOscStart(pos + 1);
+                        }
+                    } else {
+                        normal_buf.extend_from_slice(&[0x1b, b']']);
+                        normal_buf.extend_from_slice(&PREFIX[..pos]);
+                        normal_buf.push(b);
+                        state = ApcScanState::Normal;
+                    }
+                }
+                ApcScanState::InITermOsc => {
+                    if b == 0x07 {
+                        let cmd = std::mem::take(&mut self.apc_buf);
+                        segments.push(KittySegment::ITerm(cmd));
+                        state = ApcScanState::Normal;
+                    } else if b == 0x1b {
+                        state = ApcScanState::InITermEsc;
+                    } else if self.apc_buf.len() >= MAX_KITTY_APC_BYTES {
+                        self.apc_buf = Vec::new();
+                        state = ApcScanState::Normal;
+                    } else {
+                        self.apc_buf.push(b);
+                    }
+                }
+                ApcScanState::InITermEsc => {
+                    if b == b'\\' {
+                        let cmd = std::mem::take(&mut self.apc_buf);
+                        segments.push(KittySegment::ITerm(cmd));
+                        state = ApcScanState::Normal;
+                    } else if self.apc_buf.len().saturating_add(2) > MAX_KITTY_APC_BYTES {
+                        self.apc_buf = Vec::new();
+                        state = ApcScanState::Normal;
+                    } else {
+                        self.apc_buf.push(0x1b);
+                        self.apc_buf.push(b);
+                        state = ApcScanState::InITermOsc;
                     }
                 }
                 ApcScanState::InApcStart => {
                     if b == b'G' {
+                        if !normal_buf.is_empty() {
+                            segments.push(KittySegment::Normal(std::mem::take(&mut normal_buf)));
+                        }
                         self.apc_buf.clear();
                         state = ApcScanState::InKittyApc;
                     } else {
-                        normal_out.extend_from_slice(&[0x1b, b'_', b]);
+                        normal_buf.extend_from_slice(&[0x1b, b'_', b]);
                         state = ApcScanState::Normal;
                     }
                 }
@@ -114,7 +171,7 @@ impl KittyState {
                 ApcScanState::InKittyEsc => {
                     if b == b'\\' {
                         let cmd = std::mem::take(&mut self.apc_buf);
-                        self.handle_kitty_command(&cmd, cursor_col, cursor_row, replies);
+                        segments.push(KittySegment::Command(cmd));
                         state = ApcScanState::Normal;
                     } else if self.apc_buf.len().saturating_add(2) > MAX_KITTY_APC_BYTES {
                         self.apc_buf = Vec::new();
@@ -128,11 +185,117 @@ impl KittyState {
             }
         }
 
+        if !normal_buf.is_empty() {
+            segments.push(KittySegment::Normal(normal_buf));
+        }
         self.scan_state = Some(state);
+        segments
+    }
+
+    /// 入力バイト列から Kitty APC を分離し、通常の VT バイト列を返す。
+    /// 受信した Kitty コマンドの (応答バイト列, 配置する際の現在カーソル位置) を処理する。
+    pub fn filter_and_process(
+        &mut self,
+        bytes: &[u8],
+        cursor_col: usize,
+        cursor_row: usize,
+        replies: &mut Vec<Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut normal_out = Vec::with_capacity(bytes.len());
+        for seg in self.split_stream(bytes) {
+            match seg {
+                KittySegment::Normal(chunk) => normal_out.extend_from_slice(&chunk),
+                KittySegment::Command(cmd) => {
+                    self.handle_kitty_command(&cmd, cursor_col, cursor_row, replies);
+                }
+                KittySegment::ITerm(cmd) => {
+                    self.handle_iterm_command(&cmd, cursor_col, cursor_row);
+                }
+            }
+        }
         normal_out
     }
 
-    fn handle_kitty_command(
+    pub fn scroll_up_placements(&mut self, lines: usize, max_scrollback: usize) {
+        let delta = lines as isize;
+        let min_row = -(max_scrollback as isize);
+        for p in &mut self.placements {
+            p.row -= delta;
+        }
+        self.placements.retain(|p| {
+            let h = p.rows.unwrap_or(1) as isize;
+            p.row + h > min_row
+        });
+    }
+
+    pub fn handle_iterm_command(&mut self, raw: &[u8], cursor_col: usize, cursor_row: usize) {
+        let text = match std::str::from_utf8(raw) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let Some(rest) = text.strip_prefix("File=") else {
+            return;
+        };
+        let Some((header, b64_payload)) = rest.split_once(':') else {
+            return;
+        };
+
+        let mut is_inline = false;
+        let mut cols: Option<usize> = None;
+        for pair in header.split(';') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k.trim() {
+                    "inline" => is_inline = v.trim() == "1",
+                    "width" => {
+                        if let Ok(w) = v.trim().parse::<usize>()
+                            && w > 0
+                        {
+                            cols = Some(w);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !is_inline {
+            return;
+        }
+
+        let clean_b64: Vec<u8> = b64_payload
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        let id = self.next_auto_id;
+        self.next_auto_id = self.next_auto_id.wrapping_add(1).max(1);
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+
+        let mut params = HashMap::new();
+        params.insert("f".to_string(), "100".to_string());
+        let Some(img) = decode_kitty_image(id, generation, &params, &clean_b64) else {
+            return;
+        };
+        let rows = cols.map(|c| {
+            ((img.height as f64 * c as f64) / (img.width.max(1) as f64 * 2.0))
+                .ceil()
+                .max(1.0) as usize
+        });
+        self.insert_image_with_budget(img);
+
+        if self.placements.len() >= MAX_KITTY_PLACEMENTS {
+            let excess = self.placements.len() + 1 - MAX_KITTY_PLACEMENTS;
+            self.placements.drain(..excess);
+        }
+        self.placements.push(KittyPlacement {
+            image_id: id,
+            col: cursor_col,
+            row: cursor_row as isize,
+            cols,
+            rows,
+        });
+    }
+
+    pub fn handle_kitty_command(
         &mut self,
         raw: &[u8],
         cursor_col: usize,
@@ -156,7 +319,7 @@ impl KittyState {
         }
 
         let more_chunks = params.get("m").map(String::as_str) == Some("1");
-        if self.chunk_buf.is_empty() {
+        if self.chunk_params.is_empty() {
             self.chunk_params = params;
         }
         if self.chunk_buf.len().saturating_add(payload.len()) > MAX_KITTY_CHUNK_BYTES {
@@ -246,7 +409,7 @@ impl KittyState {
             self.placements.push(KittyPlacement {
                 image_id: id,
                 col: cursor_col,
-                row: cursor_row,
+                row: cursor_row as isize,
                 cols,
                 rows,
             });
@@ -487,5 +650,47 @@ mod tests {
         let seq = format!("\x1b_Gi=77,a=t,f=100;{non_png}\x1b\\");
         kitty.filter_and_process(seq.as_bytes(), 0, 0, &mut replies);
         assert!(!kitty.images.contains_key(&77));
+    }
+
+    #[test]
+    fn tracks_cursor_and_scrollback_across_split_stream() {
+        let mut grid = crate::grid::TerminalGrid::new(20, 4);
+        let payload = BASE64.encode([255u8, 0, 0, 255, 0, 255, 0, 255]);
+        let stream = format!(
+            "line1\r\nhello   \r\n\x1b_Ga=T,f=32,s=2,v=1,c=10,r=2,i=1,q=2;{payload}\x1b\\\r\n\r\n\r\nbottom"
+        );
+        for chunk in stream.as_bytes().chunks(16) {
+            grid.feed_bytes(chunk);
+        }
+        assert_eq!(grid.kitty.images.len(), 1);
+        assert_eq!(grid.kitty.placements.len(), 1);
+        assert_eq!(grid.kitty.placements[0].col, 0);
+        // 5 newlines total on a 4-row screen: image placed at row 2, then scrolled up by 2 rows -> row 0
+        assert_eq!(grid.kitty.placements[0].row, 0);
+    }
+
+    #[test]
+    fn decodes_iterm_osc_1337_inline_png() {
+        let mut png_bytes = Vec::new();
+        let img = image::RgbaImage::from_pixel(4, 2, image::Rgba([12, 34, 56, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let b64 = BASE64.encode(&png_bytes);
+        let stream =
+            format!("hi\r\n\x1b]1337;File=inline=1;width=40;preserveAspectRatio=1:{b64}\x07\r\n");
+
+        let mut grid = crate::grid::TerminalGrid::new(80, 20);
+        for chunk in stream.as_bytes().chunks(32) {
+            grid.feed_bytes(chunk);
+        }
+        assert_eq!(grid.kitty.images.len(), 1);
+        assert_eq!(grid.kitty.placements.len(), 1);
+        assert_eq!(grid.kitty.placements[0].col, 0);
+        assert_eq!(grid.kitty.placements[0].row, 1);
+        assert_eq!(grid.kitty.placements[0].cols, Some(40));
     }
 }
