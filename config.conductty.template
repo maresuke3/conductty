@@ -1,4 +1,6 @@
-# conductty 設定ファイル
+# conductty 設定ファイルテンプレート
+# このファイルを config.conductty（または OS 専用ファイル名）にコピーして配置してください。
+#
 # 配置優先順位（各ディレクトリで OS 専用ファイルを優先。見つかった場合は config.conductty は読まない）:
 #   macOS  : macos.conductty -> config.conductty
 #   Windows: windows.conductty -> config.conductty
@@ -10,6 +12,9 @@
 #   3. ~/.conductty/
 #   4. ~/ (ドットファイル: ~/.macos.conductty, ~/.config.conductty 等)
 #   5. デフォルト設定 (組み込み)
+
+# 別の TOML 設定ファイルを継承・分割して読み込む場合に指定（相対パスまたは絶対パス）
+# include = "base.toml"
 
 [features]
 multiplexer_mode = false
@@ -33,11 +38,14 @@ window_padding_x = 10.0
 window_padding_y = 10.0
 window_padding_balance = true
 
-# テーマ色を個別に上書きしたい場合のみ指定
+# テーマ色を個別に上書きしたい場合のみ指定（#RRGGBB 形式）
 # [theme]
 # background = "#222436"
 # foreground = "#c8d3f5"
 # accent = "#7aa2f7"
+# drawer_background = "#1e2030"
+# card_background = "#2f334d"
+# cursor = "#82aaff"
 
 [keybinds]
 prefix = "ctrl+b"
@@ -56,13 +64,26 @@ goto_right = "performable:ctrl+l"
 toggle_left_drawer = "prefix+b"
 toggle_right_drawer = "ctrl+shift+g"
 go_to = "prefix+g"
+go_to_next = "j, down, ctrl+j, ctrl+n"
+go_to_prev = "k, up, ctrl+k, ctrl+p"
+go_to_select = "enter"
+go_to_close = "esc, q"
+go_to_filter = "/"
 copy = "ctrl+shift+c"
 paste = "ctrl+v"
 reload_config = "ctrl+shift+r"
+keybind_hints = "prefix+?"
+
+[shell]
+# Windows で起動するデフォルトシェル（既定値: ["powershell.exe"]）
+windows_default_prog = ["powershell.exe"]
 
 [window]
+# ウィンドウ状態保存ポリシー（例: "always"）
 save_state = "always"
+# 分割・フォーカス移動時のズーム維持（例: "navigation"）
 split_preserve_zoom = "navigation"
+# macOS で Option キーを Alt として扱う設定: "left" / "none"
 macos_option_as_alt = "left"
 
 # 右Drawer プラグイン設定（Rust / Go / Zig 等のシングルバイナリを stdio JSON で呼び出す）
@@ -93,7 +114,7 @@ default_dir = "~/notes"
 dirs = ["~/work/obsidian_git/", "./docs"]
 limit = 30
 
-# OS 別の条件分岐上書き（config.conductty 内で OS ごとに一部だけ変えたい場合）
+# OS 別の条件分岐上書き（1 つの config.conductty 内で OS ごとに一部だけ変えたい場合）
 # [os.macos.appearance]
 # font_size = 16.0
 #

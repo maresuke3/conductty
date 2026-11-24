@@ -115,7 +115,7 @@ jobs:
           mkdir -p "dist/${STAGE}"
           cp "target/${{ matrix.target }}/release/conductty" "dist/${STAGE}/"
           cp "target/${{ matrix.target }}/release/conductty-server" "dist/${STAGE}/"
-          cp config.conductty README.md "dist/${STAGE}/"
+          cp config.conductty.template README.md "dist/${STAGE}/"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
 
       - name: Package macOS .app and .dmg
@@ -182,7 +182,7 @@ jobs:
           if ($webviewDll) {
             Copy-Item $webviewDll.FullName "dist/$stage/"
           }
-          Copy-Item "config.conductty", "README.md" "dist/$stage/"
+          Copy-Item "config.conductty.template", "README.md" "dist/$stage/"
           Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
 
       - name: Upload build artifacts

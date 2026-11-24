@@ -79,7 +79,7 @@ make clippy
 4. `~/`（`.<os>.conductty` → `.config.conductty`）
 5. 組み込みデフォルト設定
 
-リポジトリルートの [`config.conductty`](config.conductty) をベースにコピーして編集できます。`include = "base.toml"` による設定ファイルの分割・継承や、1 つの `config.conductty` 内で `[os.macos.*]` / `[os.windows.*]` / `[os.linux.*]` / `[os.wsl.*]` を使った OS 別上書き（WSL では `[os.linux.*]` の後に `[os.wsl.*]` を重ねて適用）にも対応しています。
+リポジトリルートの [`config.conductty.template`](config.conductty.template) を `config.conductty` としてコピーして編集できます。`include = "base.toml"` による設定ファイルの分割・継承や、1 つの `config.conductty` 内で `[os.macos.*]` / `[os.windows.*]` / `[os.linux.*]` / `[os.wsl.*]` を使った OS 別上書き（WSL では `[os.linux.*]` の後に `[os.wsl.*]` を重ねて適用）にも対応しています。
 
 ### 主な設定項目
 
