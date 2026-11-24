@@ -63,8 +63,7 @@ impl PtySession {
             c.cwd(win_cwd);
             c
         } else {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-            CommandBuilder::new(shell)
+            unix_shell_command()
         };
         cmd.env("TERM", "xterm-256color");
 
@@ -136,10 +135,30 @@ impl PtySession {
     }
 }
 
+fn unix_shell_command() -> CommandBuilder {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let mut c = CommandBuilder::new(shell);
+    // .app 起動時は launchd の最小 PATH しか持たないため、ログインシェルで ~/.zprofile 等を読ませる
+    if cfg!(target_os = "macos") {
+        c.arg("-l");
+    }
+    c
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::*;
+
+    #[test]
+    fn unix_shell_is_login_shell_only_on_macos() {
+        let argv = unix_shell_command().get_argv().clone();
+        let expected = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(argv.len(), expected);
+        assert_eq!(
+            argv.get(1).is_some_and(|a| a == "-l"),
+            cfg!(target_os = "macos")
+        );
+    }
 
     #[cfg(unix)]
     #[test]
