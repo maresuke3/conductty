@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod browser;
+mod updater;
 mod win_backdrop;
 
 use std::collections::HashMap;
@@ -4877,7 +4878,9 @@ fn print_cli_help() {
   new-space [name]                  Create a new space (workspace)
   focus <pane_id>                   Focus a pane
   kill-pane <pane_id>               Close a pane
-  kill-space <idx_or_name>          Close a space (except Master Space)"
+  kill-space <idx_or_name>          Close a space (except Master Space)
+  update [--check] [--force]        Update conductty from the latest GitHub release
+  version | --version | -V          Print version"
     );
 }
 
@@ -4915,6 +4918,11 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
             print_cli_help();
             Some(0)
         }
+        ("version" | "--version" | "-V", _) => {
+            updater::print_version();
+            Some(0)
+        }
+        ("update", _) => Some(updater::run(&args[2..])),
         ("panes", _) | ("pane", Some("list")) => {
             match send_ipc_with_wsl_fallback(args, &MuxRequest::ListPanes, rt) {
                 Ok(MuxResponse::Panes { panes }) => {
