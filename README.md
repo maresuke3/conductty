@@ -35,7 +35,13 @@ Ghostty 互換の操作感に加え、**左Drawer（`Master Space` / Workspace �
 
 ### リリースバイナリから導入
 
-[GitHub Releases](https://github.com/maresuke3/conductty/releases) からお使いの OS / アーキテクチャ向けのアーカイブ（`conductty` / `conductty-server`）をダウンロードして配置してください。
+[GitHub Releases](https://github.com/maresuke3/conductty/releases) からお使いの OS / アーキテクチャ向けのアーカイブ（`conductty` / `conductty-server`、macOS は `.dmg`）をダウンロードして配置してください。
+
+> **macOS での初回起動について**: 本アプリは Apple の公証（Notarization）を行わずアドホック署名のみで配布しているため、ブラウザから `.dmg` をダウンロードして `/Applications/Conductty.app` へコピーしたあと、ターミナルで以下を実行して検疫属性を解除してください。
+>
+> ```bash
+> xattr -cr /Applications/Conductty.app
+> ```
 
 ### ソースからビルド・起動
 
@@ -231,6 +237,18 @@ GitHub の Actions 画面（`Release` ワークフローの **Run workflow**）�
 gh workflow run release.yml -f tag=v0.1.0 -f platform=windows
 gh workflow run release.yml -f tag=v0.1.0 -f platform=macos
 gh workflow run release.yml -f tag=v0.1.0 -f platform=linux
+```
+
+### 3. macOS 配布方針（Homebrew Tap）
+
+macOS 向けには Apple Developer Program による有償の署名・公証を行わず、**アドホック署名 + Homebrew Tap（Cask）** による配布方針とします。
+
+- **Tap リポジトリ構成**: `maresuke3/homebrew-tap`（`Casks/conductty.rb`）を用意し、`aarch64-apple-darwin` / `x86_64-apple-darwin` の `.dmg` と `SHA256SUMS*.txt` に合わせて更新する（将来的にはリリースワークフローから自動 PR / 更新を連携）。
+- **ユーザー向け導入手順**: `--no-quarantine` オプション付きでインストールすることで、手動の `xattr -cr` を不要にします。
+
+```bash
+brew tap maresuke3/tap
+brew install --cask --no-quarantine conductty
 ```
 
 ---
