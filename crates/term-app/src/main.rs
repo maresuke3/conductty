@@ -1756,7 +1756,9 @@ impl ApplicationHandler<UserEvent> for App {
 
         if let (Some(window), Some(egui_state)) = (&self.window, &mut self.egui_state) {
             let response = egui_state.on_window_event(window, &event);
-            if response.repaint {
+            // egui_winit は RedrawRequested 自体にも repaint: true を返すため、ここで再要求すると
+            // 描画ごとに次の描画が積まれ無限ループになる (表示中は 60fps、最小化中はビジーループ)
+            if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
                 window.request_redraw();
             }
         }
@@ -3748,6 +3750,22 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = runtime.pty.resize(cols as u16, rows as u16);
                         need_redraw = true;
                     }
+                }
+                // Running は出力停止から AGENT_RUNNING_GRACE 経過で解除されるので、その時刻に 1 回だけ起こす
+                // (+300ms は should_throttle_agent_scan の 250ms に弾かれないための余裕)
+                let grace_ms = term_core::agent::AGENT_RUNNING_GRACE.as_millis() as u64;
+                let now_ms = self.agent_scan_start.elapsed().as_millis() as u64;
+                if let Some(expiry_ms) = self
+                    .agent_states
+                    .values()
+                    .filter(|st| st.status == AgentStatus::Running)
+                    .map(|st| st.last_changed_ms + grace_ms)
+                    .filter(|&ms| ms > now_ms)
+                    .min()
+                {
+                    self.pending_redraw_deadline = Some(
+                        self.agent_scan_start + std::time::Duration::from_millis(expiry_ms + 300),
+                    );
                 }
                 if need_redraw && let Some(w) = &self.window {
                     w.request_redraw();
