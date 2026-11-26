@@ -324,6 +324,8 @@ struct App {
     right_drawer_open: bool,
     active_plugin_idx: usize,
     drawer_snapshot: DrawerSnapshot,
+    /// 非アクティブなプラグインの直近スナップショット（取得中フラグ含む）。切替時の再取得を避ける
+    drawer_cache: HashMap<String, DrawerSnapshot>,
     drawer_selected_idx: usize,
     drawer_scroll_to_selected: bool,
     drawer_preview_item: Option<DrawerItem>,
@@ -817,6 +819,9 @@ impl App {
             self.active_plugin_idx = 0;
         }
         let plugin = plugins[self.active_plugin_idx].clone();
+        if self.drawer_snapshot.plugin_id == plugin.id && self.drawer_snapshot.is_loading {
+            return;
+        }
         self.drawer_snapshot.plugin_id = plugin.id.clone();
         self.drawer_snapshot.title = plugin.name.clone();
         self.drawer_snapshot.is_loading = true;
@@ -833,6 +838,26 @@ impl App {
             .await;
             let _ = proxy.send_event(UserEvent::DrawerUpdated(snapshot));
         });
+    }
+
+    fn switch_drawer_plugin(&mut self, idx: usize) {
+        let prev = std::mem::take(&mut self.drawer_snapshot);
+        if !prev.plugin_id.is_empty() {
+            self.drawer_cache.insert(prev.plugin_id.clone(), prev);
+        }
+        self.active_plugin_idx = idx;
+        self.drawer_selected_idx = 0;
+        self.drawer_scroll_to_selected = true;
+        self.drawer_preview_item = None;
+        self.drawer_input_action = None;
+        let cached = self
+            .enabled_plugins()
+            .get(idx)
+            .and_then(|p| self.drawer_cache.remove(&p.id));
+        match cached {
+            Some(snapshot) => self.drawer_snapshot = snapshot,
+            None => self.trigger_drawer_refresh(),
+        }
     }
 
     fn trigger_drawer_action(
@@ -1421,24 +1446,15 @@ impl App {
             Action::DrawerNextPlugin => {
                 let plugins = self.enabled_plugins();
                 if plugins.len() > 1 {
-                    self.active_plugin_idx = (self.active_plugin_idx + 1) % plugins.len();
-                    self.drawer_selected_idx = 0;
-                    self.drawer_scroll_to_selected = true;
-                    self.drawer_preview_item = None;
-                    self.drawer_input_action = None;
-                    self.trigger_drawer_refresh();
+                    self.switch_drawer_plugin((self.active_plugin_idx + 1) % plugins.len());
                 }
             }
             Action::DrawerPrevPlugin => {
                 let plugins = self.enabled_plugins();
                 if plugins.len() > 1 {
-                    self.active_plugin_idx =
-                        (self.active_plugin_idx + plugins.len() - 1) % plugins.len();
-                    self.drawer_selected_idx = 0;
-                    self.drawer_scroll_to_selected = true;
-                    self.drawer_preview_item = None;
-                    self.drawer_input_action = None;
-                    self.trigger_drawer_refresh();
+                    self.switch_drawer_plugin(
+                        (self.active_plugin_idx + plugins.len() - 1) % plugins.len(),
+                    );
                 }
             }
             Action::DrawerOpen => {
@@ -1512,6 +1528,7 @@ impl App {
                 if !new_cfg.features.kitty_graphics {
                     self.kitty_textures.clear();
                 }
+                self.drawer_cache.clear();
                 configure_fonts(&self.egui_ctx, &new_cfg.appearance.font_families);
                 if let Some(window) = &self.window {
                     win_backdrop::apply(window, new_cfg.appearance.background_opacity);
@@ -1630,10 +1647,11 @@ impl ApplicationHandler<UserEvent> for App {
                             window.request_redraw();
                         } else {
                             let deadline = self.last_redraw_at + min_interval;
-                            self.pending_redraw_deadline = Some(match self.pending_redraw_deadline {
-                                Some(existing) => existing.min(deadline),
-                                None => deadline,
-                            });
+                            self.pending_redraw_deadline =
+                                Some(match self.pending_redraw_deadline {
+                                    Some(existing) => existing.min(deadline),
+                                    None => deadline,
+                                });
                         }
                     }
                 }
@@ -1688,6 +1706,9 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
+                } else {
+                    self.drawer_cache
+                        .insert(snapshot.plugin_id.clone(), snapshot);
                 }
             }
             UserEvent::MuxStateUpdated(manager, snapshots) => {
@@ -2088,6 +2109,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                                 let _ = pane.pty.write_bytes(&bytes);
                             }
+                        }
+                        // 長押しのキーリピートでプラグインを多重起動しない
+                        InputDecision::Execute(Action::DrawerRefresh) if event.repeat => {
+                            self.suppress_next_ime_commit = true;
                         }
                         InputDecision::Execute(action) => {
                             self.suppress_next_ime_commit = true;
@@ -3709,12 +3734,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(p_idx) = switch_plugin_idx
                     && p_idx != self.active_plugin_idx
                 {
-                    self.active_plugin_idx = p_idx;
-                    self.drawer_selected_idx = 0;
-                    self.drawer_scroll_to_selected = true;
-                    self.drawer_preview_item = None;
-                    self.drawer_input_action = None;
-                    self.trigger_drawer_refresh();
+                    self.switch_drawer_plugin(p_idx);
                     need_redraw = true;
                 }
                 if refresh_requested {
@@ -5449,6 +5469,7 @@ fn main() {
         right_drawer_open,
         active_plugin_idx: 0,
         drawer_snapshot: DrawerSnapshot::default(),
+        drawer_cache: HashMap::new(),
         drawer_selected_idx: 0,
         drawer_scroll_to_selected: false,
         drawer_preview_item: None,
