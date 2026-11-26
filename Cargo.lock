@@ -3471,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "term-app"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arboard",
  "egui",
@@ -3491,7 +3491,7 @@ dependencies = [
 
 [[package]]
 name = "term-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -3504,7 +3504,7 @@ dependencies = [
 
 [[package]]
 name = "term-drawer"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3513,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "term-mux"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -3524,7 +3524,7 @@ dependencies = [
 
 [[package]]
 name = "term-render"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "wgpu",
 ]
