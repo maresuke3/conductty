@@ -306,6 +306,35 @@ pub fn resolve_plugin_command(command: &str) -> PathBuf {
     expanded
 }
 
+/// GUI 起動時（Finder / Dock 等）は PATH が最小限になるため、標準的なツール配置先を後ろに補完する。
+#[cfg(unix)]
+fn enriched_path(current: Option<std::ffi::OsString>, home: Option<&Path>) -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = current
+        .as_deref()
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    let system = [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    .map(PathBuf::from);
+    let user = home
+        .into_iter()
+        .flat_map(|h| [".local/share/mise/shims", ".local/bin", ".cargo/bin"].map(|d| h.join(d)));
+    for dir in system.into_iter().chain(user) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_else(|_| current.unwrap_or_default())
+}
+
 async fn run_plugin_process(
     command: &str,
     args: &[String],
@@ -318,6 +347,11 @@ async fn run_plugin_process(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.env(
+        "PATH",
+        enriched_path(std::env::var_os("PATH"), home_dir().as_deref()),
+    );
     apply_no_window(&mut cmd);
 
     let mut child = match cmd.spawn() {
@@ -506,6 +540,37 @@ pub async fn invoke_plugin_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn enriched_path_keeps_order_adds_standard_dirs_without_duplicates() {
+        let out = enriched_path(
+            Some("/custom/bin:/opt/homebrew/bin".into()),
+            Some(Path::new("/home/u")),
+        );
+        let dirs: Vec<PathBuf> = std::env::split_paths(&out).collect();
+        assert_eq!(dirs[0], Path::new("/custom/bin"));
+        assert_eq!(dirs[1], Path::new("/opt/homebrew/bin"));
+        assert_eq!(
+            dirs.iter()
+                .filter(|d| *d == Path::new("/opt/homebrew/bin"))
+                .count(),
+            1
+        );
+        for d in [
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/home/u/.local/share/mise/shims",
+            "/home/u/.local/bin",
+            "/home/u/.cargo/bin",
+        ] {
+            assert!(dirs.contains(&PathBuf::from(d)), "{d} missing");
+        }
+
+        let fallback: Vec<PathBuf> = std::env::split_paths(&enriched_path(None, None)).collect();
+        assert!(fallback.contains(&PathBuf::from("/usr/bin")));
+    }
 
     #[test]
     fn parses_and_sanitizes_plugin_view_json_with_body_actions_and_effects() {
