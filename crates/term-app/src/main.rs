@@ -104,7 +104,7 @@ impl GpuState {
 
         let adapter = rt
             .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
                 ..Default::default()
@@ -342,6 +342,13 @@ struct App {
     modifiers: ModifiersState,
     suppress_next_ime_commit: bool,
     last_terminal_area: Option<CoreRect>,
+    pty_dirty: Arc<std::sync::atomic::AtomicBool>,
+    window_focused: bool,
+    window_occluded: bool,
+    pending_occluded_redraw: bool,
+    last_redraw_at: std::time::Instant,
+    pending_redraw_deadline: Option<std::time::Instant>,
+    last_agent_grid_gen: HashMap<PaneId, u64>,
 }
 
 impl App {
@@ -477,12 +484,19 @@ impl App {
                 let grid = Arc::new(Mutex::new(TerminalGrid::new(cols, rows)));
                 let grid_clone = Arc::clone(&grid);
                 let proxy_out = self.proxy.clone();
+                let pty_dirty = Arc::clone(&self.pty_dirty);
                 thread::spawn(move || {
                     while let Ok(bytes) = rx.recv() {
+                        let mut sync_active = false;
                         if let Ok(mut g) = grid_clone.lock() {
                             g.feed_bytes(&bytes);
+                            sync_active = g.synchronized_output;
                         }
-                        let _ = proxy_out.send_event(UserEvent::PtyOutput);
+                        if !sync_active
+                            && !pty_dirty.swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            let _ = proxy_out.send_event(UserEvent::PtyOutput);
+                        }
                     }
                 });
 
@@ -1121,6 +1135,7 @@ impl App {
     fn cleanup_closed_pane(&mut self, pane_id: PaneId) {
         self.panes.remove(&pane_id);
         self.agent_states.remove(&pane_id);
+        self.last_agent_grid_gen.remove(&pane_id);
         self.mux_last_sizes.remove(&pane_id);
         self.kitty_textures.retain(|(pid, _), _| *pid != pane_id);
     }
@@ -1131,23 +1146,58 @@ impl App {
         }
         self.last_agent_scan = std::time::Instant::now();
         let now_ms = self.agent_scan_start.elapsed().as_millis() as u64;
+        let grace_ms = term_core::agent::AGENT_RUNNING_GRACE.as_millis() as u64;
         let mut next_states = HashMap::new();
+        let mut next_gens = HashMap::new();
 
         for ws in &self.manager.workspaces {
             for tab in &ws.tabs {
                 for pane_id in tab.all_panes() {
-                    let snap_opt = if self.config.features.multiplexer_mode {
-                        self.mux_snapshots.get(&pane_id).cloned()
+                    let prev = self.agent_states.get(&pane_id);
+                    let prev_gen = self.last_agent_grid_gen.get(&pane_id).copied();
+                    let grace_expired = prev.is_some_and(|st| {
+                        st.status == AgentStatus::Running
+                            && now_ms.saturating_sub(st.last_changed_ms) >= grace_ms
+                    });
+
+                    let (snap_opt, gen_opt) = if self.config.features.multiplexer_mode {
+                        let snap = self.mux_snapshots.get(&pane_id);
+                        let cur_gen = snap.map(|s| s.generation);
+                        if cur_gen.is_some() && cur_gen == prev_gen && !grace_expired {
+                            if let Some(g) = cur_gen {
+                                next_gens.insert(pane_id, g);
+                            }
+                            if let Some(st) = prev {
+                                next_states.insert(pane_id, st.clone());
+                            }
+                            continue;
+                        }
+                        (snap.cloned(), cur_gen)
+                    } else if let Some(rt) = self.panes.get(&pane_id) {
+                        if let Ok(g) = rt.grid.lock() {
+                            let cur_gen = g.generation;
+                            if Some(cur_gen) == prev_gen && !grace_expired {
+                                next_gens.insert(pane_id, cur_gen);
+                                if let Some(st) = prev {
+                                    next_states.insert(pane_id, st.clone());
+                                }
+                                continue;
+                            }
+                            (Some(g.snapshot()), Some(cur_gen))
+                        } else {
+                            (None, None)
+                        }
                     } else {
-                        self.panes
-                            .get(&pane_id)
-                            .and_then(|rt| rt.grid.lock().ok().map(|g| g.snapshot()))
+                        (None, None)
                     };
+
+                    if let Some(g) = gen_opt {
+                        next_gens.insert(pane_id, g);
+                    }
                     let Some(snap) = snap_opt else {
                         continue;
                     };
                     let (lines, hash) = snapshot_visible_lines(&snap);
-                    let prev = self.agent_states.get(&pane_id);
                     if let Some(detected) = detect_pane_agent(&lines, hash, now_ms, prev) {
                         next_states.insert(pane_id, detected);
                     }
@@ -1155,6 +1205,7 @@ impl App {
             }
         }
         self.agent_states = next_states;
+        self.last_agent_grid_gen = next_gens;
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -1550,6 +1601,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyOutput => {
+                self.pty_dirty
+                    .store(false, std::sync::atomic::Ordering::Release);
                 // ConPTY からの DSR (\x1b[6n) 等に対する応答があれば PTY へ返す
                 for pane in self.panes.values_mut() {
                     let replies = if let Ok(mut g) = pane.grid.lock() {
@@ -1562,7 +1615,27 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 if let Some(window) = &self.window {
-                    window.request_redraw();
+                    let is_minimized = window.is_minimized().unwrap_or(false);
+                    if self.window_occluded || is_minimized {
+                        self.pending_occluded_redraw = true;
+                    } else {
+                        let min_interval = if self.window_focused {
+                            std::time::Duration::from_millis(16)
+                        } else {
+                            std::time::Duration::from_millis(100)
+                        };
+                        let elapsed = self.last_redraw_at.elapsed();
+                        if elapsed >= min_interval {
+                            self.pending_redraw_deadline = None;
+                            window.request_redraw();
+                        } else {
+                            let deadline = self.last_redraw_at + min_interval;
+                            self.pending_redraw_deadline = Some(match self.pending_redraw_deadline {
+                                Some(existing) => existing.min(deadline),
+                                None => deadline,
+                            });
+                        }
+                    }
                 }
             }
             UserEvent::PaneExited(id) => {
@@ -1654,6 +1727,19 @@ impl ApplicationHandler<UserEvent> for App {
                 window.request_redraw();
             }
         }
+        if let Some(deadline) = self.pending_redraw_deadline {
+            if std::time::Instant::now() >= deadline {
+                self.pending_redraw_deadline = None;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            } else {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            }
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -1680,8 +1766,25 @@ impl ApplicationHandler<UserEvent> for App {
                 self.save_session();
                 event_loop.exit();
             }
-            WindowEvent::Focused(false) => {
-                self.modifiers = ModifiersState::empty();
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if !focused {
+                    self.modifiers = ModifiersState::empty();
+                } else if self.pending_occluded_redraw && !self.window_occluded {
+                    self.pending_occluded_redraw = false;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                self.window_occluded = occluded;
+                if !occluded && self.pending_occluded_redraw {
+                    self.pending_occluded_redraw = false;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
             }
             WindowEvent::Resized(size) => {
                 self.last_terminal_area = None;
@@ -1998,6 +2101,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let is_minimized = self
+                    .window
+                    .as_ref()
+                    .and_then(|w| w.is_minimized())
+                    .unwrap_or(false);
+                if self.window_occluded || is_minimized {
+                    self.pending_occluded_redraw = true;
+                    return;
+                }
+                self.last_redraw_at = std::time::Instant::now();
+                self.pending_redraw_deadline = None;
+                self.pending_occluded_redraw = false;
                 self.refresh_agent_states();
                 let area = self.terminal_area();
                 let focused_pane = self.manager.active_tab().focused_pane;
@@ -5334,6 +5449,13 @@ fn main() {
         modifiers: ModifiersState::empty(),
         suppress_next_ime_commit: false,
         last_terminal_area: None,
+        pty_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        window_focused: true,
+        window_occluded: false,
+        pending_occluded_redraw: false,
+        last_redraw_at: std::time::Instant::now(),
+        pending_redraw_deadline: None,
+        last_agent_grid_gen: HashMap::new(),
     };
     let _ = event_loop.run_app(&mut app);
 }

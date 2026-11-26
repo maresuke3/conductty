@@ -30,6 +30,10 @@ pub struct GridSnapshot {
     pub cursor_row: usize,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    #[serde(default)]
+    pub synchronized_output: bool,
+    #[serde(default)]
+    pub generation: u64,
     pub cells: Vec<Cell>,
 }
 
@@ -166,6 +170,8 @@ pub struct TerminalGrid {
     pub cursor_row: usize,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    pub synchronized_output: bool,
+    pub generation: u64,
     pub cells: Vec<Cell>,
     pub scrollback: VecDeque<Vec<Cell>>,
     pub scroll_offset: usize,
@@ -194,6 +200,8 @@ impl TerminalGrid {
             cursor_row: 0,
             cursor_visible: true,
             bracketed_paste: false,
+            synchronized_output: false,
+            generation: 0,
             cells: vec![Cell::default(); cols * rows],
             scrollback: VecDeque::new(),
             scroll_offset: 0,
@@ -246,6 +254,9 @@ impl TerminalGrid {
                 self.pending_replies.drain(..excess);
             }
         }
+        if !bytes.is_empty() {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
@@ -266,20 +277,33 @@ impl TerminalGrid {
             cursor_row: self.cursor_row,
             cursor_visible: self.cursor_visible,
             bracketed_paste: self.bracketed_paste,
+            synchronized_output: self.synchronized_output,
+            generation: self.generation,
             cells,
         }
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll_offset = (self.scroll_offset + lines).min(self.scrollback.len());
+        let next = (self.scroll_offset + lines).min(self.scrollback.len());
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        let next = self.scroll_offset.saturating_sub(lines);
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     pub fn reset_scroll(&mut self) {
-        self.scroll_offset = 0;
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     /// 現在のスクロール位置を考慮した表示セルを返す。
@@ -480,6 +504,7 @@ impl TerminalGrid {
         self.scroll_top = 0;
         self.scroll_bottom = new_rows - 1;
         self.pending_wrap = false;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn clear_wide_overlap(&mut self, row: usize, col: usize) {
@@ -993,6 +1018,12 @@ impl Perform for TerminalGrid {
             }
             'l' if is_private && first == 2004 => {
                 self.bracketed_paste = false;
+            }
+            'h' if is_private && first == 2026 => {
+                self.synchronized_output = true;
+            }
+            'l' if is_private && first == 2026 => {
+                self.synchronized_output = false;
             }
             'h' if is_private && first == 1049 => {
                 if self.alt_screen.is_none() {
