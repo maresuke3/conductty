@@ -7,11 +7,14 @@ pub struct BrowserBounds {
     pub height: f64,
 }
 
+/// HTML プレビュー表示中の `EmbeddedBrowser::url`（http(s) ではないので External ボタンは出さない）
+pub const HTML_URL: &str = "about:blank";
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod imp {
     use std::sync::Arc;
 
-    use super::BrowserBounds;
+    use super::{BrowserBounds, HTML_URL};
     use winit::dpi::{LogicalSize, PhysicalPosition};
     use winit::event_loop::ActiveEventLoop;
     use winit::window::{Window, WindowAttributes, WindowId};
@@ -31,6 +34,28 @@ mod imp {
             url: &str,
             bounds: BrowserBounds,
         ) -> Result<Self, String> {
+            let safe_url = term_drawer::validate_http_url(url)?.to_string();
+            let builder = WebViewBuilder::new().with_url(&safe_url);
+            Self::create(event_loop, parent, bounds, builder, safe_url)
+        }
+
+        pub fn open_html(
+            event_loop: &ActiveEventLoop,
+            parent: &Window,
+            html: &str,
+            bounds: BrowserBounds,
+        ) -> Result<Self, String> {
+            let builder = WebViewBuilder::new().with_html(html);
+            Self::create(event_loop, parent, bounds, builder, HTML_URL.to_string())
+        }
+
+        fn create(
+            event_loop: &ActiveEventLoop,
+            parent: &Window,
+            bounds: BrowserBounds,
+            builder: WebViewBuilder<'_>,
+            url: String,
+        ) -> Result<Self, String> {
             let scale = parent.scale_factor();
             let base = parent
                 .inner_position()
@@ -40,13 +65,12 @@ mod imp {
                 base.y + (bounds.y * scale).round() as i32,
             );
 
+            let width = bounds.width.max(100.0);
+            let height = bounds.height.max(100.0);
             let attrs = WindowAttributes::default()
                 .with_title("conductty preview")
                 .with_decorations(false)
-                .with_inner_size(LogicalSize::new(
-                    bounds.width.max(100.0),
-                    bounds.height.max(100.0),
-                ))
+                .with_inner_size(LogicalSize::new(width, height))
                 .with_position(pos);
 
             let window = Arc::new(
@@ -55,17 +79,17 @@ mod imp {
                     .map_err(|e| format!("Preview ウィンドウ作成失敗: {e}"))?,
             );
 
-            let safe_url = term_drawer::validate_http_url(url)?.to_string();
-            let webview = WebViewBuilder::new()
-                .with_url(&safe_url)
-                .with_navigation_handler(|nav_url| term_drawer::validate_http_url(&nav_url).is_ok())
-                .build(&window)
+            let webview = builder
+                .with_focused(false)
+                .with_bounds(child_rect(bounds))
+                .with_navigation_handler(|nav_url| allow_navigation(&nav_url))
+                .build_as_child(&window)
                 .map_err(|e| format!("WebView 起動失敗: {e}"))?;
 
             Ok(Self {
                 window,
                 webview,
-                url: safe_url,
+                url,
             })
         }
 
@@ -86,6 +110,7 @@ mod imp {
                 bounds.width.max(100.0),
                 bounds.height.max(100.0),
             ));
+            let _ = self.webview.set_bounds(child_rect(bounds));
         }
 
         pub fn load_url(&mut self, url: &str) {
@@ -93,6 +118,26 @@ mod imp {
                 self.url = safe_url.to_string();
                 let _ = self.webview.load_url(safe_url);
             }
+        }
+
+        pub fn load_html(&mut self, html: &str) {
+            self.url = HTML_URL.to_string();
+            let _ = self.webview.load_html(html);
+        }
+    }
+
+    /// HTML 文字列のロードは macOS で about:blank、Windows(WebView2) で data:text/html として通知される
+    fn allow_navigation(url: &str) -> bool {
+        url == HTML_URL
+            || url.starts_with("data:text/html")
+            || term_drawer::validate_http_url(url).is_ok()
+    }
+
+    fn child_rect(bounds: BrowserBounds) -> wry::Rect {
+        wry::Rect {
+            position: wry::dpi::LogicalPosition::new(0.0, 0.0).into(),
+            size: wry::dpi::LogicalSize::new(bounds.width.max(100.0), bounds.height.max(100.0))
+                .into(),
         }
     }
 }
@@ -117,6 +162,15 @@ mod imp {
             Err("Embedded browser is not supported on this OS".to_string())
         }
 
+        pub fn open_html(
+            _event_loop: &ActiveEventLoop,
+            _parent: &Window,
+            _html: &str,
+            _bounds: BrowserBounds,
+        ) -> Result<Self, String> {
+            Err("Embedded browser is not supported on this OS".to_string())
+        }
+
         pub fn window_id(&self) -> WindowId {
             unreachable!()
         }
@@ -125,6 +179,10 @@ mod imp {
 
         pub fn load_url(&mut self, url: &str) {
             self.url = url.to_string();
+        }
+
+        pub fn load_html(&mut self, _html: &str) {
+            self.url = super::HTML_URL.to_string();
         }
     }
 }

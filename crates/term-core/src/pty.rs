@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -68,6 +70,12 @@ impl PtySession {
         cmd.env("TERM", "xterm-256color");
         cmd.env("TERM_PROGRAM", "conductty");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        if let Some(path) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| path_with_dir(std::env::var_os("PATH"), exe.parent()?))
+        {
+            cmd.env("PATH", path);
+        }
         if cfg!(target_os = "windows") {
             let mut wslenv = std::env::var("WSLENV").unwrap_or_default();
             for key in ["TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
@@ -152,6 +160,17 @@ impl PtySession {
     }
 }
 
+/// Ghostty 同様、自身のバイナリのディレクトリを PATH 末尾に足してシェルから `conductty` を叩けるようにする。
+/// 既に含まれている・PATH 未設定・結合不能な場合は None（PATH を触らない）。
+fn path_with_dir(path: Option<OsString>, dir: &Path) -> Option<OsString> {
+    let mut paths: Vec<_> = std::env::split_paths(&path?).collect();
+    if paths.iter().any(|p| p == dir) {
+        return None;
+    }
+    paths.push(dir.to_path_buf());
+    std::env::join_paths(paths).ok()
+}
+
 fn unix_shell_command() -> CommandBuilder {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut c = CommandBuilder::new(shell);
@@ -175,6 +194,20 @@ mod tests {
             argv.get(1).is_some_and(|a| a == "-l"),
             cfg!(target_os = "macos")
         );
+    }
+
+    #[test]
+    fn path_with_dir_appends_once_at_end() {
+        let dir = std::env::temp_dir().join("conductty-bin");
+        let other = std::env::temp_dir().join("other-bin");
+        let path = std::env::join_paths([&other]).unwrap();
+
+        let appended = path_with_dir(Some(path), &dir).unwrap();
+        let entries: Vec<_> = std::env::split_paths(&appended).collect();
+        assert_eq!(entries, vec![other.clone(), dir.clone()]);
+
+        assert_eq!(path_with_dir(Some(appended), &dir), None);
+        assert_eq!(path_with_dir(None, &dir), None);
     }
 
     #[cfg(unix)]

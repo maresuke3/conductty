@@ -416,6 +416,7 @@ impl ServerState {
                     snapshots: self.collect_snapshots(),
                 }
             }
+            MuxRequest::SetTheme { .. } => MuxResponse::Ok { delivered_to: 0 },
         }
     }
 }

@@ -20,6 +20,8 @@
 multiplexer_mode = false
 # 左Drawerの表示モード: "always" (常時表示) / "collapsed" (折りたたみ) / "hidden" (非表示)
 left_drawer_mode = "collapsed"
+# 左Drawer下部の開閉ボタンを表示するかどうか
+left_drawer_toggle_button = true
 right_drawer = true
 right_drawer_default_open = false
 embedded_browser = true
@@ -31,7 +33,11 @@ font_families = ["Cica", "FiraCode Nerd Font", "Fira Code"]
 font_size = 18.0
 font_thicken = true
 adjust_cell_height = 2.0
-# プリセット: "TokyoNight Moon" / "TokyoNight" / "Solarized Dark"
+# テーマプリセット（大文字小文字・空白・ハイフンは無視。`conductty theme <name>` でも切替可）:
+#   "Solarized Dark" / "Solarized Light" / "Dracula"
+#   "GitHub Dark" / "GitHub Light"
+#   "Gruvbox Dark" / "Gruvbox Light" / "Gruvbox Material"
+#   "Tokyo Night" / "Tokyo Night Day" / "Tokyo Night Moon" / "Tokyo Night Night" / "Tokyo Night Storm"
 theme = "TokyoNight Moon"
 background_opacity = 1.0
 window_padding_x = 10.0
@@ -63,6 +69,15 @@ goto_up = "performable:ctrl+k"
 goto_right = "performable:ctrl+l"
 toggle_left_drawer = "prefix+b"
 toggle_right_drawer = "ctrl+shift+g"
+drawer_next = "j, down"
+drawer_prev = "k, up"
+drawer_next_plugin = "l, right, tab"
+drawer_prev_plugin = "h, left, shift+tab"
+drawer_preview = "enter, b"
+drawer_open = "ctrl+enter, cmd+enter, o"
+drawer_send_to_pane = "s"
+drawer_refresh = "r"
+drawer_close = "esc, q"
 go_to = "prefix+g"
 go_to_next = "j, down, ctrl+j, ctrl+n"
 go_to_prev = "k, up, ctrl+k, ctrl+p"

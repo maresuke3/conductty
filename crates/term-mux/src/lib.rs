@@ -271,6 +271,9 @@ pub enum MuxRequest {
         dir: NavDirection,
     },
     ToggleZoom,
+    SetTheme {
+        theme: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

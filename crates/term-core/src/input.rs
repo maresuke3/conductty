@@ -192,6 +192,7 @@ pub struct InputRouter {
     pub prefix_trigger: Option<KeyBinding>,
     pub prefix_bindings: Vec<KeyBinding>,
     pub go_to_bindings: Vec<(KeyBinding, GoToCommand)>,
+    pub right_drawer_bindings: Vec<KeyBinding>,
 }
 
 impl Default for InputRouter {
@@ -269,6 +270,33 @@ impl InputRouter {
             }
         }
 
+        let mut right_drawer_bindings = Vec::new();
+        for p in split_binding_list(&kb.toggle_right_drawer) {
+            if strip_leader_prefix(p).is_none()
+                && let Some(b) = KeyBinding::parse(p, Action::CloseRightDrawer)
+            {
+                right_drawer_bindings.push(b);
+            }
+        }
+        let right_drawer_specs = [
+            (&kb.drawer_close, Action::CloseRightDrawer),
+            (&kb.drawer_next, Action::DrawerNext),
+            (&kb.drawer_prev, Action::DrawerPrev),
+            (&kb.drawer_prev_plugin, Action::DrawerPrevPlugin),
+            (&kb.drawer_next_plugin, Action::DrawerNextPlugin),
+            (&kb.drawer_preview, Action::DrawerPreview),
+            (&kb.drawer_open, Action::DrawerOpen),
+            (&kb.drawer_send_to_pane, Action::DrawerSendToPane),
+            (&kb.drawer_refresh, Action::DrawerRefresh),
+        ];
+        for (spec, action) in right_drawer_specs {
+            for part in split_binding_list(spec) {
+                if let Some(b) = KeyBinding::parse(part, action) {
+                    right_drawer_bindings.push(b);
+                }
+            }
+        }
+
         Self {
             mode: InputMode::Normal,
             macos_left_option_as_alt: config.window.macos_option_as_alt == "left",
@@ -276,6 +304,7 @@ impl InputRouter {
             prefix_trigger,
             prefix_bindings,
             go_to_bindings,
+            right_drawer_bindings,
         }
     }
 
@@ -420,51 +449,15 @@ impl InputRouter {
     }
 
     fn route_right_drawer_mode(&mut self, event: &KeyEvent) -> InputDecision {
-        let m = event.mods;
-        if m.ctrl
-            && m.shift
-            && !m.alt
-            && matches!(event.code, KeyCode::Char('g') | KeyCode::Char('G'))
-        {
-            self.mode = InputMode::Normal;
-            return InputDecision::Execute(Action::CloseRightDrawer);
+        for binding in &self.right_drawer_bindings {
+            if binding.matches(event) {
+                if binding.action == Action::CloseRightDrawer {
+                    self.mode = InputMode::Normal;
+                }
+                return InputDecision::Execute(binding.action);
+            }
         }
-
-        match (&event.code, m.ctrl, m.shift, m.alt) {
-            (KeyCode::Escape, _, _, _)
-            | (KeyCode::Char('q') | KeyCode::Char('Q'), false, false, false) => {
-                self.mode = InputMode::Normal;
-                InputDecision::Execute(Action::CloseRightDrawer)
-            }
-            (KeyCode::Char('j') | KeyCode::Char('J'), false, false, false)
-            | (KeyCode::Down, false, false, false) => InputDecision::Execute(Action::DrawerNext),
-            (KeyCode::Char('k') | KeyCode::Char('K'), false, false, false)
-            | (KeyCode::Up, false, false, false) => InputDecision::Execute(Action::DrawerPrev),
-            (KeyCode::Char('h') | KeyCode::Char('H'), false, false, false)
-            | (KeyCode::Left, false, false, false)
-            | (KeyCode::Tab, false, true, false) => {
-                InputDecision::Execute(Action::DrawerPrevPlugin)
-            }
-            (KeyCode::Char('l') | KeyCode::Char('L'), false, false, false)
-            | (KeyCode::Right, false, false, false)
-            | (KeyCode::Tab, false, false, false) => {
-                InputDecision::Execute(Action::DrawerNextPlugin)
-            }
-            (KeyCode::Enter, false, false, false)
-            | (KeyCode::Char('o') | KeyCode::Char('O'), false, false, false) => {
-                InputDecision::Execute(Action::DrawerOpen)
-            }
-            (KeyCode::Char('b') | KeyCode::Char('B'), false, false, false) => {
-                InputDecision::Execute(Action::DrawerPreview)
-            }
-            (KeyCode::Char('s') | KeyCode::Char('S'), false, false, false) => {
-                InputDecision::Execute(Action::DrawerSendToPane)
-            }
-            (KeyCode::Char('r') | KeyCode::Char('R'), false, false, false) => {
-                InputDecision::Execute(Action::DrawerRefresh)
-            }
-            _ => InputDecision::Ignore,
-        }
+        InputDecision::Ignore
     }
 
     fn route_pane_move_mode(&mut self, event: &KeyEvent) -> InputDecision {
@@ -989,6 +982,69 @@ mod tests {
         assert_eq!(
             router.route(&key_w, &ctx),
             InputDecision::Execute(Action::NewWorkspace)
+        );
+    }
+
+    #[test]
+    fn right_drawer_preview_open_and_custom_keybinds() {
+        let mut router = InputRouter::default();
+        let ctx = MockCtx { has_right: false };
+        router.mode = InputMode::RightDrawer;
+
+        let enter = KeyEvent {
+            code: KeyCode::Enter,
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&enter, &ctx),
+            InputDecision::Execute(Action::DrawerPreview)
+        );
+
+        let ctrl_enter = KeyEvent {
+            code: KeyCode::Enter,
+            mods: mods(true, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&ctrl_enter, &ctx),
+            InputDecision::Execute(Action::DrawerOpen)
+        );
+
+        let cmd_enter = KeyEvent {
+            code: KeyCode::Enter,
+            mods: Modifiers {
+                ctrl: false,
+                alt: false,
+                shift: false,
+                logo: true,
+            },
+            left_alt: false,
+        };
+        assert_eq!(
+            router.route(&cmd_enter, &ctx),
+            InputDecision::Execute(Action::DrawerOpen)
+        );
+
+        // config によるカスタマイズ上書き
+        let mut cfg = AppConfig::default();
+        cfg.keybinds.drawer_preview = "p".to_string();
+        cfg.keybinds.drawer_open = "enter".to_string();
+        let mut custom_router = InputRouter::from_config(&cfg);
+        custom_router.mode = InputMode::RightDrawer;
+
+        let key_p = KeyEvent {
+            code: KeyCode::Char('p'),
+            mods: mods(false, false, false),
+            left_alt: false,
+        };
+        assert_eq!(
+            custom_router.route(&key_p, &ctx),
+            InputDecision::Execute(Action::DrawerPreview)
+        );
+        assert_eq!(
+            custom_router.route(&enter, &ctx),
+            InputDecision::Execute(Action::DrawerOpen)
         );
     }
 }

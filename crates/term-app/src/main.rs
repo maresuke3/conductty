@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod browser;
+mod markdown_html;
+mod theme_picker;
 mod updater;
 mod win_backdrop;
 
@@ -12,8 +14,9 @@ use std::thread;
 
 use browser::{BrowserBounds, EmbeddedBrowser};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
+use markdown_html::{markdown_contains_mermaid, render_markdown_to_html};
 use term_core::agent::{AgentStatus, PaneAgentState, detect_pane_agent, snapshot_visible_lines};
-use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme};
+use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme, resolve_theme_preset};
 use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::input::{
     Action, GoToCommand, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode,
@@ -61,9 +64,64 @@ struct PaneRuntime {
     last_size: (usize, usize),
 }
 
-fn panel_color(r: u8, g: u8, b: u8, opacity: f32) -> Color32 {
+fn panel_color([r, g, b]: [u8; 3], opacity: f32) -> Color32 {
     let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
     Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn rgb([r, g, b]: [u8; 3]) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
+
+fn mix_rgb(a: [u8; 3], b: [u8; 3], k: f32) -> Color32 {
+    rgb(std::array::from_fn(|i| {
+        (a[i] as f32 + (b[i] as f32 - a[i] as f32) * k).round() as u8
+    }))
+}
+
+fn is_light_theme(theme: &ResolvedTheme) -> bool {
+    theme.bg.iter().map(|&c| c as u32).sum::<u32>() > 384
+}
+
+/// テーマから導出したドロワー等の UI 配色（状態色: 橙/緑/赤などはテーマ非依存のまま）
+#[derive(Clone, Copy)]
+struct UiPalette {
+    fg: Color32,
+    muted: Color32,
+    dim: Color32,
+    accent: Color32,
+    card: Color32,
+    card_active: Color32,
+    drawer: Color32,
+}
+
+impl UiPalette {
+    fn new(t: &ResolvedTheme) -> Self {
+        Self {
+            fg: rgb(t.fg),
+            muted: mix_rgb(t.bg, t.fg, 0.6),
+            dim: mix_rgb(t.bg, t.fg, 0.45),
+            accent: rgb(t.accent),
+            card: rgb(t.card_bg),
+            card_active: mix_rgb(t.card_bg, t.fg, 0.12),
+            drawer: rgb(t.drawer_bg),
+        }
+    }
+}
+
+/// egui 標準ウィジェット（ボタン・入力欄・区切り線など）をテーマの明暗に合わせる
+fn apply_theme_visuals(ctx: &egui::Context, theme: &ResolvedTheme) {
+    let (egui_theme, mut v) = if is_light_theme(theme) {
+        (egui::Theme::Light, egui::Visuals::light())
+    } else {
+        (egui::Theme::Dark, egui::Visuals::dark())
+    };
+    v.panel_fill = rgb(theme.drawer_bg);
+    v.window_fill = rgb(theme.drawer_bg);
+    v.extreme_bg_color = rgb(theme.card_bg);
+    v.hyperlink_color = rgb(theme.accent);
+    ctx.set_theme(egui_theme);
+    ctx.set_visuals_of(egui_theme, v);
 }
 
 enum RenderStatus {
@@ -338,11 +396,13 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     browser: Option<EmbeddedBrowser>,
     pending_browser_url: Option<String>,
+    pending_browser_html: Option<String>,
     browser_error: Option<String>,
     kitty_textures: HashMap<(PaneId, u32), (egui::TextureHandle, u64)>,
     router: InputRouter,
     modifiers: ModifiersState,
     suppress_next_ime_commit: bool,
+    ime_preedit: Option<(String, Option<(usize, usize)>)>,
     last_terminal_area: Option<CoreRect>,
     pty_dirty: Arc<std::sync::atomic::AtomicBool>,
     window_focused: bool,
@@ -787,6 +847,18 @@ impl App {
                     delivered_to: delivered,
                 }
             }
+            MuxRequest::SetTheme { theme } => {
+                let Some((name, _)) = resolve_theme_preset(&theme) else {
+                    return MuxResponse::Error {
+                        message: format!("unknown theme: {theme}"),
+                    };
+                };
+                self.config.appearance.theme = name.to_string();
+                // [theme] の個別上書き色も維持するため resolve_theme() 経由で再計算する
+                self.theme = self.config.resolve_theme();
+                apply_theme_visuals(&self.egui_ctx, &self.theme);
+                MuxResponse::Ok { delivered_to: 1 }
+            }
             _ => MuxResponse::Error {
                 message: "supported in conductty-server (--mux) mode only".to_string(),
             },
@@ -838,6 +910,21 @@ impl App {
             .await;
             let _ = proxy.send_event(UserEvent::DrawerUpdated(snapshot));
         });
+    }
+
+    /// 本文プレビューを開く。```mermaid を含む本文は WebView で図として描画する（Raw でテキスト表示に戻せる）
+    fn open_body_preview(&mut self, item: DrawerItem) {
+        if self.config.features.embedded_browser
+            && let Some(body) = item
+                .body
+                .as_deref()
+                .filter(|b| markdown_contains_mermaid(b))
+        {
+            self.pending_browser_html =
+                Some(render_markdown_to_html(&item.title, body, &self.theme));
+        }
+        self.right_drawer_open = true;
+        self.drawer_preview_item = Some(item);
     }
 
     fn switch_drawer_plugin(&mut self, idx: usize) {
@@ -1419,17 +1506,19 @@ impl App {
                 }
             }
             Action::CloseRightDrawer => {
+                if self.browser.take().is_some() {
+                    self.drawer_preview_item = None;
+                    if let Some(window) = &self.window {
+                        window.focus_window();
+                    }
+                    return;
+                }
                 if self.drawer_preview_item.take().is_some()
                     || self.drawer_input_action.take().is_some()
                 {
                     return;
                 }
                 self.right_drawer_open = false;
-                if self.browser.take().is_some()
-                    && let Some(window) = &self.window
-                {
-                    window.focus_window();
-                }
                 self.router.mode = InputMode::Normal;
             }
             Action::DrawerNext => {
@@ -1462,8 +1551,7 @@ impl App {
                     if !item.url.is_empty() {
                         open_url(&item.url);
                     } else if item.body.as_ref().is_some_and(|b| !b.is_empty()) {
-                        self.right_drawer_open = true;
-                        self.drawer_preview_item = Some(item);
+                        self.open_body_preview(item);
                     } else if let Some(first_act) = item.actions.first() {
                         if first_act.needs_input {
                             self.drawer_input_action = Some((
@@ -1484,12 +1572,16 @@ impl App {
             }
             Action::DrawerPreview => {
                 if self.drawer_preview_item.take().is_some() {
+                    if self.browser.take().is_some()
+                        && let Some(window) = &self.window
+                    {
+                        window.focus_window();
+                    }
                     return;
                 }
                 if let Some(item) = self.selected_drawer_item() {
                     if item.body.as_ref().is_some_and(|b| !b.is_empty()) {
-                        self.right_drawer_open = true;
-                        self.drawer_preview_item = Some(item);
+                        self.open_body_preview(item);
                     } else if self.config.features.embedded_browser && !item.url.is_empty() {
                         self.right_drawer_open = true;
                         self.pending_browser_url = Some(item.url);
@@ -1530,6 +1622,7 @@ impl App {
                 }
                 self.drawer_cache.clear();
                 configure_fonts(&self.egui_ctx, &new_cfg.appearance.font_families);
+                apply_theme_visuals(&self.egui_ctx, &self.theme);
                 if let Some(window) = &self.window {
                     win_backdrop::apply(window, new_cfg.appearance.background_opacity);
                 }
@@ -1571,6 +1664,7 @@ impl ApplicationHandler<UserEvent> for App {
             win_backdrop::apply(&window, self.config.appearance.background_opacity);
 
             configure_fonts(&self.egui_ctx, &self.config.appearance.font_families);
+            apply_theme_visuals(&self.egui_ctx, &self.theme);
             let egui_state = egui_winit::State::new(
                 self.egui_ctx.clone(),
                 egui::ViewportId::ROOT,
@@ -1729,17 +1823,28 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(url) = self.pending_browser_url.take() {
+        let pending = (self.pending_browser_url.take().map(|u| (u, false)))
+            .or_else(|| self.pending_browser_html.take().map(|h| (h, true)));
+        if let Some((content, is_html)) = pending {
             self.right_drawer_open = true;
             self.browser_error = None;
             let bounds = self.right_browser_bounds();
             if let Some(browser) = &mut self.browser {
-                browser.load_url(&url);
+                if is_html {
+                    browser.load_html(&content);
+                } else {
+                    browser.load_url(&content);
+                }
                 if let Some(parent) = &self.window {
                     browser.sync_to_parent(parent, bounds);
                 }
             } else if let Some(parent) = &self.window {
-                match EmbeddedBrowser::open(event_loop, parent, &url, bounds) {
+                let opened = if is_html {
+                    EmbeddedBrowser::open_html(event_loop, parent, &content, bounds)
+                } else {
+                    EmbeddedBrowser::open(event_loop, parent, &content, bounds)
+                };
+                match opened {
                     Ok(b) => self.browser = Some(b),
                     Err(err) => self.browser_error = Some(err),
                 }
@@ -1765,7 +1870,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if self.browser.as_ref().is_some_and(|b| b.window_id() == id) {
-            if matches!(event, WindowEvent::CloseRequested) {
+            let should_close = matches!(event, WindowEvent::CloseRequested)
+                || matches!(
+                    &event,
+                    WindowEvent::KeyboardInput { event: key_ev, .. }
+                        if key_ev.state == ElementState::Pressed
+                            && matches!(key_ev.logical_key, Key::Named(NamedKey::Escape))
+                );
+            if should_close {
                 self.browser = None;
                 if let Some(window) = &self.window {
                     window.focus_window();
@@ -1775,7 +1887,11 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        if let (Some(window), Some(egui_state)) = (&self.window, &mut self.egui_state) {
+        let is_text_editing =
+            self.renaming_workspace_idx.is_some() || self.drawer_input_action.is_some();
+        if let (Some(window), Some(egui_state)) = (&self.window, &mut self.egui_state)
+            && should_forward_event_to_egui(is_text_editing, &event)
+        {
             let response = egui_state.on_window_event(window, &event);
             // egui_winit は RedrawRequested 自体にも repaint: true を返すため、ここで再要求すると
             // 描画ごとに次の描画が積まれ無限ループになる (表示中は 60fps、最小化中はビジーループ)
@@ -1889,9 +2005,39 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                if self.renaming_workspace_idx.is_some() || self.drawer_input_action.is_some() {
+                    self.ime_preedit = None;
+                    return;
+                }
+                if self.router.mode == InputMode::Normal
+                    && !self.pane_mode_active
+                    && !self.go_to_open
+                {
+                    if text.is_empty() {
+                        self.ime_preedit = None;
+                    } else {
+                        self.ime_preedit = Some((text, cursor));
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                if self.ime_preedit.take().is_some()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                self.ime_preedit = None;
                 if self.suppress_next_ime_commit {
                     self.suppress_next_ime_commit = false;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                     return;
                 }
                 if self.modifiers.alt_key() && self.router.macos_left_option_as_alt {
@@ -1917,6 +2063,9 @@ impl ApplicationHandler<UserEvent> for App {
                         });
                     } else if let Some(pane) = self.panes.get_mut(&focused) {
                         let _ = pane.pty.write_bytes(text.as_bytes());
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
                     }
                 }
             }
@@ -2264,9 +2413,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut toggle_left_collapse = false;
                 let can_collapse_left =
                     self.config.features.left_drawer_mode == LeftDrawerMode::Collapsed;
+                let show_left_toggle =
+                    can_collapse_left && self.config.features.left_drawer_toggle_button;
                 let mut switch_ws_target: Option<usize> = None;
                 let mut switch_tab_target: Option<(usize, usize)> = None;
-                let mut new_ws_requested = false;
                 let mut start_rename_idx: Option<usize> = None;
                 let mut commit_rename: Option<(usize, String)> = None;
                 let mut cancel_rename = false;
@@ -2278,6 +2428,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut new_tab_requested = false;
                 let mut close_drawer_requested = false;
                 let mut close_browser_requested = false;
+                let mut show_raw_requested = false;
                 let mut open_url_target: Option<String> = None;
                 let mut preview_url_target: Option<String> = None;
                 let mut send_to_pane_text: Option<String> = None;
@@ -2297,6 +2448,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let ui_opacity = self.config.appearance.background_opacity;
                 let mut computed_cell_size = self.cell_size;
                 let mut computed_terminal_area: Option<CoreRect> = None;
+                let ime_preedit = self.ime_preedit.clone();
+                let mut ime_cursor_rect: Option<Rect> = None;
+                let theme = self.theme;
+                let pal = UiPalette::new(&theme);
 
                 let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                     match left_drawer_mode {
@@ -2306,30 +2461,24 @@ impl ApplicationHandler<UserEvent> for App {
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
+                                    .fill(panel_color(theme.drawer_bg, ui_opacity))
                                     .inner_margin(12.0),
                             )
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.heading(
                                         egui::RichText::new("Workspaces")
-                                            .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if can_collapse_left && ui.button("<<").clicked() {
-                                                toggle_left_collapse = true;
-                                            }
-                                            if ui.button("+ New").clicked() {
-                                                new_ws_requested = true;
-                                            }
-                                        },
+                                            .color(pal.fg),
                                     );
                                 });
                                 ui.separator();
 
-                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                let footer_h = 32.0;
+                                let avail_h = (ui.available_height() - footer_h).max(80.0);
+                                egui::ScrollArea::vertical()
+                                    .max_height(avail_h)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
                                     for (idx, (name, tab_count, active_t, pane_count)) in
                                         ws_summaries.iter().enumerate()
                                     {
@@ -2339,12 +2488,12 @@ impl ApplicationHandler<UserEvent> for App {
                                         let accent = if is_master {
                                             Color32::from_rgb(0xff, 0xc7, 0x77)
                                         } else {
-                                            Color32::from_rgb(0x7a, 0xa2, 0xf7)
+                                            pal.accent
                                         };
                                         let fill = if is_active {
-                                            Color32::from_rgb(0x3b, 0x42, 0x61)
+                                            pal.card_active
                                         } else {
-                                            Color32::from_rgb(0x2f, 0x33, 0x4d)
+                                            pal.card
                                         };
                                         let stroke = if is_selected {
                                             Stroke::new(1.5_f32, accent)
@@ -2415,7 +2564,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                         "{tab_count} tabs · {pane_count} panes"
                                                     ))
                                                     .small()
-                                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                    .color(pal.muted),
                                                 );
 
                                                 if *tab_count > 1 {
@@ -2449,7 +2598,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                 agent_entries.len()
                                             ))
                                             .strong()
-                                            .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
+                                            .color(pal.fg),
                                         );
                                         if has_ask_agent {
                                             ui.label(
@@ -2465,7 +2614,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         ui.label(
                                             egui::RichText::new("No active agents detected")
                                                 .small()
-                                                .color(Color32::from_rgb(0x63, 0x6d, 0xa6)),
+                                                .color(pal.dim),
                                         );
                                     } else {
                                         for (ws_idx, ws_name, tab_idx, pane_id, is_focused, st) in
@@ -2486,16 +2635,16 @@ impl ApplicationHandler<UserEvent> for App {
                                                 }
                                             };
                                             let card_fill = if *is_focused {
-                                                Color32::from_rgb(0x3b, 0x42, 0x61)
+                                                pal.card_active
                                             } else {
-                                                Color32::from_rgb(0x2f, 0x33, 0x4d)
+                                                pal.card
                                             };
                                             let card_stroke = if st.status == AgentStatus::Ask {
                                                 Stroke::new(1.5_f32, badge_color)
                                             } else if *is_focused {
                                                 Stroke::new(
                                                     1.0_f32,
-                                                    Color32::from_rgb(0x7a, 0xa2, 0xf7),
+                                                    pal.accent,
                                                 )
                                             } else {
                                                 Stroke::NONE
@@ -2529,9 +2678,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                         ui.label(
                                                             egui::RichText::new(st.kind.label())
                                                                 .strong()
-                                                                .color(Color32::from_rgb(
-                                                                    0xc8, 0xd3, 0xf5,
-                                                                )),
+                                                                .color(pal.fg),
                                                         );
                                                     });
                                                     ui.label(
@@ -2541,16 +2688,14 @@ impl ApplicationHandler<UserEvent> for App {
                                                             pane_id
                                                         ))
                                                         .small()
-                                                        .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                        .color(pal.muted),
                                                     );
                                                     if !st.summary.is_empty() {
                                                         ui.label(
                                                             egui::RichText::new(&st.summary)
                                                                 .small()
                                                                 .monospace()
-                                                                .color(Color32::from_rgb(
-                                                                    0xa9, 0xb1, 0xd6,
-                                                                )),
+                                                                .color(pal.muted),
                                                         );
                                                     }
                                                 })
@@ -2565,13 +2710,25 @@ impl ApplicationHandler<UserEvent> for App {
                                 });
 
                                 ui.separator();
-                                ui.label(
-                                    egui::RichText::new(
-                                        "j/k: select | Enter: switch | n: new | r: rename | d: close",
-                                    )
-                                    .small()
-                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "j/k: select | Enter: switch | n: new | r: rename | d: close",
+                                        )
+                                        .small()
+                                        .color(pal.muted),
+                                    );
+                                    if show_left_toggle {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("<<").clicked() {
+                                                    toggle_left_collapse = true;
+                                                }
+                                            },
+                                        );
+                                    }
+                                });
                             });
                         }
                         LeftDrawerMode::Collapsed => {
@@ -2580,14 +2737,11 @@ impl ApplicationHandler<UserEvent> for App {
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
+                                    .fill(panel_color(theme.drawer_bg, ui_opacity))
                                     .inner_margin(4.0),
                             )
                             .show(ui, |ui| {
                                 ui.vertical_centered(|ui| {
-                                    if ui.button(">").clicked() {
-                                        toggle_left_collapse = true;
-                                    }
                                     if has_ask_agent {
                                         ui.label(
                                             egui::RichText::new("!")
@@ -2608,6 +2762,16 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
                                     }
                                 });
+                                if show_left_toggle {
+                                    ui.with_layout(
+                                        egui::Layout::bottom_up(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button(">").clicked() {
+                                                toggle_left_collapse = true;
+                                            }
+                                        },
+                                    );
+                                }
                             });
                         }
                         LeftDrawerMode::Hidden => {}
@@ -2619,7 +2783,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .resizable(false)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
+                                    .fill(panel_color(theme.drawer_bg, ui_opacity))
                                     .inner_margin(12.0),
                             )
                             .show(ui, |ui| {
@@ -2628,8 +2792,14 @@ impl ApplicationHandler<UserEvent> for App {
                                         if ui.button("<- List").clicked() {
                                             close_browser_requested = true;
                                         }
-                                        if ui.button("External").clicked() {
-                                            open_url_target = Some(url.clone());
+                                        if url.starts_with("http://") || url.starts_with("https://") {
+                                            if ui.button("External").clicked() {
+                                                open_url_target = Some(url.clone());
+                                            }
+                                        } else if drawer_preview_item.is_some()
+                                            && ui.button("Raw").clicked()
+                                        {
+                                            show_raw_requested = true;
                                         }
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -2671,12 +2841,12 @@ impl ApplicationHandler<UserEvent> for App {
                                         ui.label(
                                             egui::RichText::new(&item.subtitle)
                                                 .small()
-                                                .color(Color32::from_rgb(0x7a, 0xa2, 0xf7)),
+                                                .color(pal.accent),
                                         );
                                     }
                                     ui.heading(
                                         egui::RichText::new(&item.title)
-                                            .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
+                                            .color(pal.fg),
                                     );
                                     if !item.actions.is_empty() {
                                         ui.horizontal_wrapped(|ui| {
@@ -2710,13 +2880,14 @@ impl ApplicationHandler<UserEvent> for App {
                                             render_markdown_preview(
                                                 ui,
                                                 item.body.as_deref().unwrap_or(""),
+                                                &pal,
                                             );
                                         });
                                     ui.separator();
                                     ui.label(
                                         egui::RichText::new("b/Esc: back to list | s: send to pane")
                                             .small()
-                                            .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                            .color(pal.muted),
                                     );
                                     return;
                                 }
@@ -2749,7 +2920,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 ui.horizontal(|ui| {
                                     ui.heading(
                                         egui::RichText::new(header_title)
-                                            .color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
+                                            .color(pal.fg),
                                     );
                                     if let Some(p) = enabled_plugins.get(active_plugin_idx)
                                         && !p.category.is_empty()
@@ -2757,7 +2928,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         ui.label(
                                             egui::RichText::new(format!("[{}]", p.category))
                                                 .small()
-                                                .color(Color32::from_rgb(0x7a, 0xa2, 0xf7)),
+                                                .color(pal.accent),
                                         );
                                     }
                                     ui.with_layout(
@@ -2828,7 +2999,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 if drawer_snapshot.is_loading {
                                     ui.label(
                                         egui::RichText::new("Loading plugin view...")
-                                            .color(Color32::from_rgb(0x82, 0xaa, 0xff)),
+                                            .color(pal.accent),
                                     );
                                 }
 
@@ -2846,7 +3017,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                 egui::RichText::new(
                                                     "No drawer plugins enabled in config.conductty",
                                                 )
-                                                .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                .color(pal.muted),
                                             );
                                             return;
                                         }
@@ -2867,6 +3038,9 @@ impl ApplicationHandler<UserEvent> for App {
                                             ui.separator();
                                         }
 
+                                        let show_send_to_pane = enabled_plugins
+                                            .get(active_plugin_idx)
+                                            .is_none_or(|p| p.show_send_to_pane);
                                         let mut global_idx = 0usize;
                                         for section in &drawer_snapshot.sections {
                                             render_drawer_section(
@@ -2875,12 +3049,14 @@ impl ApplicationHandler<UserEvent> for App {
                                                 &mut global_idx,
                                                 self.drawer_selected_idx,
                                                 scroll_to_selected,
+                                                show_send_to_pane,
                                                 &mut open_url_target,
                                                 &mut preview_url_target,
                                                 &mut preview_body_item,
                                                 &mut send_to_pane_text,
                                                 &mut invoke_action_target,
                                                 &mut prompt_action_target,
+                                                &pal,
                                             );
                                         }
                                     });
@@ -2891,7 +3067,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         "h/l: plugin | j/k: select | b: preview | o: open | s: send | r: refresh | q/Esc: close",
                                     )
                                     .small()
-                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                    .color(pal.muted),
                                 );
                             });
                     }
@@ -2901,7 +3077,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .exact_size(TAB_BAR_HEIGHT)
                             .frame(
                                 egui::Frame::new()
-                                    .fill(panel_color(0x18, 0x1a, 0x28, ui_opacity))
+                                    .fill(panel_color(theme.drawer_bg, ui_opacity))
                                     .inner_margin(egui::Margin::symmetric(8, 4)),
                             )
                             .show(ui, |ui| {
@@ -2909,12 +3085,12 @@ impl ApplicationHandler<UserEvent> for App {
                                     for (t_idx, (_tab_id, title)) in active_tabs.iter().enumerate() {
                                         let is_active = t_idx == active_tab_idx;
                                         let fill = if is_active {
-                                            Color32::from_rgb(0x3b, 0x42, 0x61)
+                                            pal.card_active
                                         } else {
-                                            Color32::from_rgb(0x24, 0x28, 0x3b)
+                                            pal.card
                                         };
                                         let stroke = if is_active {
-                                            Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0xa2, 0xf7))
+                                            Stroke::new(1.0_f32, pal.accent)
                                         } else {
                                             Stroke::NONE
                                         };
@@ -2927,9 +3103,9 @@ impl ApplicationHandler<UserEvent> for App {
                                             .show(ui, |ui| {
                                                 ui.horizontal(|ui| {
                                                     let label_color = if is_active {
-                                                        Color32::from_rgb(0xc8, 0xd3, 0xf5)
+                                                        pal.fg
                                                     } else {
-                                                        Color32::from_rgb(0x82, 0x8b, 0xb8)
+                                                        pal.muted
                                                     };
                                                     if ui
                                                         .add(
@@ -2949,9 +3125,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                             egui::Button::new(
                                                                 egui::RichText::new("x")
                                                                     .small()
-                                                                    .color(Color32::from_rgb(
-                                                                        0x82, 0x8b, 0xb8,
-                                                                    )),
+                                                                    .color(pal.muted),
                                                             )
                                                             .frame(false),
                                                         )
@@ -2967,7 +3141,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         .add(
                                             egui::Button::new(
                                                 egui::RichText::new("+")
-                                                    .color(Color32::from_rgb(0x7a, 0xa2, 0xf7)),
+                                                    .color(pal.accent),
                                             )
                                             .frame(false),
                                         )
@@ -3018,9 +3192,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 } else if is_focused && pane_resize_mode {
                                     Color32::from_rgb(0x7d, 0xcf, 0xff)
                                 } else if is_focused {
-                                    Color32::from_rgb(0x7a, 0xa2, 0xf7)
+                                    pal.accent
                                 } else {
-                                    Color32::from_rgb(0x3b, 0x42, 0x61)
+                                    pal.card_active
                                 };
                                 let border_width = if is_focused && (prefix_mode || pane_resize_mode) {
                                     2.5_f32
@@ -3061,7 +3235,22 @@ impl ApplicationHandler<UserEvent> for App {
                                             &font_id,
                                             is_focused,
                                             selection.filter(|(p, _, _)| p == pane_id),
+                                            &theme,
                                         );
+                                        if is_focused {
+                                            ime_cursor_rect = Some(render_ime_preedit(
+                                                &painter,
+                                                snap,
+                                                rect,
+                                                pad_x,
+                                                pad_y,
+                                                char_w,
+                                                row_h,
+                                                &font_id,
+                                                &theme,
+                                                ime_preedit.as_ref(),
+                                            ));
+                                        }
                                     }
                                 } else if let Some(runtime) = self.panes.get(pane_id) {
                                     if (target_cols, target_rows) != runtime.last_size {
@@ -3081,7 +3270,22 @@ impl ApplicationHandler<UserEvent> for App {
                                             &font_id,
                                             is_focused,
                                             selection.filter(|(p, _, _)| p == pane_id),
+                                            &theme,
                                         );
+                                        if is_focused {
+                                            ime_cursor_rect = Some(render_ime_preedit(
+                                                &painter,
+                                                &snap,
+                                                rect,
+                                                pad_x,
+                                                pad_y,
+                                                char_w,
+                                                row_h,
+                                                &font_id,
+                                                &theme,
+                                                ime_preedit.as_ref(),
+                                            ));
+                                        }
                                         if self.config.features.kitty_graphics {
                                             let pid_val = *pane_id;
                                             self.kitty_textures.retain(|(pid, img_id), _| {
@@ -3260,7 +3464,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     egui::Align2::RIGHT_TOP,
                                     label,
                                     FontId::new(12.0, FontFamily::Monospace),
-                                    Color32::from_rgb(0x82, 0x8b, 0xb8),
+                                    pal.muted,
                                 );
                             }
                         });
@@ -3274,8 +3478,8 @@ impl ApplicationHandler<UserEvent> for App {
                             .fixed_size(Vec2::new(520.0, 420.0))
                             .frame(
                                 egui::Frame::window(ui.style())
-                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
-                                    .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0x7a, 0xa2, 0xf7)))
+                                    .fill(panel_color(theme.drawer_bg, ui_opacity))
+                                    .stroke(Stroke::new(1.5_f32, pal.accent))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::same(14)),
                             )
@@ -3289,7 +3493,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         })
                                         .strong()
                                         .size(15.0)
-                                        .color(Color32::from_rgb(0x82, 0xaa, 0xff)),
+                                        .color(pal.accent),
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -3300,15 +3504,15 @@ impl ApplicationHandler<UserEvent> for App {
                                                     go_to_items.len()
                                                 ))
                                                 .small()
-                                                .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                .color(pal.muted),
                                             );
                                         },
                                     );
                                 });
                                 ui.add_space(6.0);
                                 egui::Frame::NONE
-                                    .fill(panel_color(0x19, 0x1b, 0x29, ui_opacity))
-                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x3b, 0x42, 0x61)))
+                                    .fill(panel_color(theme.drawer_bg, ui_opacity))
+                                    .stroke(Stroke::new(1.0_f32, pal.card_active))
                                     .corner_radius(4.0)
                                     .inner_margin(egui::Margin::symmetric(8, 6))
                                     .show(ui, |ui| {
@@ -3321,9 +3525,9 @@ impl ApplicationHandler<UserEvent> for App {
                                             format!("/{go_to_query}")
                                         };
                                         let color = if go_to_query.is_empty() && !go_to_filtering {
-                                            Color32::from_rgb(0x63, 0x6d, 0xa6)
+                                            pal.dim
                                         } else {
-                                            Color32::from_rgb(0xc8, 0xd3, 0xf5)
+                                            pal.fg
                                         };
                                         ui.label(
                                             egui::RichText::new(prompt)
@@ -3340,7 +3544,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         if go_to_items.is_empty() {
                                             ui.label(
                                                 egui::RichText::new("No matching panes")
-                                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                    .color(pal.muted),
                                             );
                                             return;
                                         }
@@ -3365,7 +3569,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             }
                                             let is_selected = idx == go_to_selected_idx;
                                             let row_bg = if is_selected {
-                                                Color32::from_rgb(0x2f, 0x33, 0x4d)
+                                                pal.card
                                             } else {
                                                 Color32::TRANSPARENT
                                             };
@@ -3391,9 +3595,9 @@ impl ApplicationHandler<UserEvent> for App {
                                                             .monospace()
                                                             .size(13.0)
                                                             .color(if is_selected {
-                                                                Color32::from_rgb(0xff, 0xff, 0xff)
+                                                                pal.accent
                                                             } else {
-                                                                Color32::from_rgb(0xc8, 0xd3, 0xf5)
+                                                                pal.fg
                                                             }),
                                                         );
                                                     });
@@ -3414,7 +3618,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         "j/k: move   /: filter   Enter: jump   q/Esc: close",
                                     )
                                     .small()
-                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                    .color(pal.muted),
                                 );
                             });
                     }
@@ -3471,6 +3675,20 @@ impl ApplicationHandler<UserEvent> for App {
                                     ("Close Modal", kb_snapshot.go_to_close.clone()),
                                 ],
                             ),
+                            (
+                                "Right Drawer (Plugins)",
+                                vec![
+                                    ("Next Item", kb_snapshot.drawer_next.clone()),
+                                    ("Prev Item", kb_snapshot.drawer_prev.clone()),
+                                    ("Next Plugin", kb_snapshot.drawer_next_plugin.clone()),
+                                    ("Prev Plugin", kb_snapshot.drawer_prev_plugin.clone()),
+                                    ("Preview (In-App)", kb_snapshot.drawer_preview.clone()),
+                                    ("Open (Browser)", kb_snapshot.drawer_open.clone()),
+                                    ("Send to Pane", kb_snapshot.drawer_send_to_pane.clone()),
+                                    ("Refresh", kb_snapshot.drawer_refresh.clone()),
+                                    ("Close Drawer", kb_snapshot.drawer_close.clone()),
+                                ],
+                            ),
                         ];
                         egui::Window::new("keybind_hints_modal")
                             .title_bar(false)
@@ -3480,7 +3698,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .fixed_size(Vec2::new(560.0, 460.0))
                             .frame(
                                 egui::Frame::window(ui.style())
-                                    .fill(panel_color(0x1e, 0x20, 0x30, ui_opacity))
+                                    .fill(panel_color(theme.drawer_bg, ui_opacity))
                                     .stroke(Stroke::new(1.5_f32, Color32::from_rgb(0xff, 0x9e, 0x64)))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::same(16)),
@@ -3499,7 +3717,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             ui.label(
                                                 egui::RichText::new("j/k: scroll   Esc: close")
                                                     .small()
-                                                    .color(Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                                                    .color(pal.muted),
                                             );
                                         },
                                     );
@@ -3517,7 +3735,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                 egui::RichText::new(*heading)
                                                     .strong()
                                                     .size(13.0)
-                                                    .color(Color32::from_rgb(0x82, 0xaa, 0xff)),
+                                                    .color(pal.accent),
                                             );
                                             for (label, keys) in rows {
                                                 ui.horizontal(|ui| {
@@ -3525,7 +3743,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                         egui::RichText::new(format!("{label:<24}"))
                                                             .monospace()
                                                             .size(12.5)
-                                                            .color(Color32::from_rgb(0xa9, 0xb1, 0xd6)),
+                                                            .color(pal.muted),
                                                     );
                                                     ui.label(
                                                         egui::RichText::new(keys)
@@ -3561,8 +3779,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // 「あ」固定になるのを防ぐため、端末用 IME 出力を常に Some に保つ
                 let mut platform_output = std::mem::take(&mut full_output.platform_output);
                 if platform_output.ime.is_none() {
-                    let cursor_rect =
-                        Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(10.0, 20.0));
+                    let cursor_rect = ime_cursor_rect.unwrap_or_else(|| {
+                        Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(10.0, 20.0))
+                    });
                     platform_output.ime = Some(egui::output::IMEOutput {
                         purpose: egui::IMEPurpose::Terminal,
                         rect: cursor_rect,
@@ -3638,10 +3857,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.handle_action(Action::ToggleLeftDrawerCollapse);
                     need_redraw = true;
                 }
-                if new_ws_requested {
-                    self.handle_action(Action::NewWorkspace);
-                    need_redraw = true;
-                }
                 if let Some(ws_idx) = switch_ws_target {
                     if self.config.features.multiplexer_mode {
                         self.send_mux_action(MuxRequest::SwitchWorkspace { idx: ws_idx });
@@ -3700,11 +3915,15 @@ impl ApplicationHandler<UserEvent> for App {
                     self.router.mode = InputMode::Normal;
                     need_redraw = true;
                 }
-                if close_browser_requested {
+                if close_browser_requested || show_raw_requested {
                     if self.browser.take().is_some()
                         && let Some(w) = &self.window
                     {
                         w.focus_window();
+                    }
+                    // Raw は本文テキスト表示へ、<- List はリストへ戻る
+                    if close_browser_requested {
+                        self.drawer_preview_item = None;
                     }
                     need_redraw = true;
                 }
@@ -3714,7 +3933,7 @@ impl ApplicationHandler<UserEvent> for App {
                     need_redraw = true;
                 }
                 if let Some(item) = preview_body_item {
-                    self.drawer_preview_item = Some(item);
+                    self.open_body_preview(item);
                     need_redraw = true;
                 }
                 if cancel_action_prompt {
@@ -3796,7 +4015,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-fn parse_drawer_accent(hex: Option<&str>) -> Color32 {
+fn parse_drawer_accent(hex: Option<&str>, fallback: Color32) -> Color32 {
     if let Some(s) = hex {
         let h = s.trim().trim_start_matches('#');
         if h.len() == 6
@@ -3809,7 +4028,7 @@ fn parse_drawer_accent(hex: Option<&str>) -> Color32 {
             return Color32::from_rgb(r, g, b);
         }
     }
-    Color32::from_rgb(0x7a, 0xa2, 0xf7)
+    fallback
 }
 
 fn build_markdown_inline_job(text: &str, size: f32, base_color: Color32) -> egui::text::LayoutJob {
@@ -3820,6 +4039,13 @@ fn build_markdown_inline_job(text: &str, size: f32, base_color: Color32) -> egui
     let len = chars.len();
     let mut i = 0usize;
     let mut plain_buf = String::new();
+    // 太字は本文色より一段強く: 暗色テーマでは白、明色テーマでは黒
+    let strong_color =
+        if base_color.r() as u16 + base_color.g() as u16 + base_color.b() as u16 > 384 {
+            Color32::WHITE
+        } else {
+            Color32::BLACK
+        };
 
     let flush_plain = |buf: &mut String, job: &mut LayoutJob| {
         if !buf.is_empty() {
@@ -3849,7 +4075,7 @@ fn build_markdown_inline_job(text: &str, size: f32, base_color: Color32) -> egui
                 TextFormat {
                     font_id: FontId::new((size - 1.0).max(11.0), FontFamily::Monospace),
                     color: Color32::from_rgb(0xff, 0x9e, 0x64),
-                    background: Color32::from_rgb(0x24, 0x28, 0x3b),
+                    background: base_color.gamma_multiply(0.15),
                     ..Default::default()
                 },
             );
@@ -3868,7 +4094,7 @@ fn build_markdown_inline_job(text: &str, size: f32, base_color: Color32) -> egui
                     0.0,
                     TextFormat {
                         font_id: FontId::new(size + 0.5, FontFamily::Proportional),
-                        color: Color32::from_rgb(0xff, 0xff, 0xff),
+                        color: strong_color,
                         ..Default::default()
                     },
                 );
@@ -3888,8 +4114,8 @@ fn build_markdown_inline_job(text: &str, size: f32, base_color: Color32) -> egui
                     0.0,
                     TextFormat {
                         font_id: FontId::new(size, FontFamily::Proportional),
-                        color: Color32::from_rgb(0x63, 0x6d, 0xa6),
-                        strikethrough: Stroke::new(1.0, Color32::from_rgb(0x82, 0x8b, 0xb8)),
+                        color: base_color.gamma_multiply(0.6),
+                        strikethrough: Stroke::new(1.0, base_color.gamma_multiply(0.75)),
                         ..Default::default()
                     },
                 );
@@ -3955,7 +4181,7 @@ fn split_markdown_table_row(line: &str) -> Vec<&str> {
     inner.split('|').map(str::trim).collect()
 }
 
-fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
+fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str, pal: &UiPalette) {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut idx = 0usize;
 
@@ -3966,8 +4192,8 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
         let fm_lines = &lines[1..1 + end_rel];
         if !fm_lines.is_empty() {
             egui::Frame::new()
-                .fill(Color32::from_rgb(0x24, 0x28, 0x3b))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x3b, 0x42, 0x61)))
+                .fill(pal.card)
+                .stroke(Stroke::new(1.0, pal.card_active))
                 .corner_radius(4.0)
                 .inner_margin(8.0)
                 .show(ui, |ui| {
@@ -3992,7 +4218,7 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
         idx = 1 + end_rel + 1;
     }
 
-    let body_color = Color32::from_rgb(0xc8, 0xd3, 0xf5);
+    let body_color = pal.fg;
 
     while idx < lines.len() {
         let line = lines[idx];
@@ -4018,19 +4244,14 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
             }
             let code_text = code_lines.join("\n");
             egui::Frame::new()
-                .fill(Color32::from_rgb(0x16, 0x16, 0x1e))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x3b, 0x42, 0x61)))
+                .fill(pal.drawer)
+                .stroke(Stroke::new(1.0, pal.card_active))
                 .corner_radius(4.0)
                 .inner_margin(8.0)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if !lang.is_empty() {
-                            ui.label(
-                                egui::RichText::new(lang)
-                                    .small()
-                                    .strong()
-                                    .color(Color32::from_rgb(0x7a, 0xa2, 0xf7)),
-                            );
+                            ui.label(egui::RichText::new(lang).small().strong().color(pal.accent));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Copy").clicked() {
@@ -4070,8 +4291,8 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
             }
             if !rows.is_empty() {
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(0x24, 0x28, 0x3b))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x3b, 0x42, 0x61)))
+                    .fill(pal.card)
+                    .stroke(Stroke::new(1.0, pal.card_active))
                     .corner_radius(4.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
@@ -4081,11 +4302,8 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
                             .show(ui, |ui| {
                                 for (r_idx, row) in rows.iter().enumerate() {
                                     for cell in row {
-                                        let color = if r_idx == 0 {
-                                            Color32::from_rgb(0x7a, 0xa2, 0xf7)
-                                        } else {
-                                            body_color
-                                        };
+                                        let color =
+                                            if r_idx == 0 { pal.accent } else { body_color };
                                         let size = if r_idx == 0 { 13.5 } else { 13.0 };
                                         render_markdown_inline(ui, cell, size, color);
                                     }
@@ -4110,14 +4328,14 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
         // Headings
         if let Some(h1) = trimmed.strip_prefix("# ") {
             ui.add_space(6.0);
-            render_markdown_inline(ui, h1.trim(), 19.0, Color32::from_rgb(0x7a, 0xa2, 0xf7));
+            render_markdown_inline(ui, h1.trim(), 19.0, pal.accent);
             ui.separator();
             idx += 1;
             continue;
         }
         if let Some(h2) = trimmed.strip_prefix("## ") {
             ui.add_space(6.0);
-            render_markdown_inline(ui, h2.trim(), 16.5, Color32::from_rgb(0x82, 0xaa, 0xff));
+            render_markdown_inline(ui, h2.trim(), 16.5, pal.accent);
             ui.separator();
             idx += 1;
             continue;
@@ -4139,17 +4357,12 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
         if let Some(quote) = trimmed.strip_prefix('>') {
             let quote_text = quote.trim_start();
             egui::Frame::new()
-                .fill(Color32::from_rgb(0x24, 0x28, 0x3b))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x7a, 0xa2, 0xf7)))
+                .fill(pal.card)
+                .stroke(Stroke::new(1.0, pal.accent))
                 .corner_radius(3.0)
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .show(ui, |ui| {
-                    render_markdown_inline(
-                        ui,
-                        quote_text,
-                        13.5,
-                        Color32::from_rgb(0xa9, 0xb1, 0xd6),
-                    );
+                    render_markdown_inline(ui, quote_text, 13.5, pal.muted);
                 });
             idx += 1;
             continue;
@@ -4167,11 +4380,7 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
                 if indent_px > 0.0 {
                     ui.add_space(indent_px);
                 }
-                ui.label(
-                    egui::RichText::new("☐")
-                        .color(Color32::from_rgb(0x82, 0x8b, 0xb8))
-                        .strong(),
-                );
+                ui.label(egui::RichText::new("☐").color(pal.muted).strong());
                 render_markdown_inline(ui, unchecked, 13.5, body_color);
             });
             idx += 1;
@@ -4191,7 +4400,7 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
                         .color(Color32::from_rgb(0xc3, 0xe8, 0x8d))
                         .strong(),
                 );
-                render_markdown_inline(ui, checked, 13.5, Color32::from_rgb(0x82, 0x8b, 0xb8));
+                render_markdown_inline(ui, checked, 13.5, pal.muted);
             });
             idx += 1;
             continue;
@@ -4205,11 +4414,7 @@ fn render_markdown_preview(ui: &mut egui::Ui, markdown: &str) {
                 if indent_px > 0.0 {
                     ui.add_space(indent_px);
                 }
-                ui.label(
-                    egui::RichText::new("•")
-                        .color(Color32::from_rgb(0x7a, 0xa2, 0xf7))
-                        .strong(),
-                );
+                ui.label(egui::RichText::new("•").color(pal.accent).strong());
                 render_markdown_inline(ui, bullet, 13.5, body_color);
             });
             idx += 1;
@@ -4228,14 +4433,16 @@ fn render_drawer_section(
     global_idx: &mut usize,
     selected_idx: usize,
     scroll_to_selected: bool,
-    open_url_target: &mut Option<String>,
-    preview_url_target: &mut Option<String>,
+    show_send_to_pane: bool,
+    _open_url_target: &mut Option<String>,
+    _preview_url_target: &mut Option<String>,
     preview_body_item: &mut Option<DrawerItem>,
     send_to_pane_text: &mut Option<String>,
     invoke_action_target: &mut Option<(String, Option<String>, Option<String>)>,
     prompt_action_target: &mut Option<(String, Option<String>, String)>,
+    pal: &UiPalette,
 ) {
-    let accent = parse_drawer_accent(section.accent.as_deref());
+    let accent = parse_drawer_accent(section.accent.as_deref(), pal.accent);
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         ui.label(
@@ -4258,11 +4465,7 @@ fn render_drawer_section(
         }
     });
     if section.items.is_empty() {
-        ui.label(
-            egui::RichText::new("  None")
-                .small()
-                .color(Color32::from_rgb(0x63, 0x6d, 0xa6)),
-        );
+        ui.label(egui::RichText::new("  None").small().color(pal.dim));
         return;
     }
 
@@ -4271,12 +4474,12 @@ fn render_drawer_section(
         *global_idx += 1;
 
         let fill = if is_selected {
-            Color32::from_rgb(0x3b, 0x42, 0x61)
+            pal.card_active
         } else {
-            Color32::from_rgb(0x2f, 0x33, 0x4d)
+            pal.card
         };
         let stroke = if is_selected {
-            Stroke::new(1.5_f32, Color32::from_rgb(0x7a, 0xa2, 0xf7))
+            Stroke::new(1.5_f32, pal.accent)
         } else {
             Stroke::NONE
         };
@@ -4287,6 +4490,7 @@ fn render_drawer_section(
             .corner_radius(4.0)
             .inner_margin(8.0)
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 if !item.subtitle.is_empty() || item.badge.is_some() {
                     ui.horizontal(|ui| {
                         if let Some(badge) = &item.badge
@@ -4300,45 +4504,46 @@ fn render_drawer_section(
                             );
                         }
                         if !item.subtitle.is_empty() {
-                            ui.label(egui::RichText::new(&item.subtitle).small().color(accent));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&item.subtitle).small().color(accent),
+                                )
+                                .truncate(),
+                            );
                         }
                     });
                 }
                 ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&item.title).color(Color32::from_rgb(0xc8, 0xd3, 0xf5)),
-                    )
-                    .selectable(true),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    if item.body.as_ref().is_some_and(|b| !b.is_empty()) {
-                        if ui.small_button("View").clicked() {
+                    egui::Label::new(egui::RichText::new(&item.title).color(pal.fg))
+                        .truncate()
+                        .selectable(true),
+                )
+                .on_hover_text(&item.title);
+                let has_body = item.body.as_ref().is_some_and(|b| !b.is_empty());
+                if has_body || show_send_to_pane || !item.actions.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        if has_body && ui.small_button("View").clicked() {
                             *preview_body_item = Some(item.clone());
                         }
-                    } else if !item.url.is_empty() && ui.small_button("Preview").clicked() {
-                        *preview_url_target = Some(item.url.clone());
-                    }
-                    if !item.url.is_empty() && ui.small_button("Open").clicked() {
-                        *open_url_target = Some(item.url.clone());
-                    }
-                    if ui.small_button("Send to Pane").clicked() {
-                        *send_to_pane_text = Some(format_item_for_pane(item));
-                    }
-                    for act in &item.actions {
-                        if ui.small_button(&act.label).clicked() {
-                            if act.needs_input {
-                                *prompt_action_target = Some((
-                                    act.id.clone(),
-                                    Some(item.id.clone()),
-                                    act.input_placeholder.clone().unwrap_or_default(),
-                                ));
-                            } else {
-                                *invoke_action_target =
-                                    Some((act.id.clone(), Some(item.id.clone()), None));
+                        if show_send_to_pane && ui.small_button("Send to Pane").clicked() {
+                            *send_to_pane_text = Some(format_item_for_pane(item));
+                        }
+                        for act in &item.actions {
+                            if ui.small_button(&act.label).clicked() {
+                                if act.needs_input {
+                                    *prompt_action_target = Some((
+                                        act.id.clone(),
+                                        Some(item.id.clone()),
+                                        act.input_placeholder.clone().unwrap_or_default(),
+                                    ));
+                                } else {
+                                    *invoke_action_target =
+                                        Some((act.id.clone(), Some(item.id.clone()), None));
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             });
         if is_selected && scroll_to_selected {
             frame_resp.response.scroll_to_me(None);
@@ -4359,8 +4564,12 @@ fn render_grid_snapshot(
     font_id: &FontId,
     is_focused: bool,
     selection: Option<PaneSelection>,
+    theme: &ResolvedTheme,
 ) {
     let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
+    // 既定前景色のセルはテーマの前景色で描く（Light テーマで文字が読めるように）
+    let default_fg = term_core::grid::Cell::default().fg;
+    let theme_fg = rgb(theme.fg);
 
     for row in 0..snap.rows {
         let y = rect.y + pad_y + row as f32 * row_h;
@@ -4422,7 +4631,11 @@ fn render_grid_snapshot(
                 col += 1;
                 continue;
             }
-            let fg_color = Color32::from_rgb(cell.fg.r, cell.fg.g, cell.fg.b);
+            let fg_color = if cell.fg == default_fg {
+                theme_fg
+            } else {
+                Color32::from_rgb(cell.fg.r, cell.fg.g, cell.fg.b)
+            };
             if is_box_drawing_char(ch) {
                 let cell_rect = Rect::from_min_size(
                     Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
@@ -4460,9 +4673,95 @@ fn render_grid_snapshot(
         painter.rect_filled(
             cursor_rect,
             0.0,
-            Color32::from_rgba_unmultiplied(0x82, 0xaa, 0xff, 160),
+            Color32::from_rgba_unmultiplied(theme.cursor[0], theme.cursor[1], theme.cursor[2], 160),
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_ime_preedit(
+    painter: &egui::Painter,
+    snap: &GridSnapshot,
+    rect: &CoreRect,
+    pad_x: f32,
+    pad_y: f32,
+    char_w: f32,
+    row_h: f32,
+    font_id: &FontId,
+    theme: &term_core::config::ResolvedTheme,
+    preedit: Option<&(String, Option<(usize, usize)>)>,
+) -> Rect {
+    let cx = rect.x + pad_x + snap.cursor_col as f32 * char_w;
+    let cy = rect.y + pad_y + snap.cursor_row as f32 * row_h;
+    let base_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(char_w, row_h));
+
+    let Some((text, cursor_range)) = preedit else {
+        return base_rect;
+    };
+    if text.is_empty() {
+        return base_rect;
+    }
+
+    let fg = Color32::from_rgb(theme.fg[0], theme.fg[1], theme.fg[2]);
+    let bg = Color32::from_rgb(theme.bg[0], theme.bg[1], theme.bg[2]);
+    let accent = Color32::from_rgb(theme.accent[0], theme.accent[1], theme.accent[2]);
+
+    let galley = painter.layout_no_wrap(text.clone(), font_id.clone(), fg);
+    let text_w = galley.size().x.max(char_w);
+    let box_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(text_w, row_h));
+
+    // 未確定文字列の背景を塗りつぶし、下線とテキストを描画する
+    painter.rect_filled(box_rect, 0.0, bg);
+    painter.galley(Pos2::new(cx, cy), galley, fg);
+
+    let underline_y = cy + row_h - 1.5;
+    painter.line_segment(
+        [
+            Pos2::new(cx, underline_y),
+            Pos2::new(cx + text_w, underline_y),
+        ],
+        Stroke::new(1.5, accent),
+    );
+
+    // 変換カーソル／選択範囲の強調表示
+    let ime_x = if let Some((start, end)) = cursor_range {
+        let prefix = text.get(..*start).unwrap_or("");
+        let prefix_w = if prefix.is_empty() {
+            0.0
+        } else {
+            painter
+                .layout_no_wrap(prefix.to_string(), font_id.clone(), fg)
+                .size()
+                .x
+        };
+        if end > start
+            && let Some(seg) = text.get(*start..*end)
+        {
+            let seg_w = painter
+                .layout_no_wrap(seg.to_string(), font_id.clone(), fg)
+                .size()
+                .x
+                .max(2.0);
+            painter.line_segment(
+                [
+                    Pos2::new(cx + prefix_w, underline_y),
+                    Pos2::new(cx + prefix_w + seg_w, underline_y),
+                ],
+                Stroke::new(2.5, fg),
+            );
+        } else {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(cx + prefix_w, cy), Vec2::new(2.0, row_h)),
+                0.0,
+                accent,
+            );
+        }
+        cx + prefix_w
+    } else {
+        cx + text_w
+    };
+
+    Rect::from_min_size(Pos2::new(ime_x, cy), Vec2::new(char_w, row_h))
 }
 
 #[derive(Debug, Clone)]
@@ -5051,6 +5350,8 @@ fn print_cli_help() {
   focus <pane_id>                   Focus a pane
   kill-pane <pane_id>               Close a pane
   kill-space <idx_or_name>          Close a space (except Master Space)
+  theme [list]                      Pick a theme with live preview (plain list when piped)
+  theme <name>                      Save theme to config and apply it to running conductty
   update [--check] [--force]        Update conductty from the latest GitHub release
   version | --version | -V          Print version"
     );
@@ -5082,6 +5383,65 @@ fn send_cli_action_ok(
     }
 }
 
+fn run_theme_cli(args: &[String], rt: &tokio::runtime::Runtime) -> i32 {
+    // `conductty theme Tokyo Night Storm` のように引用符なしの複数語も受け付ける
+    let name = args[2..].join(" ");
+    let canonical = if name.is_empty() || name == "list" {
+        use std::io::IsTerminal;
+        let current = AppConfig::load().appearance.theme;
+        if !(cfg!(unix) && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            theme_picker::print_list(&current);
+            return 0;
+        }
+        // ライブプレビュー: conductty 未起動なら接続失敗を無視して色見本だけで操作できる
+        let preview = |theme: &str| {
+            let req = MuxRequest::SetTheme {
+                theme: theme.to_string(),
+            };
+            let _ = rt.block_on(send_request(DEFAULT_IPC_ADDR, &req));
+        };
+        match theme_picker::run(&current, &preview) {
+            Ok(Some(selected)) => selected,
+            result => {
+                preview(&current);
+                if let Err(err) = result {
+                    eprintln!("error: {err}");
+                    return 1;
+                }
+                println!("theme unchanged: {current}");
+                return 0;
+            }
+        }
+    } else {
+        let Some((canonical, _)) = resolve_theme_preset(&name) else {
+            eprintln!("error: unknown theme: {name}");
+            theme_picker::print_list(&AppConfig::load().appearance.theme);
+            return 1;
+        };
+        canonical
+    };
+    match AppConfig::save_theme_to_config(canonical) {
+        Ok(path) => println!("saved theme \"{canonical}\" to {}", path.display()),
+        Err(err) => {
+            eprintln!("error: {err}");
+            return 1;
+        }
+    }
+    // テーマは GUI 側で描画するため、mux サーバーを経由せず GUI の IPC に直接送る
+    let req = MuxRequest::SetTheme {
+        theme: canonical.to_string(),
+    };
+    match rt.block_on(send_request(DEFAULT_IPC_ADDR, &req)) {
+        Ok(MuxResponse::Ok { .. }) => println!("applied to running conductty"),
+        Ok(MuxResponse::Error { message }) => {
+            eprintln!("warning: running conductty did not apply the theme: {message}")
+        }
+        Ok(other) => eprintln!("warning: unexpected response: {other:?}"),
+        Err(_) => println!("conductty is not running; the theme will be used on next launch"),
+    }
+    0
+}
+
 fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i32> {
     let sub = args.get(1)?.as_str();
     let sub2 = args.get(2).map(String::as_str);
@@ -5095,6 +5455,7 @@ fn run_cli_subcommand(args: &[String], rt: &tokio::runtime::Runtime) -> Option<i
             Some(0)
         }
         ("update", _) => Some(updater::run(&args[2..])),
+        ("theme", _) => Some(run_theme_cli(args, rt)),
         ("panes", _) | ("pane", Some("list")) => {
             match send_ipc_with_wsl_fallback(args, &MuxRequest::ListPanes, rt) {
                 Ok(MuxResponse::Panes { panes }) => {
@@ -5482,11 +5843,13 @@ fn main() {
         clipboard: arboard::Clipboard::new().ok(),
         browser: None,
         pending_browser_url: None,
+        pending_browser_html: None,
         browser_error: None,
         kitty_textures: HashMap::new(),
         router,
         modifiers: ModifiersState::empty(),
         suppress_next_ime_commit: false,
+        ime_preedit: None,
         last_terminal_area: None,
         pty_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         window_focused: true,
@@ -5499,6 +5862,15 @@ fn main() {
     let _ = event_loop.run_app(&mut app);
 }
 
+/// キー入力/IME を常に egui へ渡すと Tab でウィジェット間フォーカス移動が起きるため、TextEdit 編集中のみ渡す
+fn should_forward_event_to_egui(is_text_editing: bool, event: &WindowEvent) -> bool {
+    is_text_editing
+        || !matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+        )
+}
+
 fn should_throttle_agent_scan(elapsed: std::time::Duration) -> bool {
     elapsed < std::time::Duration::from_millis(250)
 }
@@ -5506,6 +5878,27 @@ fn should_throttle_agent_scan(elapsed: std::time::Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use term_core::config::THEME_PRESETS;
+
+    #[test]
+    fn egui_receives_key_and_ime_events_only_while_text_editing() {
+        // winit の KeyEvent は外部から構築できないため、同じ分岐の Ime で検証する
+        let ime = WindowEvent::Ime(winit::event::Ime::Commit("a".into()));
+        assert!(!should_forward_event_to_egui(false, &ime));
+        assert!(should_forward_event_to_egui(true, &ime));
+
+        let non_key = [
+            WindowEvent::ModifiersChanged(winit::event::Modifiers::default()),
+            WindowEvent::Resized(winit::dpi::PhysicalSize::new(800, 600)),
+            WindowEvent::CursorLeft {
+                device_id: winit::event::DeviceId::dummy(),
+            },
+        ];
+        for ev in &non_key {
+            assert!(should_forward_event_to_egui(false, ev));
+            assert!(should_forward_event_to_egui(true, ev));
+        }
+    }
 
     struct NoNav;
     impl PerformableContext for NoNav {
@@ -5604,5 +5997,17 @@ mod tests {
         assert!(!should_throttle_agent_scan(
             std::time::Duration::from_millis(250)
         ));
+    }
+
+    #[test]
+    fn light_presets_use_light_visuals() {
+        for name in THEME_PRESETS {
+            let (_, theme) = resolve_theme_preset(name).unwrap();
+            let expect_light = matches!(
+                *name,
+                "Solarized Light" | "GitHub Light" | "Gruvbox Light" | "Tokyo Night Day"
+            );
+            assert_eq!(is_light_theme(&theme), expect_light, "{name}");
+        }
     }
 }

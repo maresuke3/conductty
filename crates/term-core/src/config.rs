@@ -41,6 +41,7 @@ pub struct DrawerPluginConfig {
     pub command: String,
     pub args: Vec<String>,
     pub enabled: bool,
+    pub show_send_to_pane: bool,
     pub config: toml::Value,
 }
 
@@ -53,6 +54,7 @@ impl Default for DrawerPluginConfig {
             command: "conductty-plugin-github".to_string(),
             args: Vec::new(),
             enabled: true,
+            show_send_to_pane: true,
             config: toml::Value::Table(toml::map::Map::new()),
         }
     }
@@ -68,6 +70,7 @@ pub fn default_plugins() -> Vec<DrawerPluginConfig> {
             command: "conductty-plugin-docs".to_string(),
             args: Vec::new(),
             enabled: true,
+            show_send_to_pane: true,
             config: toml::Value::Table(toml::map::Map::new()),
         },
     ]
@@ -88,6 +91,7 @@ pub enum LeftDrawerMode {
 pub struct FeaturesConfig {
     pub multiplexer_mode: bool,
     pub left_drawer_mode: LeftDrawerMode,
+    pub left_drawer_toggle_button: bool,
     pub right_drawer: bool,
     pub right_drawer_default_open: bool,
     pub embedded_browser: bool,
@@ -139,6 +143,15 @@ pub struct KeybindsConfig {
     pub goto_right: String,
     pub toggle_left_drawer: String,
     pub toggle_right_drawer: String,
+    pub drawer_next: String,
+    pub drawer_prev: String,
+    pub drawer_next_plugin: String,
+    pub drawer_prev_plugin: String,
+    pub drawer_preview: String,
+    pub drawer_open: String,
+    pub drawer_send_to_pane: String,
+    pub drawer_refresh: String,
+    pub drawer_close: String,
     pub go_to: String,
     pub go_to_next: String,
     pub go_to_prev: String,
@@ -180,6 +193,7 @@ impl Default for FeaturesConfig {
         Self {
             multiplexer_mode: false,
             left_drawer_mode: LeftDrawerMode::Always,
+            left_drawer_toggle_button: true,
             right_drawer: true,
             right_drawer_default_open: false,
             embedded_browser: true,
@@ -227,6 +241,15 @@ impl Default for KeybindsConfig {
             goto_right: "performable:ctrl+l".to_string(),
             toggle_left_drawer: "ctrl+shift+e".to_string(),
             toggle_right_drawer: "ctrl+shift+g".to_string(),
+            drawer_next: "j, down".to_string(),
+            drawer_prev: "k, up".to_string(),
+            drawer_next_plugin: "l, right, tab".to_string(),
+            drawer_prev_plugin: "h, left, shift+tab".to_string(),
+            drawer_preview: "enter, b".to_string(),
+            drawer_open: "ctrl+enter, cmd+enter, o".to_string(),
+            drawer_send_to_pane: "s".to_string(),
+            drawer_refresh: "r".to_string(),
+            drawer_close: "esc, q".to_string(),
             go_to: "ctrl+shift+space".to_string(),
             go_to_next: "j, down, ctrl+j, ctrl+n".to_string(),
             go_to_prev: "k, up, ctrl+k, ctrl+p".to_string(),
@@ -450,6 +473,62 @@ fn apply_os_overrides(
     Ok(())
 }
 
+fn update_theme_in_toml_text(raw: &str, theme_name: &str) -> String {
+    let escaped = theme_name.replace('\\', "\\\\").replace('"', "\\\"");
+    let new_line = format!("theme = \"{escaped}\"");
+    let mut out = Vec::new();
+    let mut in_appearance = false;
+    let mut saw_appearance = false;
+    let mut replaced = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_appearance && !replaced {
+                out.push(new_line.clone());
+                replaced = true;
+            }
+            in_appearance = trimmed.split('#').next().unwrap_or("").trim() == "[appearance]";
+            if in_appearance {
+                saw_appearance = true;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if in_appearance
+            && !trimmed.starts_with('#')
+            && trimmed
+                .strip_prefix("theme")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            if !replaced {
+                out.push(new_line.clone());
+                replaced = true;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    if in_appearance && !replaced {
+        out.push(new_line.clone());
+        replaced = true;
+    }
+    if !replaced && !saw_appearance {
+        if !out.is_empty() && !out.last().is_some_and(|l| l.is_empty()) {
+            out.push(String::new());
+        }
+        out.push("[appearance]".to_string());
+        out.push(new_line);
+    }
+
+    let mut result = out.join("\n");
+    if raw.ends_with('\n') || !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
 #[cfg(test)]
 fn load_toml_with_include(path: &Path, depth: u8) -> Result<toml::Value, String> {
     load_toml_with_include_for_os(path, depth, TargetOs::current())
@@ -512,6 +591,173 @@ fn load_toml_with_include_inner(
     Ok(val)
 }
 
+/// 利用可能なビルトインテーマ名一覧（正規名称）
+pub const THEME_PRESETS: &[&str] = &[
+    "Solarized Dark",
+    "Solarized Light",
+    "Dracula",
+    "GitHub Dark",
+    "GitHub Light",
+    "Gruvbox Dark",
+    "Gruvbox Light",
+    "Gruvbox Material",
+    "Tokyo Night",
+    "Tokyo Night Day",
+    "Tokyo Night Moon",
+    "Tokyo Night Night",
+    "Tokyo Night Storm",
+];
+
+fn normalize_theme_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// テーマ名から正規名称と ResolvedTheme を解決する（大文字小文字・空白・ハイフン無視）
+pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)> {
+    match normalize_theme_key(name).as_str() {
+        "solarizeddark" => Some((
+            "Solarized Dark",
+            ResolvedTheme {
+                bg: [0x00, 0x2b, 0x36],
+                fg: [0x83, 0x94, 0x96],
+                accent: [0x26, 0x8b, 0xd2],
+                drawer_bg: [0x00, 0x21, 0x2b],
+                card_bg: [0x07, 0x36, 0x42],
+                cursor: [0x93, 0xa1, 0xa1],
+            },
+        )),
+        "solarizedlight" => Some((
+            "Solarized Light",
+            ResolvedTheme {
+                bg: [0xfd, 0xf6, 0xe3],
+                fg: [0x58, 0x6e, 0x75],
+                accent: [0x26, 0x8b, 0xd2],
+                drawer_bg: [0xee, 0xe8, 0xd5],
+                card_bg: [0xe4, 0xdd, 0xc8],
+                cursor: [0x65, 0x7b, 0x83],
+            },
+        )),
+        "dracula" => Some((
+            "Dracula",
+            ResolvedTheme {
+                bg: [0x28, 0x2a, 0x36],
+                fg: [0xf8, 0xf8, 0xf2],
+                accent: [0xbd, 0x93, 0xf9],
+                drawer_bg: [0x21, 0x22, 0x2c],
+                card_bg: [0x34, 0x37, 0x46],
+                cursor: [0xff, 0x79, 0xc6],
+            },
+        )),
+        "githubdark" => Some((
+            "GitHub Dark",
+            ResolvedTheme {
+                bg: [0x0d, 0x11, 0x17],
+                fg: [0xe6, 0xed, 0xf3],
+                accent: [0x58, 0xa6, 0xff],
+                drawer_bg: [0x01, 0x04, 0x09],
+                card_bg: [0x16, 0x1b, 0x22],
+                cursor: [0x58, 0xa6, 0xff],
+            },
+        )),
+        "githublight" => Some((
+            "GitHub Light",
+            ResolvedTheme {
+                bg: [0xff, 0xff, 0xff],
+                fg: [0x1f, 0x23, 0x28],
+                accent: [0x09, 0x69, 0xda],
+                drawer_bg: [0xf6, 0xf8, 0xfa],
+                card_bg: [0xea, 0xee, 0xf2],
+                cursor: [0x09, 0x69, 0xda],
+            },
+        )),
+        "gruvboxdark" | "gruvbox" => Some((
+            "Gruvbox Dark",
+            ResolvedTheme {
+                bg: [0x28, 0x28, 0x28],
+                fg: [0xeb, 0xdb, 0xb2],
+                accent: [0xfe, 0x80, 0x19],
+                drawer_bg: [0x1d, 0x20, 0x21],
+                card_bg: [0x3c, 0x38, 0x36],
+                cursor: [0xfb, 0xf1, 0xc7],
+            },
+        )),
+        "gruvboxlight" => Some((
+            "Gruvbox Light",
+            ResolvedTheme {
+                bg: [0xfb, 0xf1, 0xc7],
+                fg: [0x3c, 0x38, 0x36],
+                accent: [0xd6, 0x5d, 0x0e],
+                drawer_bg: [0xf2, 0xe5, 0xbc],
+                card_bg: [0xeb, 0xdb, 0xb2],
+                cursor: [0x3c, 0x38, 0x36],
+            },
+        )),
+        "gruvboxmaterial" => Some((
+            "Gruvbox Material",
+            ResolvedTheme {
+                bg: [0x29, 0x28, 0x28],
+                fg: [0xd4, 0xbe, 0x98],
+                accent: [0xe7, 0x8a, 0x4e],
+                drawer_bg: [0x1d, 0x20, 0x21],
+                card_bg: [0x32, 0x30, 0x2f],
+                cursor: [0xd4, 0xbe, 0x98],
+            },
+        )),
+        "tokyonight" | "tokyonightnight" => Some((
+            if normalize_theme_key(name) == "tokyonightnight" {
+                "Tokyo Night Night"
+            } else {
+                "Tokyo Night"
+            },
+            ResolvedTheme {
+                bg: [0x1a, 0x1b, 0x26],
+                fg: [0xc0, 0xca, 0xf5],
+                accent: [0x7a, 0xa2, 0xf7],
+                drawer_bg: [0x16, 0x16, 0x1e],
+                card_bg: [0x24, 0x28, 0x3b],
+                cursor: [0xc0, 0xca, 0xf5],
+            },
+        )),
+        "tokyonightday" => Some((
+            "Tokyo Night Day",
+            ResolvedTheme {
+                bg: [0xe1, 0xe2, 0xe7],
+                fg: [0x37, 0x60, 0xbf],
+                accent: [0x2e, 0x7d, 0xe9],
+                drawer_bg: [0xd0, 0xd5, 0xe3],
+                card_bg: [0xc4, 0xc8, 0xda],
+                cursor: [0x37, 0x60, 0xbf],
+            },
+        )),
+        "tokyonightstorm" => Some((
+            "Tokyo Night Storm",
+            ResolvedTheme {
+                bg: [0x24, 0x28, 0x3b],
+                fg: [0xc0, 0xca, 0xf5],
+                accent: [0x7a, 0xa2, 0xf7],
+                drawer_bg: [0x1f, 0x23, 0x35],
+                card_bg: [0x29, 0x2e, 0x42],
+                cursor: [0xc0, 0xca, 0xf5],
+            },
+        )),
+        "tokyonightmoon" => Some((
+            "Tokyo Night Moon",
+            ResolvedTheme {
+                bg: [0x22, 0x24, 0x36],
+                fg: [0xc8, 0xd3, 0xf5],
+                accent: [0x7a, 0xa2, 0xf7],
+                drawer_bg: [0x1e, 0x20, 0x30],
+                card_bg: [0x2f, 0x33, 0x4d],
+                cursor: [0x82, 0xaa, 0xff],
+            },
+        )),
+        _ => None,
+    }
+}
+
 impl AppConfig {
     pub fn load() -> Self {
         Self::load_for_os(TargetOs::current())
@@ -555,34 +801,46 @@ impl AppConfig {
         val.try_into()
     }
 
+    pub fn active_config_path() -> Option<PathBuf> {
+        let home = resolve_home_dir()?;
+        let paths = config_search_paths_for_os(&home, TargetOs::current());
+        paths.iter().find(|p| p.is_file()).cloned().or_else(|| {
+            Some(
+                home.join(".config")
+                    .join("conductty")
+                    .join("config.conductty"),
+            )
+        })
+    }
+
+    pub fn save_theme_to_config(theme_name: &str) -> Result<PathBuf, String> {
+        let path = Self::active_config_path()
+            .ok_or_else(|| "設定ファイルの保存先ホームディレクトリが見つかりません".to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("設定ディレクトリ作成失敗: {e}"))?;
+        }
+        let existing = if path.is_file() {
+            std::fs::read_to_string(&path).map_err(|e| format!("設定ファイル読み込み失敗: {e}"))?
+        } else {
+            String::new()
+        };
+        let updated = update_theme_in_toml_text(&existing, theme_name);
+        std::fs::write(&path, updated).map_err(|e| format!("設定ファイル書き込み失敗: {e}"))?;
+        Ok(path)
+    }
+
     pub fn resolve_theme(&self) -> ResolvedTheme {
-        let mut base = match self.appearance.theme.to_lowercase().as_str() {
-            "tokyonight" | "tokyo night" => ResolvedTheme {
-                bg: [0x1a, 0x1b, 0x26],
-                fg: [0xc0, 0xca, 0xf5],
-                accent: [0x7a, 0xa2, 0xf7],
-                drawer_bg: [0x16, 0x16, 0x1e],
-                card_bg: [0x24, 0x28, 0x3b],
-                cursor: [0x7a, 0xa2, 0xf7],
-            },
-            "solarized dark" => ResolvedTheme {
-                bg: [0x00, 0x2b, 0x36],
-                fg: [0x83, 0x94, 0x96],
-                accent: [0x26, 0x8b, 0xd2],
-                drawer_bg: [0x00, 0x21, 0x2b],
-                card_bg: [0x07, 0x36, 0x42],
-                cursor: [0x93, 0xa1, 0xa1],
-            },
-            // Default: TokyoNight Moon
-            _ => ResolvedTheme {
+        let mut base = resolve_theme_preset(&self.appearance.theme)
+            .map(|(_, t)| t)
+            .unwrap_or(ResolvedTheme {
                 bg: [0x22, 0x24, 0x36],
                 fg: [0xc8, 0xd3, 0xf5],
                 accent: [0x7a, 0xa2, 0xf7],
                 drawer_bg: [0x1e, 0x20, 0x30],
                 card_bg: [0x2f, 0x33, 0x4d],
                 cursor: [0x82, 0xaa, 0xff],
-            },
-        };
+            });
 
         if let Some(hex) = self.theme.background.as_deref().and_then(parse_hex_rgb) {
             base.bg = hex;
@@ -846,5 +1104,44 @@ windows_default_prog = ["wsl.exe", "--cd", "~"]
         let dir_err = load_toml_with_include(&dir, 0).unwrap_err();
         assert!(dir_err.contains("not a regular file"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_theme_presets_resolve_and_update_toml() {
+        for preset in THEME_PRESETS {
+            let (canonical, _) = resolve_theme_preset(preset).expect("preset should resolve");
+            assert_eq!(canonical, *preset);
+        }
+        assert_eq!(
+            resolve_theme_preset("tokyo-night-storm").map(|(n, _)| n),
+            Some("Tokyo Night Storm")
+        );
+        assert_eq!(
+            resolve_theme_preset("solarized light").map(|(n, _)| n),
+            Some("Solarized Light")
+        );
+        assert_eq!(
+            resolve_theme_preset("gruvbox-material").map(|(n, _)| n),
+            Some("Gruvbox Material")
+        );
+
+        let raw = "[features]\nright_drawer = true\n\n[appearance]\ntheme = \"TokyoNight Moon\"\nfont_size = 18.0\n";
+        let updated = update_theme_in_toml_text(raw, "Dracula");
+        assert!(updated.contains("theme = \"Dracula\""));
+        assert!(!updated.contains("TokyoNight Moon"));
+        assert!(updated.contains("font_size = 18.0"));
+
+        // [[plugins]] 内の theme キーは触らず、[appearance] 側に追記する
+        let raw = "[appearance]\nfont_size = 18.0\n\n[[plugins]]\ntheme = \"keep\"\n";
+        let updated = update_theme_in_toml_text(raw, "GitHub Light");
+        let v: toml::Value = toml::from_str(&updated).expect("valid toml");
+        assert_eq!(v["appearance"]["theme"].as_str(), Some("GitHub Light"));
+        assert_eq!(v["plugins"][0]["theme"].as_str(), Some("keep"));
+
+        // [appearance] が無ければ新設する
+        let updated = update_theme_in_toml_text("[features]\nright_drawer = true\n", "Dracula");
+        let v: toml::Value = toml::from_str(&updated).expect("valid toml");
+        assert_eq!(v["appearance"]["theme"].as_str(), Some("Dracula"));
+        assert_eq!(v["features"]["right_drawer"].as_bool(), Some(true));
     }
 }
