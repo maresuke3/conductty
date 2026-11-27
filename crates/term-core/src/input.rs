@@ -32,6 +32,14 @@ pub enum KeyCode {
     Down,
     Left,
     Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    /// F1〜F12
+    F(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +201,8 @@ pub struct InputRouter {
     pub prefix_bindings: Vec<KeyBinding>,
     pub go_to_bindings: Vec<(KeyBinding, GoToCommand)>,
     pub right_drawer_bindings: Vec<KeyBinding>,
+    /// フォーカス中のペインがカーソルキーのアプリケーションモード (DECCKM) か。キーを送る前にアプリが入れる
+    pub app_cursor_keys: bool,
 }
 
 impl Default for InputRouter {
@@ -305,6 +315,7 @@ impl InputRouter {
             prefix_bindings,
             go_to_bindings,
             right_drawer_bindings,
+            app_cursor_keys: false,
         }
     }
 
@@ -552,36 +563,104 @@ impl InputRouter {
         }
     }
 
+    /// キーを PTY に送るバイト列にする（xterm / Ghostty と同じ形）
     fn encode_vt_bytes(&self, event: &KeyEvent) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
         let treat_as_alt = event.mods.alt && (!self.macos_left_option_as_alt || event.left_alt);
+        // xterm の修飾キーの番号: 1 + Shift(1) + Alt(2) + Ctrl(4)
+        let m = 1 + event.mods.shift as u8 + 2 * treat_as_alt as u8 + 4 * event.mods.ctrl as u8;
+        let seq = |s: String| Some(s.into_bytes());
+        match event.code {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Right
+            | KeyCode::Left
+            | KeyCode::Home
+            | KeyCode::End => {
+                let c = match event.code {
+                    KeyCode::Up => 'A',
+                    KeyCode::Down => 'B',
+                    KeyCode::Right => 'C',
+                    KeyCode::Left => 'D',
+                    KeyCode::Home => 'H',
+                    _ => 'F',
+                };
+                return if m > 1 {
+                    seq(format!("\x1b[1;{m}{c}"))
+                } else if self.app_cursor_keys {
+                    seq(format!("\x1bO{c}"))
+                } else {
+                    seq(format!("\x1b[{c}"))
+                };
+            }
+            KeyCode::F(n @ 1..=4) => {
+                let c = ['P', 'Q', 'R', 'S'][n as usize - 1];
+                return if m > 1 {
+                    seq(format!("\x1b[1;{m}{c}"))
+                } else {
+                    seq(format!("\x1bO{c}"))
+                };
+            }
+            KeyCode::Insert
+            | KeyCode::Delete
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::F(_) => {
+                let n = match event.code {
+                    KeyCode::Insert => 2,
+                    KeyCode::Delete => 3,
+                    KeyCode::PageUp => 5,
+                    KeyCode::PageDown => 6,
+                    KeyCode::F(5) => 15,
+                    KeyCode::F(f @ 6..=10) => f + 11,
+                    KeyCode::F(f @ 11..=12) => f + 12,
+                    _ => return None,
+                };
+                return if m > 1 {
+                    seq(format!("\x1b[{n};{m}~"))
+                } else {
+                    seq(format!("\x1b[{n}~"))
+                };
+            }
+            KeyCode::Tab if event.mods.shift => return seq("\x1b[Z".to_string()),
+            _ => {}
+        }
+
+        let mut out = Vec::new();
         if treat_as_alt {
             out.push(0x1b);
         }
-
         match event.code {
-            KeyCode::Char(c) => {
-                if event.mods.ctrl && c.is_ascii_alphabetic() {
-                    let ctrl_byte = (c.to_ascii_lowercase() as u8) - b'a' + 1;
-                    out.push(ctrl_byte);
-                } else {
+            KeyCode::Char(c) => match ctrl_byte(c).filter(|_| event.mods.ctrl) {
+                Some(b) => out.push(b),
+                None => {
                     let mut buf = [0u8; 4];
-                    let s = c.encode_utf8(&mut buf);
-                    out.extend_from_slice(s.as_bytes());
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 }
-            }
+            },
             KeyCode::Enter => out.push(b'\r'),
             KeyCode::Escape => out.push(0x1b),
-            KeyCode::Backspace => out.push(0x7f),
+            KeyCode::Backspace => out.push(if event.mods.ctrl { 0x08 } else { 0x7f }),
             KeyCode::Tab => out.push(b'\t'),
-            KeyCode::Space => out.push(b' '),
+            KeyCode::Space => out.push(if event.mods.ctrl { 0x00 } else { b' ' }),
             KeyCode::Backquote => out.push(b'`'),
-            KeyCode::Up => out.extend_from_slice(b"\x1b[A"),
-            KeyCode::Down => out.extend_from_slice(b"\x1b[B"),
-            KeyCode::Right => out.extend_from_slice(b"\x1b[C"),
-            KeyCode::Left => out.extend_from_slice(b"\x1b[D"),
+            _ => return None,
         }
         Some(out)
+    }
+}
+
+/// Ctrl+キーで送る制御文字（xterm と同じ。Ctrl+2〜8 は Ctrl+@ / [ / \\ / ] / ^ / _ / ? と同じ）
+fn ctrl_byte(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        c @ 'a'..='z' => Some(c as u8 - b'a' + 1),
+        '@' | '2' => Some(0x00),
+        '[' | '3' => Some(0x1b),
+        '\\' | '4' => Some(0x1c),
+        ']' | '5' => Some(0x1d),
+        '^' | '6' => Some(0x1e),
+        '_' | '7' | '/' => Some(0x1f),
+        '?' | '8' => Some(0x7f),
+        _ => None,
     }
 }
 
@@ -605,6 +684,68 @@ mod tests {
             shift,
             logo: false,
         }
+    }
+
+    #[test]
+    fn encodes_special_keys_like_xterm() {
+        let router = InputRouter::default();
+        let enc = |code, m: Modifiers| {
+            let ev = KeyEvent {
+                code,
+                mods: m,
+                left_alt: true,
+            };
+            String::from_utf8(router.encode_vt_bytes(&ev).unwrap()).unwrap()
+        };
+        let none = mods(false, false, false);
+        let cases = [
+            (KeyCode::Up, none, "\x1b[A"),
+            (KeyCode::Up, mods(true, false, false), "\x1b[1;5A"),
+            (KeyCode::Right, mods(false, true, true), "\x1b[1;4C"),
+            (KeyCode::Home, none, "\x1b[H"),
+            (KeyCode::End, mods(false, false, true), "\x1b[1;2F"),
+            (KeyCode::Insert, none, "\x1b[2~"),
+            (KeyCode::Delete, none, "\x1b[3~"),
+            (KeyCode::PageUp, none, "\x1b[5~"),
+            (KeyCode::PageDown, mods(false, false, true), "\x1b[6;2~"),
+            (KeyCode::F(1), none, "\x1bOP"),
+            (KeyCode::F(4), mods(false, false, true), "\x1b[1;2S"),
+            (KeyCode::F(5), none, "\x1b[15~"),
+            (KeyCode::F(6), none, "\x1b[17~"),
+            (KeyCode::F(10), none, "\x1b[21~"),
+            (KeyCode::F(11), none, "\x1b[23~"),
+            (KeyCode::F(12), mods(true, false, false), "\x1b[24;5~"),
+            (KeyCode::Tab, mods(false, false, true), "\x1b[Z"),
+            (KeyCode::Space, mods(true, false, false), "\x00"),
+            (KeyCode::Backspace, mods(true, false, false), "\x08"),
+            (KeyCode::Char('['), mods(true, false, false), "\x1b"),
+            (KeyCode::Char('/'), mods(true, false, false), "\x1f"),
+            (KeyCode::Char('a'), mods(true, false, false), "\x01"),
+            (KeyCode::Char('x'), mods(false, true, false), "\x1bx"),
+        ];
+        for (code, m, expected) in cases {
+            assert_eq!(enc(code.clone(), m), expected, "{code:?} {m:?}");
+        }
+    }
+
+    #[test]
+    fn app_cursor_keys_send_ss3_without_modifiers() {
+        let router = InputRouter {
+            app_cursor_keys: true,
+            ..InputRouter::default()
+        };
+        let enc = |code, m| {
+            let ev = KeyEvent {
+                code,
+                mods: m,
+                left_alt: false,
+            };
+            router.encode_vt_bytes(&ev).unwrap()
+        };
+        assert_eq!(enc(KeyCode::Up, mods(false, false, false)), b"\x1bOA");
+        assert_eq!(enc(KeyCode::End, mods(false, false, false)), b"\x1bOF");
+        // 修飾キーがあれば CSI のまま
+        assert_eq!(enc(KeyCode::Left, mods(true, false, false)), b"\x1b[1;5D");
     }
 
     #[test]
