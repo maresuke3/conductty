@@ -125,6 +125,11 @@ pub struct ThemeColorsConfig {
     pub drawer_background: Option<String>,
     pub card_background: Option<String>,
     pub cursor: Option<String>,
+    /// Ghostty と同じ "N=#rrggbb"（N は 0〜255）
+    pub palette: Vec<String>,
+    pub cursor_text: Option<String>,
+    pub selection_background: Option<String>,
+    pub selection_foreground: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +195,11 @@ pub struct ResolvedTheme {
     pub cursor: [u8; 3],
     /// 256色のパレット（ANSI の 0〜15 と、256色の 16〜255）
     pub palette: [[u8; 3]; 256],
+    /// カーソルの下の文字の色。None ならカーソルを半透明で重ねて文字を透かす
+    pub cursor_text: Option<[u8; 3]>,
+    /// 選択範囲の背景・文字の色。背景が None なら半透明の色を重ねる
+    pub selection_bg: Option<[u8; 3]>,
+    pub selection_fg: Option<[u8; 3]>,
 }
 
 /// プリセットが見つからないときの TokyoNight Moon
@@ -203,6 +213,9 @@ impl Default for ResolvedTheme {
             card_bg: [0x2f, 0x33, 0x4d],
             cursor: [0x82, 0xaa, 0xff],
             palette: DEFAULT_PALETTE,
+            cursor_text: None,
+            selection_bg: None,
+            selection_fg: None,
         }
     }
 }
@@ -655,6 +668,80 @@ fn normalize_theme_key(name: &str) -> String {
         .collect()
 }
 
+/// テーマ名からテーマを決める。プリセットに無い名前は Ghostty 形式のテーマファイルとして探す
+/// （`~/.config/conductty/themes/<名前>`、または絶対パス）
+pub fn find_theme(name: &str) -> Option<(String, ResolvedTheme)> {
+    if let Some((canonical, theme)) = resolve_theme_preset(name) {
+        return Some((canonical.to_string(), theme));
+    }
+    let text = std::fs::read_to_string(theme_file_path(name)?).ok()?;
+    Some((name.to_string(), parse_ghostty_theme(&text)))
+}
+
+fn theme_file_path(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    // 名前は themes の中のファイルだけを指す（IPC からも渡るため、外のファイルへ出られないようにする）
+    if name.is_empty() || name.contains(['/', '\\']) || name == ".." {
+        return None;
+    }
+    resolve_home_dir().map(|home| home.join(".config/conductty/themes").join(name))
+}
+
+/// Ghostty のテーマファイル（`key = value` の行）を読む。知らない項目は無視する
+pub fn parse_ghostty_theme(text: &str) -> ResolvedTheme {
+    let mut theme = ResolvedTheme::default();
+    let mut cursor = None;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if key == "palette" {
+            if let Some((i, color)) = parse_palette_entry(value) {
+                theme.palette[i] = color;
+            }
+            continue;
+        }
+        let Some(color) = parse_hex_rgb(value) else {
+            continue;
+        };
+        match key {
+            "background" => theme.bg = color,
+            "foreground" => theme.fg = color,
+            "cursor-color" => cursor = Some(color),
+            "cursor-text" => theme.cursor_text = Some(color),
+            "selection-background" => theme.selection_bg = Some(color),
+            "selection-foreground" => theme.selection_fg = Some(color),
+            _ => {}
+        }
+    }
+    // Ghostty に無い conductty の画面の色は、テーマの色から決める
+    theme.cursor = cursor.unwrap_or(theme.fg);
+    theme.accent = cursor.unwrap_or(theme.palette[4]);
+    theme.drawer_bg = mix_rgb(theme.bg, [0, 0, 0], 0.3);
+    theme.card_bg = mix_rgb(theme.bg, theme.fg, 0.1);
+    theme
+}
+
+/// Ghostty の `palette` の値（"N=#rrggbb"）を読む
+fn parse_palette_entry(value: &str) -> Option<(usize, [u8; 3])> {
+    let (index, color) = value.split_once('=')?;
+    Some((
+        index.trim().parse::<u8>().ok()? as usize,
+        parse_hex_rgb(color)?,
+    ))
+}
+
+fn mix_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
+}
+
 /// テーマ名から正規名称と ResolvedTheme を解決する（大文字小文字・空白・ハイフン無視）
 pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)> {
     match normalize_theme_key(name).as_str() {
@@ -883,7 +970,7 @@ impl AppConfig {
     }
 
     pub fn resolve_theme(&self) -> ResolvedTheme {
-        let mut base = resolve_theme_preset(&self.appearance.theme)
+        let mut base = find_theme(&self.appearance.theme)
             .map(|(_, t)| t)
             .unwrap_or_default();
 
@@ -914,6 +1001,33 @@ impl AppConfig {
         }
         if let Some(hex) = self.theme.cursor.as_deref().and_then(parse_hex_rgb) {
             base.cursor = hex;
+        }
+        for (i, color) in self
+            .theme
+            .palette
+            .iter()
+            .filter_map(|v| parse_palette_entry(v))
+        {
+            base.palette[i] = color;
+        }
+        if let Some(hex) = self.theme.cursor_text.as_deref().and_then(parse_hex_rgb) {
+            base.cursor_text = Some(hex);
+        }
+        if let Some(hex) = self
+            .theme
+            .selection_background
+            .as_deref()
+            .and_then(parse_hex_rgb)
+        {
+            base.selection_bg = Some(hex);
+        }
+        if let Some(hex) = self
+            .theme
+            .selection_foreground
+            .as_deref()
+            .and_then(parse_hex_rgb)
+        {
+            base.selection_fg = Some(hex);
         }
         base
     }
@@ -960,6 +1074,66 @@ mod tests {
             theme.cell_colors(&cell(Color::Indexed(1), Color::Default, true)),
             (theme.bg, Some([0xff, 0x00, 0x55]))
         );
+    }
+
+    #[test]
+    fn parses_ghostty_theme_file() {
+        let theme = parse_ghostty_theme(
+            "# comment\n\
+             palette = 1=#ff0055\n\
+             palette = 200=00ffff\n\
+             background = #0a0a0f\n\
+             foreground = #d4b3f7\n\
+             cursor-color = #00ffff\n\
+             cursor-text = #0a0a0f\n\
+             selection-background = #004d4d\n\
+             selection-foreground = #0a0a0f\n\
+             font-size = 14\n",
+        );
+        assert_eq!(theme.palette[1], [0xff, 0x00, 0x55]);
+        assert_eq!(theme.palette[200], [0x00, 0xff, 0xff]);
+        // 書かれていない番号は既定のまま
+        assert_eq!(theme.palette[2], DEFAULT_PALETTE[2]);
+        assert_eq!(
+            (theme.bg, theme.fg),
+            ([0x0a, 0x0a, 0x0f], [0xd4, 0xb3, 0xf7])
+        );
+        assert_eq!(
+            (theme.cursor, theme.accent),
+            ([0x00, 0xff, 0xff], [0x00, 0xff, 0xff])
+        );
+        assert_eq!(theme.cursor_text, Some([0x0a, 0x0a, 0x0f]));
+        assert_eq!(theme.selection_bg, Some([0x00, 0x4d, 0x4d]));
+        assert_eq!(theme.selection_fg, Some([0x0a, 0x0a, 0x0f]));
+    }
+
+    #[test]
+    fn theme_file_path_stays_in_themes_dir_unless_absolute() {
+        assert_eq!(theme_file_path(""), None);
+        assert_eq!(theme_file_path(".."), None);
+        assert_eq!(theme_file_path("../config.conductty"), None);
+        assert_eq!(theme_file_path("a/b"), None);
+        assert_eq!(
+            theme_file_path("/tmp/my-theme"),
+            Some(PathBuf::from("/tmp/my-theme"))
+        );
+        assert!(
+            theme_file_path("cyberpunk-icy")
+                .is_some_and(|p| p.ends_with(".config/conductty/themes/cyberpunk-icy"))
+        );
+    }
+
+    #[test]
+    fn theme_section_overrides_palette_and_selection() {
+        let mut config = AppConfig::default();
+        config.theme.palette = vec!["1=#ff0055".to_string(), "300=#000000".to_string()];
+        config.theme.selection_background = Some("#004d4d".to_string());
+        config.theme.cursor_text = Some("#0a0a0f".to_string());
+        let theme = config.resolve_theme();
+        assert_eq!(theme.palette[1], [0xff, 0x00, 0x55]);
+        assert_eq!(theme.selection_bg, Some([0x00, 0x4d, 0x4d]));
+        assert_eq!(theme.selection_fg, None);
+        assert_eq!(theme.cursor_text, Some([0x0a, 0x0a, 0x0f]));
     }
 
     #[test]

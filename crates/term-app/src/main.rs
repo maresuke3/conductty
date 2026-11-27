@@ -16,7 +16,7 @@ use browser::{BrowserBounds, EmbeddedBrowser};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
 use markdown_html::{markdown_contains_mermaid, render_markdown_to_html};
 use term_core::agent::{AgentStatus, PaneAgentState, detect_pane_agent, snapshot_visible_lines};
-use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme, resolve_theme_preset};
+use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme, find_theme};
 use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::input::{
     Action, GoToCommand, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode,
@@ -851,12 +851,12 @@ impl App {
                 }
             }
             MuxRequest::SetTheme { theme } => {
-                let Some((name, _)) = resolve_theme_preset(&theme) else {
+                let Some((name, _)) = find_theme(&theme) else {
                     return MuxResponse::Error {
                         message: format!("unknown theme: {theme}"),
                     };
                 };
-                self.config.appearance.theme = name.to_string();
+                self.config.appearance.theme = name;
                 // [theme] の個別上書き色も維持するため resolve_theme() 経由で再計算する
                 self.theme = self.config.resolve_theme();
                 apply_theme_visuals(&self.egui_ctx, &self.theme);
@@ -4603,6 +4603,9 @@ fn render_grid_snapshot(
     let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
     // セルの色は番号・既定色のまま届くので、ここで今のテーマの色に決める
     let cell_bg = |c: usize| snap.cells.get(c).and_then(|cell| theme.cell_colors(cell).1);
+    let is_selected = |pos: (usize, usize)| sel_range.is_some_and(|(s, e)| pos >= s && pos <= e);
+    // cursor-text があるときは Ghostty と同じく、塗りつぶしたカーソルの上に文字をその色で描く
+    let solid_cursor = is_focused && snap.cursor_visible && theme.cursor_text.is_some();
 
     for row in 0..snap.rows {
         let y = rect.y + pad_y + row as f32 * row_h;
@@ -4629,21 +4632,23 @@ fn render_grid_snapshot(
             }
         }
 
-        if let Some((start, end)) = sel_range {
-            for col in 0..snap.cols {
-                let pos = (row, col);
-                if pos >= start && pos <= end {
-                    let sel_rect = Rect::from_min_size(
-                        Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
-                        Vec2::new(char_w, row_h),
-                    );
-                    painter.rect_filled(
-                        sel_rect,
-                        0.0,
-                        Color32::from_rgba_unmultiplied(0x3d, 0x59, 0xa1, 120),
-                    );
-                }
-            }
+        let sel_color = theme
+            .selection_bg
+            .map(rgb)
+            .unwrap_or(Color32::from_rgba_unmultiplied(0x3d, 0x59, 0xa1, 120));
+        for col in (0..snap.cols).filter(|&col| is_selected((row, col))) {
+            let sel_rect = Rect::from_min_size(
+                Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
+                Vec2::new(char_w, row_h),
+            );
+            painter.rect_filled(sel_rect, 0.0, sel_color);
+        }
+        if solid_cursor && row == snap.cursor_row {
+            let cursor_rect = Rect::from_min_size(
+                Pos2::new(rect.x + pad_x + snap.cursor_col as f32 * char_w, y),
+                Vec2::new(char_w, row_h),
+            );
+            painter.rect_filled(cursor_rect, 0.0, rgb(theme.cursor));
         }
 
         col = 0;
@@ -4656,7 +4661,14 @@ fn render_grid_snapshot(
                 col += 1;
                 continue;
             }
-            let fg_color = rgb(theme.cell_colors(cell).0);
+            let fg_color = if solid_cursor && (row, col) == (snap.cursor_row, snap.cursor_col) {
+                theme.cursor_text.map(rgb)
+            } else if is_selected((row, col)) {
+                theme.selection_fg.map(rgb)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| rgb(theme.cell_colors(cell).0));
             if is_box_drawing_char(ch) {
                 let cell_rect = Rect::from_min_size(
                     Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
@@ -4687,7 +4699,7 @@ fn render_grid_snapshot(
         }
     }
 
-    if is_focused && snap.cursor_visible {
+    if is_focused && snap.cursor_visible && !solid_cursor {
         let cx = rect.x + pad_x + snap.cursor_col as f32 * char_w;
         let cy = rect.y + pad_y + snap.cursor_row as f32 * row_h;
         let cursor_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(char_w, row_h));
@@ -5422,7 +5434,7 @@ fn run_theme_cli(args: &[String], rt: &tokio::runtime::Runtime) -> i32 {
             let _ = rt.block_on(send_request(DEFAULT_IPC_ADDR, &req));
         };
         match theme_picker::run(&current, &preview) {
-            Ok(Some(selected)) => selected,
+            Ok(Some(selected)) => selected.to_string(),
             result => {
                 preview(&current);
                 if let Err(err) = result {
@@ -5434,14 +5446,14 @@ fn run_theme_cli(args: &[String], rt: &tokio::runtime::Runtime) -> i32 {
             }
         }
     } else {
-        let Some((canonical, _)) = resolve_theme_preset(&name) else {
+        let Some((canonical, _)) = find_theme(&name) else {
             eprintln!("error: unknown theme: {name}");
             theme_picker::print_list(&AppConfig::load().appearance.theme);
             return 1;
         };
         canonical
     };
-    match AppConfig::save_theme_to_config(canonical) {
+    match AppConfig::save_theme_to_config(&canonical) {
         Ok(path) => println!("saved theme \"{canonical}\" to {}", path.display()),
         Err(err) => {
             eprintln!("error: {err}");
@@ -5449,9 +5461,7 @@ fn run_theme_cli(args: &[String], rt: &tokio::runtime::Runtime) -> i32 {
         }
     }
     // テーマは GUI 側で描画するため、mux サーバーを経由せず GUI の IPC に直接送る
-    let req = MuxRequest::SetTheme {
-        theme: canonical.to_string(),
-    };
+    let req = MuxRequest::SetTheme { theme: canonical };
     match rt.block_on(send_request(DEFAULT_IPC_ADDR, &req)) {
         Ok(MuxResponse::Ok { .. }) => println!("applied to running conductty"),
         Ok(MuxResponse::Error { message }) => {
@@ -5900,7 +5910,7 @@ fn should_throttle_agent_scan(elapsed: std::time::Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use term_core::config::THEME_PRESETS;
+    use term_core::config::{THEME_PRESETS, resolve_theme_preset};
 
     #[test]
     fn egui_receives_key_and_ime_events_only_while_text_editing() {

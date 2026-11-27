@@ -105,6 +105,7 @@ font_size = 18.0
 font_thicken = true
 adjust_cell_height = 2.0
 # プリセット: "TokyoNight Moon" / "TokyoNight" / "Solarized Dark"
+# プリセットに無い名前は Ghostty 形式のテーマファイル ~/.config/conductty/themes/<名前> を読む
 theme = "TokyoNight Moon"
 background_opacity = 0.85
 window_padding_x = 10.0
@@ -119,6 +120,10 @@ window_padding_balance = true
 # drawer_background = "#1e2030"
 # card_background = "#292e42"
 # cursor = "#c8d3f5"
+# cursor_text = "#222436"
+# selection_background = "#2d3f76"
+# selection_foreground = "#c8d3f5"
+# palette = ["1=#ff757f", "4=#82aaff"]
 
 # Windows でデフォルトシェルに WSL2 を使いたい場合のみコメントアウトを外す
 # [os.windows.shell]

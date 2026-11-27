@@ -38,6 +38,8 @@ adjust_cell_height = 2.0
 #   "GitHub Dark" / "GitHub Light"
 #   "Gruvbox Dark" / "Gruvbox Light" / "Gruvbox Material"
 #   "Tokyo Night" / "Tokyo Night Day" / "Tokyo Night Moon" / "Tokyo Night Night" / "Tokyo Night Storm"
+# プリセットに無い名前は、Ghostty 形式のテーマファイル ~/.config/conductty/themes/<名前>（または絶対パス）を読む
+#   例: Ghostty の themes フォルダから cyberpunk-icy をコピーして theme = "cyberpunk-icy"
 theme = "TokyoNight Moon"
 background_opacity = 1.0
 window_padding_x = 10.0
@@ -52,6 +54,10 @@ window_padding_balance = true
 # drawer_background = "#1e2030"
 # card_background = "#2f334d"
 # cursor = "#82aaff"
+# cursor_text = "#222436"           # カーソルの下の文字の色（指定するとカーソルを塗りつぶす）
+# selection_background = "#2d3f76"
+# selection_foreground = "#c8d3f5"
+# palette = ["1=#ff757f", "4=#82aaff"]  # Ghostty と同じ "番号=#RRGGBB"（番号は 0〜255）
 
 [keybinds]
 prefix = "ctrl+b"
