@@ -1163,10 +1163,14 @@ mod tests {
         assert_eq!(theme_file_path(".."), None);
         assert_eq!(theme_file_path("../config.conductty"), None);
         assert_eq!(theme_file_path("a/b"), None);
-        assert_eq!(
-            theme_file_path("/tmp/my-theme"),
-            Some(PathBuf::from("/tmp/my-theme"))
-        );
+        assert_eq!(theme_file_path("a\\b"), None);
+        // Windows はドライブ名の無いパスを絶対パスとみなさない
+        let absolute = if cfg!(windows) {
+            "C:\\themes\\my-theme"
+        } else {
+            "/tmp/my-theme"
+        };
+        assert_eq!(theme_file_path(absolute), Some(PathBuf::from(absolute)));
         assert!(
             theme_file_path("cyberpunk-icy")
                 .is_some_and(|p| p.ends_with(".config/conductty/themes/cyberpunk-icy"))
