@@ -112,6 +112,8 @@ window_padding_x = 10.0
 window_padding_y = 10.0
 window_padding_balance = true
 # bold_is_bright = false  # 太字の 0〜7 番の色を明るい 8〜15 番で描く
+# cursor_style = "block"   # "block" / "bar" / "underline" / "block_hollow"
+# cursor_style_blink = false  # 未指定なら点滅する
 
 # テーマ色を個別に上書きしたい場合
 # [theme]

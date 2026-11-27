@@ -128,6 +128,18 @@ pub enum MouseTracking {
     AnyEvent,
 }
 
+/// カーソルの形（Ghostty の cursor-style と同じ値）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+    /// 塗りつぶさない枠だけのブロック
+    BlockHollow,
+}
+
 /// アプリが CSI ? h / l で切り替える、キー・マウスの送り方のモード
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -143,6 +155,10 @@ pub struct TerminalModes {
     pub alt_scroll: bool,
     /// 代替画面 (?1049) を使っているか
     pub alt_screen: bool,
+    /// アプリが DECSCUSR (CSI Ps SP q) で決めたカーソルの形。None なら設定の形
+    pub cursor_style: Option<CursorStyle>,
+    /// アプリが決めたカーソルの点滅（DECSCUSR / ?12）。None なら設定に従う
+    pub cursor_blink: Option<bool>,
 }
 
 impl Default for TerminalModes {
@@ -154,6 +170,8 @@ impl Default for TerminalModes {
             focus_events: false,
             alt_scroll: true,
             alt_screen: false,
+            cursor_style: None,
+            cursor_blink: None,
         }
     }
 }
@@ -559,6 +577,8 @@ impl TerminalGrid {
     fn set_private_mode(&mut self, mode: u16, on: bool) {
         match mode {
             1 => self.modes.app_cursor_keys = on,
+            // カーソルの点滅 (AT&T 610)
+            12 => self.modes.cursor_blink = Some(on),
             9 | 1000 | 1002 | 1003 => {
                 self.modes.mouse_tracking = match (on, mode) {
                     (false, _) => MouseTracking::Off,
@@ -1181,6 +1201,19 @@ impl Perform for TerminalGrid {
             self.push_reply(reply.into_bytes());
             return;
         }
+        // DECSCUSR (CSI Ps SP q): カーソルの形。0 は設定に戻し、1・3・5 は点滅、2・4・6 は点滅しない
+        if intermediates == b" " && action == 'q' {
+            let (style, blink) = match first {
+                0 => (None, None),
+                1 | 2 => (Some(CursorStyle::Block), Some(first == 1)),
+                3 | 4 => (Some(CursorStyle::Underline), Some(first == 3)),
+                5 | 6 => (Some(CursorStyle::Bar), Some(first == 5)),
+                _ => return,
+            };
+            self.modes.cursor_style = style;
+            self.modes.cursor_blink = blink;
+            return;
+        }
         // NOTE: CSI > 4 ; 2 m（modifyOtherKeys）などを、記号の無い CSI m（SGR）として扱わない
         if intermediates.iter().any(|&b| b != b'?') {
             return;
@@ -1640,6 +1673,29 @@ mod tests {
                 ch: 'A',
                 ..Cell::default()
             }
+        );
+    }
+
+    #[test]
+    fn decscusr_and_mode_12_set_cursor_style_and_blink() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.feed_bytes(b"\x1b[6 q");
+        assert_eq!(
+            (grid.modes.cursor_style, grid.modes.cursor_blink),
+            (Some(CursorStyle::Bar), Some(false))
+        );
+        grid.feed_bytes(b"\x1b[3 q");
+        assert_eq!(
+            (grid.modes.cursor_style, grid.modes.cursor_blink),
+            (Some(CursorStyle::Underline), Some(true))
+        );
+        grid.feed_bytes(b"\x1b[?12l");
+        assert_eq!(grid.modes.cursor_blink, Some(false));
+        // 0 で設定の形に戻す
+        grid.feed_bytes(b"\x1b[0 q");
+        assert_eq!(
+            (grid.modes.cursor_style, grid.modes.cursor_blink),
+            (None, None)
         );
     }
 
