@@ -17,12 +17,15 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, S
 use markdown_html::{markdown_contains_mermaid, render_markdown_to_html};
 use term_core::agent::{AgentStatus, PaneAgentState, detect_pane_agent, snapshot_visible_lines};
 use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme, find_theme};
-use term_core::grid::{Cell, GridSnapshot, TerminalGrid, Underline};
+use term_core::grid::{Cell, GridSnapshot, MouseTracking, TerminalGrid, TerminalModes, Underline};
 use term_core::input::{
     Action, GoToCommand, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode,
     KeyEvent as CoreKeyEvent, Modifiers, PerformableContext,
 };
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
+use term_core::mouse::{
+    MouseAction, MouseButton as CoreMouseButton, MouseEvent as CoreMouseEvent, encode_mouse,
+};
 use term_core::pty::PtySession;
 use term_drawer::{
     DrawerEffect, DrawerItem, DrawerSection, DrawerSnapshot, fetch_plugin_snapshot,
@@ -396,6 +399,12 @@ struct App {
     cell_size: (f32, f32),
     selection: Option<PaneSelection>,
     selecting: bool,
+    /// アプリへマウスを報告しているときに押しているボタン（ドラッグの報告に使う）
+    mouse_button_down: Option<CoreMouseButton>,
+    /// 最後にマウスの動きを報告したセル。同じセルの中の動きは送らない
+    mouse_last_cell: Option<(PaneId, usize, usize)>,
+    /// フォーカスがあると知らせたペイン (?1004)
+    focus_reported: Option<PaneId>,
     clipboard: Option<arboard::Clipboard>,
     browser: Option<EmbeddedBrowser>,
     pending_browser_url: Option<String>,
@@ -1109,18 +1118,96 @@ impl App {
         }
     }
 
-    fn focused_app_cursor_keys(&self) -> bool {
-        let focused = self.manager.active_tab().focused_pane;
+    fn pane_modes(&self, pane_id: PaneId) -> TerminalModes {
         if self.config.features.multiplexer_mode {
             return self
                 .mux_snapshots
-                .get(&focused)
-                .is_some_and(|s| s.app_cursor_keys);
+                .get(&pane_id)
+                .map(|s| s.modes)
+                .unwrap_or_default();
         }
         self.panes
-            .get(&focused)
-            .and_then(|p| p.grid.lock().ok().map(|g| g.app_cursor_keys))
-            .unwrap_or(false)
+            .get(&pane_id)
+            .and_then(|p| p.grid.lock().ok().map(|g| g.modes))
+            .unwrap_or_default()
+    }
+
+    fn write_pane_bytes(&mut self, pane_id: PaneId, bytes: Vec<u8>) {
+        if self.config.features.multiplexer_mode {
+            let _ = self.rt.block_on(send_request(
+                DEFAULT_MUX_SERVER_ADDR,
+                &MuxRequest::WriteBytes { pane_id, bytes },
+            ));
+        } else if let Some(pane) = self.panes.get_mut(&pane_id) {
+            let _ = pane.pty.write_bytes(&bytes);
+        }
+    }
+
+    /// マウスの報告をアプリが求めていれば送る。送ったら true（選択などには使わない）
+    /// Ghostty と同じく、Shift を押しているときは送らずに選択に使う
+    fn report_mouse(&mut self, action: MouseAction, button: CoreMouseButton) -> bool {
+        // ペインの外で離したときも、最後に報告したセルで離したことを送る
+        let hit = self.hit_test_cell(self.cursor_pos).or(match action {
+            MouseAction::Release => self.mouse_last_cell,
+            _ => None,
+        });
+        let Some((pane_id, col, row)) = hit else {
+            return false;
+        };
+        let modes = self.pane_modes(pane_id);
+        if modes.mouse_tracking == MouseTracking::Off || self.modifiers.shift_key() {
+            return false;
+        }
+        if action == MouseAction::Motion && self.mouse_last_cell == Some((pane_id, col, row)) {
+            return true;
+        }
+        self.mouse_last_cell = Some((pane_id, col, row));
+        let is_button = matches!(
+            button,
+            CoreMouseButton::Left | CoreMouseButton::Middle | CoreMouseButton::Right
+        );
+        match action {
+            MouseAction::Press if is_button => {
+                self.manager.active_tab_mut().focused_pane = pane_id;
+                self.mouse_button_down = Some(button);
+            }
+            MouseAction::Release => self.mouse_button_down = None,
+            _ => {}
+        }
+        let ev = CoreMouseEvent {
+            action,
+            button,
+            col,
+            row,
+            shift: false,
+            alt: self.modifiers.alt_key(),
+            ctrl: self.modifiers.control_key(),
+        };
+        if let Some(bytes) = encode_mouse(modes.mouse_tracking, modes.mouse_sgr, &ev) {
+            self.write_pane_bytes(pane_id, bytes);
+        }
+        true
+    }
+
+    /// ウィンドウやペインのフォーカスが変わったら、求めているペインに CSI I / CSI O で知らせる (?1004)
+    fn sync_focus_events(&mut self) {
+        let target = self
+            .window_focused
+            .then(|| self.manager.active_tab().focused_pane);
+        if target == self.focus_reported {
+            return;
+        }
+        if let Some(old) = self.focus_reported
+            && self.pane_modes(old).focus_events
+        {
+            self.write_pane_bytes(old, b"\x1b[O".to_vec());
+        }
+        if let Some(new) = target
+            && self.pane_modes(new).focus_events
+        {
+            self.write_pane_bytes(new, b"\x1b[I".to_vec());
+        }
+        self.focus_reported = target;
     }
 
     /// grid が OSC の色の問い合わせに今のテーマで答えるよう、テーマを渡す
@@ -1969,6 +2056,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                self.sync_focus_events();
                 if !focused {
                     self.modifiers = ModifiersState::empty();
                 } else if self.pending_occluded_redraw && !self.window_occluded {
@@ -2009,6 +2097,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.cursor_pos =
                         Pos2::new(position.x as f32 / scale, position.y as f32 / scale);
                 }
+                if !self.selecting {
+                    let button = self.mouse_button_down.unwrap_or(CoreMouseButton::None);
+                    self.report_mouse(MouseAction::Motion, button);
+                }
                 if self.selecting
                     && let Some((pane_id, col, row)) = self.hit_test_cell(self.cursor_pos)
                     && let Some((sel_pane, start, _)) = self.selection
@@ -2021,6 +2113,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let core_button = match button {
+                    MouseButton::Left => Some(CoreMouseButton::Left),
+                    MouseButton::Middle => Some(CoreMouseButton::Middle),
+                    MouseButton::Right => Some(CoreMouseButton::Right),
+                    _ => None,
+                };
+                let action = match state {
+                    ElementState::Pressed => MouseAction::Press,
+                    ElementState::Released => MouseAction::Release,
+                };
+                // ドラッグで選択している途中に報告が始まっても、選択は最後まで続ける
+                if !self.selecting
+                    && let Some(core_button) = core_button
+                    && self.report_mouse(action, core_button)
+                {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
                         if let Some((pane_id, col, row)) = self.hit_test_cell(self.cursor_pos) {
@@ -2046,11 +2158,43 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 let area = self.terminal_area();
                 if self.cursor_pos.x >= area.x && self.cursor_pos.x < area.x + area.width {
-                    let lines = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y.round() as i32 * 3,
-                        MouseScrollDelta::PixelDelta(pos) => (pos.y / 16.0).round() as i32,
+                    let (ticks, lines) = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => {
+                            (y.round() as i32, y.round() as i32 * 3)
+                        }
+                        MouseScrollDelta::PixelDelta(pos) => {
+                            let n = (pos.y / 16.0).round() as i32;
+                            (n, n)
+                        }
                     };
-                    if lines != 0 {
+                    let hovered = self.hit_test_cell(self.cursor_pos).map(|(id, _, _)| id);
+                    let modes = hovered.map(|id| self.pane_modes(id)).unwrap_or_default();
+                    let wheel = if ticks > 0 {
+                        CoreMouseButton::WheelUp
+                    } else {
+                        CoreMouseButton::WheelDown
+                    };
+                    if ticks != 0
+                        && modes.mouse_tracking != MouseTracking::Off
+                        && !self.modifiers.shift_key()
+                    {
+                        for _ in 0..ticks.unsigned_abs() {
+                            self.report_mouse(MouseAction::Press, wheel);
+                        }
+                    } else if let Some(pane_id) = hovered
+                        && lines != 0
+                        && modes.alt_screen
+                        && modes.alt_scroll
+                    {
+                        // 代替画面ではスクロールバックが無いので、ホイールを矢印キーとして送る (?1007)
+                        let key = match (lines > 0, modes.app_cursor_keys) {
+                            (true, false) => b"\x1b[A",
+                            (false, false) => b"\x1b[B",
+                            (true, true) => b"\x1bOA",
+                            (false, true) => b"\x1bOB",
+                        };
+                        self.write_pane_bytes(pane_id, key.repeat(lines.unsigned_abs() as usize));
+                    } else if lines != 0 {
                         let focused = self.manager.active_tab().focused_pane;
                         if let Some(pane) = self.panes.get(&focused)
                             && let Ok(mut g) = pane.grid.lock()
@@ -2293,7 +2437,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(core_ev) = to_core_key_event(&event, self.modifiers) {
-                    self.router.app_cursor_keys = self.focused_app_cursor_keys();
+                    let focused = self.manager.active_tab().focused_pane;
+                    self.router.app_cursor_keys = self.pane_modes(focused).app_cursor_keys;
                     let area = self.terminal_area();
                     let decision = {
                         let ctx = TabNavCtx {
@@ -2340,6 +2485,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // ペインのフォーカスはいろいろな操作で変わるので、描くたびに知らせる必要があるか確かめる
+                self.sync_focus_events();
                 let is_minimized = self
                     .window
                     .as_ref()
@@ -6017,6 +6164,9 @@ fn main() {
         cell_size: (10.0, 22.0),
         selection: None,
         selecting: false,
+        mouse_button_down: None,
+        mouse_last_cell: None,
+        focus_reported: None,
         clipboard: arboard::Clipboard::new().ok(),
         browser: None,
         pending_browser_url: None,
