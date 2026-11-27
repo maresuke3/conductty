@@ -113,6 +113,8 @@ pub struct AppearanceConfig {
     pub window_padding_x: f32,
     pub window_padding_y: f32,
     pub window_padding_balance: bool,
+    /// 太字の 0〜7 番の色を 8〜15 番の明るい色で描く（Ghostty の bold-is-bright）。未指定ならテーマに従う
+    pub bold_is_bright: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +202,8 @@ pub struct ResolvedTheme {
     /// 選択範囲の背景・文字の色。背景が None なら半透明の色を重ねる
     pub selection_bg: Option<[u8; 3]>,
     pub selection_fg: Option<[u8; 3]>,
+    /// 太字の 0〜7 番の色を 8〜15 番の明るい色で描く
+    pub bold_is_bright: bool,
 }
 
 /// プリセットが見つからないときの TokyoNight Moon
@@ -216,6 +220,7 @@ impl Default for ResolvedTheme {
             cursor_text: None,
             selection_bg: None,
             selection_fg: None,
+            bold_is_bright: false,
         }
     }
 }
@@ -233,7 +238,8 @@ impl ResolvedTheme {
         theme
     }
 
-    fn color_rgb(&self, color: Color) -> Option<[u8; 3]> {
+    /// 色をこのテーマで RGB にする。既定色は None
+    pub fn color_rgb(&self, color: Color) -> Option<[u8; 3]> {
         match color {
             Color::Default => None,
             Color::Indexed(i) => Some(self.palette[i as usize]),
@@ -243,7 +249,11 @@ impl ResolvedTheme {
 
     /// セルを描く前景色と背景色。背景が None なら塗らない
     pub fn cell_colors(&self, cell: &Cell) -> ([u8; 3], Option<[u8; 3]>) {
-        let fg = self.color_rgb(cell.fg).unwrap_or(self.fg);
+        let fg = match cell.fg {
+            Color::Indexed(i) if cell.bold && self.bold_is_bright && i < 8 => Color::Indexed(i + 8),
+            fg => fg,
+        };
+        let fg = self.color_rgb(fg).unwrap_or(self.fg);
         let bg = self.color_rgb(cell.bg);
         if cell.reverse {
             (bg.unwrap_or(self.bg), Some(fg))
@@ -284,6 +294,7 @@ impl Default for AppearanceConfig {
             window_padding_x: 10.0,
             window_padding_y: 10.0,
             window_padding_balance: true,
+            bold_is_bright: None,
         }
     }
 }
@@ -714,6 +725,10 @@ pub fn parse_ghostty_theme(text: &str) -> ResolvedTheme {
             continue;
         };
         let (key, value) = (key.trim(), value.trim());
+        if key == "bold-is-bright" {
+            theme.bold_is_bright = value == "true";
+            continue;
+        }
         if key == "palette" {
             if let Some((i, color)) = parse_palette_entry(value) {
                 theme.palette[i] = color;
@@ -1014,6 +1029,9 @@ impl AppConfig {
         if let Some(hex) = self.theme.cursor.as_deref().and_then(parse_hex_rgb) {
             base.cursor = hex;
         }
+        if let Some(v) = self.appearance.bold_is_bright {
+            base.bold_is_bright = v;
+        }
         for (i, color) in self
             .theme
             .palette
@@ -1146,6 +1164,36 @@ mod tests {
         assert_eq!(theme.selection_bg, Some([0x00, 0x4d, 0x4d]));
         assert_eq!(theme.selection_fg, None);
         assert_eq!(theme.cursor_text, Some([0x0a, 0x0a, 0x0f]));
+    }
+
+    #[test]
+    fn bold_is_bright_uses_bright_palette_for_bold_0_to_7() {
+        let bold_red = Cell {
+            fg: Color::Indexed(1),
+            bold: true,
+            ..Cell::default()
+        };
+        let theme = ResolvedTheme::default();
+        assert_eq!(theme.cell_colors(&bold_red).0, DEFAULT_PALETTE[1]);
+
+        let theme = parse_ghostty_theme("bold-is-bright = true\n");
+        assert_eq!(theme.cell_colors(&bold_red).0, DEFAULT_PALETTE[9]);
+        // 太字でない文字と 8 番以降は変えない
+        let red = Cell {
+            bold: false,
+            ..bold_red
+        };
+        assert_eq!(theme.cell_colors(&red).0, DEFAULT_PALETTE[1]);
+        let bold_bright = Cell {
+            fg: Color::Indexed(9),
+            ..bold_red
+        };
+        assert_eq!(theme.cell_colors(&bold_bright).0, DEFAULT_PALETTE[9]);
+
+        // [appearance] の指定がテーマより優先する
+        let mut config = AppConfig::default();
+        config.appearance.bold_is_bright = Some(true);
+        assert!(config.resolve_theme().bold_is_bright);
     }
 
     #[test]

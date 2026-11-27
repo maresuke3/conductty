@@ -17,7 +17,7 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, S
 use markdown_html::{markdown_contains_mermaid, render_markdown_to_html};
 use term_core::agent::{AgentStatus, PaneAgentState, detect_pane_agent, snapshot_visible_lines};
 use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme, find_theme};
-use term_core::grid::{GridSnapshot, TerminalGrid};
+use term_core::grid::{Cell, GridSnapshot, TerminalGrid, Underline};
 use term_core::input::{
     Action, GoToCommand, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode,
     KeyEvent as CoreKeyEvent, Modifiers, PerformableContext,
@@ -4686,16 +4686,15 @@ fn render_grid_snapshot(
             painter.rect_filled(cursor_rect, 0.0, rgb(theme.cursor));
         }
 
-        col = 0;
-        while col < snap.cols {
+        for col in 0..snap.cols {
             let Some(cell) = snap.cells.get(row_start + col) else {
                 break;
             };
-            let ch = cell.ch;
-            if ch == ' ' || ch == '\0' {
-                col += 1;
+            if cell.invisible {
                 continue;
             }
+            let pos = Pos2::new(rect.x + pad_x + col as f32 * char_w, y);
+            let cell_rect = Rect::from_min_size(pos, Vec2::new(char_w, row_h));
             let fg_color = if solid_cursor && (row, col) == (snap.cursor_row, snap.cursor_col) {
                 theme.cursor_text.map(rgb)
             } else if is_selected((row, col)) {
@@ -4704,33 +4703,21 @@ fn render_grid_snapshot(
                 None
             }
             .unwrap_or_else(|| rgb(theme.cell_colors(cell).0));
-            if is_box_drawing_char(ch) {
-                let cell_rect = Rect::from_min_size(
-                    Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
-                    Vec2::new(char_w, row_h),
-                );
-                if !draw_box_drawing(painter, ch, cell_rect, fg_color) {
-                    painter.text(
-                        Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
-                        egui::Align2::LEFT_TOP,
-                        ch.to_string(),
-                        font_id.clone(),
-                        fg_color,
-                    );
-                }
-                col += 1;
+            // 薄字は Ghostty の faint-opacity の既定（0.5）と同じく半透明で描く
+            let fg_color = if cell.dim {
+                fg_color.gamma_multiply(0.5)
             } else {
-                let mut ch_buf = [0u8; 4];
-                let s = ch.encode_utf8(&mut ch_buf);
-                painter.text(
-                    Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
-                    egui::Align2::LEFT_TOP,
-                    s,
-                    font_id.clone(),
-                    fg_color,
-                );
-                col += 1;
+                fg_color
+            };
+            draw_text_decorations(painter, cell, cell_rect, font_id.size, fg_color, theme);
+            let ch = cell.ch;
+            if ch == ' ' || ch == '\0' {
+                continue;
             }
+            if is_box_drawing_char(ch) && draw_box_drawing(painter, ch, cell_rect, fg_color) {
+                continue;
+            }
+            draw_cell_text(painter, pos, ch, font_id, fg_color, cell.bold, cell.italic);
         }
     }
 
@@ -4867,6 +4854,96 @@ fn filtered_go_to_items(manager: &WorkspaceManager, query: &str) -> Vec<GoToItem
         }
     }
     items
+}
+
+/// 1 文字を描く。太字のフォントは読み込んでいないため、少しずらして重ねて太く見せる（Ghostty の合成した太字と同じ）
+fn draw_cell_text(
+    painter: &egui::Painter,
+    pos: Pos2,
+    ch: char,
+    font_id: &FontId,
+    color: Color32,
+    bold: bool,
+    italic: bool,
+) {
+    let offsets: &[f32] = if bold { &[0.0, 1.0] } else { &[0.0] };
+    for &dx in offsets {
+        let pos = pos + Vec2::new(dx, 0.0);
+        if italic {
+            let format = egui::TextFormat {
+                font_id: font_id.clone(),
+                color,
+                italics: true,
+                ..Default::default()
+            };
+            let job = egui::text::LayoutJob::single_section(ch.to_string(), format);
+            painter.galley(pos, painter.layout_job(job), color);
+        } else {
+            painter.text(pos, egui::Align2::LEFT_TOP, ch, font_id.clone(), color);
+        }
+    }
+}
+
+/// 下線・取り消し線・上線を引く。空白のセルにも引く
+fn draw_text_decorations(
+    painter: &egui::Painter,
+    cell: &Cell,
+    cell_rect: Rect,
+    font_size: f32,
+    fg: Color32,
+    theme: &ResolvedTheme,
+) {
+    let width = (font_size / 14.0).max(1.0);
+    let (left, right) = (cell_rect.left(), cell_rect.right());
+    let hline = |y: f32, color: Color32| {
+        painter.line_segment(
+            [Pos2::new(left, y), Pos2::new(right, y)],
+            Stroke::new(width, color),
+        );
+    };
+    // NOTE: 文字は行の上端に合わせて描いているので、線の高さはフォントの大きさから決める
+    let underline_y = (cell_rect.top() + font_size * 1.05).min(cell_rect.bottom() - width);
+    if cell.underline != Underline::None {
+        let color = theme.color_rgb(cell.underline_color).map(rgb).unwrap_or(fg);
+        let ends = [Pos2::new(left, underline_y), Pos2::new(right, underline_y)];
+        match cell.underline {
+            Underline::Double => {
+                hline(underline_y - width, color);
+                hline(underline_y + width, color);
+            }
+            // 隣のセルと波がつながるよう、セルの両端は線の高さにそろえる
+            Underline::Curly => {
+                let amp = width * 1.5;
+                let points = [0.0, -amp, 0.0, amp, 0.0]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, dy)| {
+                        Pos2::new(left + (right - left) * k as f32 / 4.0, underline_y + dy)
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(points, Stroke::new(width, color)));
+            }
+            Underline::Dotted => painter.extend(egui::Shape::dotted_line(
+                &ends,
+                color,
+                width * 2.5,
+                width * 0.6,
+            )),
+            Underline::Dashed => painter.extend(egui::Shape::dashed_line(
+                &ends,
+                Stroke::new(width, color),
+                width * 3.0,
+                width * 2.0,
+            )),
+            _ => hline(underline_y, color),
+        }
+    }
+    if cell.strikethrough {
+        hline(cell_rect.top() + font_size * 0.6, fg);
+    }
+    if cell.overline {
+        hline(cell_rect.top() + width / 2.0, fg);
+    }
 }
 
 fn is_box_drawing_char(ch: char) -> bool {

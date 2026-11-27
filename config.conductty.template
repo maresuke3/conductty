@@ -45,6 +45,8 @@ background_opacity = 1.0
 window_padding_x = 10.0
 window_padding_y = 10.0
 window_padding_balance = true
+# 太字の 0〜7 番の色を 8〜15 番の明るい色で描く（Ghostty の bold-is-bright。未指定ならテーマに従う）
+# bold_is_bright = false
 
 # テーマ色を個別に上書きしたい場合のみ指定（#RRGGBB 形式）
 # [theme]
