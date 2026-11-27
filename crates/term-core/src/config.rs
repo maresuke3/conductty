@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::grid::{Cell, Color, DEFAULT_PALETTE};
+use crate::grid::{Cell, Color, ColorOverrides, DEFAULT_PALETTE};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -221,6 +221,18 @@ impl Default for ResolvedTheme {
 }
 
 impl ResolvedTheme {
+    /// OSC で変えた色を重ねたテーマ
+    pub fn with_overrides(&self, overrides: &ColorOverrides) -> ResolvedTheme {
+        let mut theme = *self;
+        for (&i, &color) in &overrides.palette {
+            theme.palette[i as usize] = color;
+        }
+        theme.fg = overrides.fg.unwrap_or(theme.fg);
+        theme.bg = overrides.bg.unwrap_or(theme.bg);
+        theme.cursor = overrides.cursor.unwrap_or(theme.cursor);
+        theme
+    }
+
     fn color_rgb(&self, color: Color) -> Option<[u8; 3]> {
         match color {
             Color::Default => None,

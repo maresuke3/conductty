@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use vte::{Params, Parser, Perform};
 
+use crate::config::ResolvedTheme;
 use crate::kitty::{KittySegment, KittyState};
 
 const MAX_SCROLLBACK: usize = 2000;
@@ -60,6 +61,17 @@ pub struct GridSnapshot {
     #[serde(default)]
     pub generation: u64,
     pub cells: Vec<Cell>,
+    #[serde(default)]
+    pub color_overrides: ColorOverrides,
+}
+
+/// OSC 4 / 10 / 11 / 12 で変えた色。テーマの色より優先し、OSC 104 / 110 / 111 / 112 で戻す
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorOverrides {
+    pub palette: BTreeMap<u8, [u8; 3]>,
+    pub fg: Option<[u8; 3]>,
+    pub bg: Option<[u8; 3]>,
+    pub cursor: Option<[u8; 3]>,
 }
 
 /// 既定の256色。0〜15 は TokyoNight Moon、16〜231 は 6x6x6 の色の立方体、232〜255 はグレー（xterm と同じ計算）
@@ -105,6 +117,56 @@ pub const DEFAULT_PALETTE: [[u8; 3]; 256] = {
     p
 };
 
+fn parse_number<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+/// OSC の色の指定を読む。`rgb:R/G/B`（各 1〜4 桁、桁数に合わせて拡大する）と
+/// `#RGB` / `#RRGGBB` / `#RRRGGGBBB` / `#RRRRGGGGBBBB`（上位の桁を使う。XParseColor と同じ）
+/// shortcut: X11 の色名（red など）は読まない。色名で指定するアプリが出てきたら対応する
+pub fn parse_color_spec(spec: &[u8]) -> Option<[u8; 3]> {
+    let spec = std::str::from_utf8(spec).ok()?;
+    if let Some(rest) = spec.strip_prefix("rgb:") {
+        let mut parts = rest.split('/');
+        let mut color = [0u8; 3];
+        for c in &mut color {
+            let part = parts.next()?;
+            if part.is_empty() || part.len() > 4 {
+                return None;
+            }
+            let max = (1u32 << (4 * part.len())) - 1;
+            *c = (u32::from_str_radix(part, 16).ok()? * 255 / max) as u8;
+        }
+        return parts.next().is_none().then_some(color);
+    }
+    let hex = spec.strip_prefix('#')?;
+    if hex.is_empty() || hex.len() % 3 != 0 || hex.len() > 12 {
+        return None;
+    }
+    let n = hex.len() / 3;
+    let mut color = [0u8; 3];
+    for (i, c) in color.iter_mut().enumerate() {
+        let v = u32::from_str_radix(&hex[i * n..(i + 1) * n], 16).ok()?;
+        // 上位 8 ビットを取る。1 桁のときは左へずらす（#f00 は #f00000）
+        *c = if n == 1 {
+            (v << 4) as u8
+        } else {
+            (v >> (4 * (n - 2))) as u8
+        };
+    }
+    Some(color)
+}
+
+/// xterm と同じ `rgb:rrrr/gggg/bbbb` の形にする
+fn rgb_spec([r, g, b]: [u8; 3]) -> String {
+    format!(
+        "rgb:{:04x}/{:04x}/{:04x}",
+        r as u16 * 257,
+        g as u16 * 257,
+        b as u16 * 257
+    )
+}
+
 /// 副作用ゼロの端末グリッド状態マシン。
 /// VT バイト列を `feed_bytes` で食わせると、セル配列・スクロールバック・カーソル位置を更新する。
 pub struct TerminalGrid {
@@ -121,6 +183,9 @@ pub struct TerminalGrid {
     pub scroll_offset: usize,
     pub pending_replies: Vec<Vec<u8>>,
     pub kitty: KittyState,
+    pub color_overrides: ColorOverrides,
+    /// OSC の問い合わせに答えるためのテーマ。描画するテーマと同じものを set_theme で渡す
+    theme: ResolvedTheme,
     current_fg: Color,
     current_bg: Color,
     current_bold: bool,
@@ -151,6 +216,8 @@ impl TerminalGrid {
             scroll_offset: 0,
             pending_replies: Vec::new(),
             kitty: KittyState::new(),
+            color_overrides: ColorOverrides::default(),
+            theme: ResolvedTheme::default(),
             current_fg: Color::Default,
             current_bg: Color::Default,
             current_bold: false,
@@ -224,7 +291,86 @@ impl TerminalGrid {
             synchronized_output: self.synchronized_output,
             generation: self.generation,
             cells,
+            color_overrides: self.color_overrides.clone(),
         }
+    }
+
+    pub fn set_theme(&mut self, theme: &ResolvedTheme) {
+        self.theme = *theme;
+    }
+
+    fn push_reply(&mut self, reply: Vec<u8>) {
+        const MAX_PENDING_REPLIES: usize = 256;
+        self.pending_replies.push(reply);
+        if self.pending_replies.len() > MAX_PENDING_REPLIES {
+            let excess = self.pending_replies.len() - MAX_PENDING_REPLIES;
+            self.pending_replies.drain(..excess);
+        }
+    }
+
+    /// OSC 4 / 104 / 10〜12 / 110〜112（パレットと前景・背景・カーソルの色の変更・問い合わせ・リセット）
+    fn handle_color_osc(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        let Some(code) = params.first().and_then(|p| parse_number::<u16>(p)) else {
+            return;
+        };
+        // 問い合わせには、問い合わせと同じ終端（BEL か ST）で返す
+        let st = if bell_terminated { "\x07" } else { "\x1b\\" };
+        let args = &params[1..];
+        match code {
+            // OSC 4 ; 番号 ; 色 [; 番号 ; 色 ...]。色が ? なら今の色を返す
+            4 => {
+                for pair in args.chunks(2) {
+                    let [index, spec] = pair else { break };
+                    let Some(i) = parse_number::<u8>(index) else {
+                        continue;
+                    };
+                    if *spec == b"?" {
+                        let color = self.current_theme().palette[i as usize];
+                        let reply = format!("\x1b]4;{i};{}{st}", rgb_spec(color));
+                        self.push_reply(reply.into_bytes());
+                    } else if let Some(color) = parse_color_spec(spec) {
+                        self.color_overrides.palette.insert(i, color);
+                    }
+                }
+            }
+            104 if args.iter().all(|a| a.is_empty()) => self.color_overrides.palette.clear(),
+            104 => {
+                for i in args.iter().filter_map(|a| parse_number::<u8>(a)) {
+                    self.color_overrides.palette.remove(&i);
+                }
+            }
+            // OSC 10 ; 色 ; 色 ... は 10, 11, 12 の順に続けて指定できる
+            10..=12 => {
+                for (code, spec) in (code..=12).zip(args) {
+                    if *spec == b"?" {
+                        let theme = self.current_theme();
+                        let color = match code {
+                            10 => theme.fg,
+                            11 => theme.bg,
+                            _ => theme.cursor,
+                        };
+                        let reply = format!("\x1b]{code};{}{st}", rgb_spec(color));
+                        self.push_reply(reply.into_bytes());
+                    } else if let Some(color) = parse_color_spec(spec) {
+                        *self.dynamic_color(code) = Some(color);
+                    }
+                }
+            }
+            110..=112 => *self.dynamic_color(code - 100) = None,
+            _ => {}
+        }
+    }
+
+    fn dynamic_color(&mut self, code: u16) -> &mut Option<[u8; 3]> {
+        match code {
+            10 => &mut self.color_overrides.fg,
+            11 => &mut self.color_overrides.bg,
+            _ => &mut self.color_overrides.cursor,
+        }
+    }
+
+    fn current_theme(&self) -> ResolvedTheme {
+        self.theme.with_overrides(&self.color_overrides)
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -716,6 +862,10 @@ impl Perform for TerminalGrid {
         }
     }
 
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.handle_color_osc(params, bell_terminated);
+    }
+
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
             b'7' => {
@@ -739,6 +889,7 @@ impl Perform for TerminalGrid {
                 self.reverse_index();
             }
             b'c' => {
+                self.color_overrides = ColorOverrides::default();
                 self.clear_all();
                 self.cursor_col = 0;
                 self.cursor_row = 0;
@@ -981,12 +1132,7 @@ impl Perform for TerminalGrid {
             }
             'n' if first == 6 => {
                 let reply = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
-                const MAX_PENDING_REPLIES: usize = 256;
-                self.pending_replies.push(reply.into_bytes());
-                if self.pending_replies.len() > MAX_PENDING_REPLIES {
-                    let excess = self.pending_replies.len() - MAX_PENDING_REPLIES;
-                    self.pending_replies.drain(..excess);
-                }
+                self.push_reply(reply.into_bytes());
             }
             'm' => self.apply_sgr(params),
             _ => {}
@@ -1070,6 +1216,89 @@ mod tests {
         assert_eq!(DEFAULT_PALETTE[231], [255, 255, 255]);
         assert_eq!(DEFAULT_PALETTE[232], [8, 8, 8]);
         assert_eq!(DEFAULT_PALETTE[255], [238, 238, 238]);
+    }
+
+    #[test]
+    fn osc_4_sets_queries_and_104_resets_palette() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.feed_bytes(b"\x1b]4;1;rgb:ff/00/55;2;#00ff9f\x07");
+        assert_eq!(
+            grid.color_overrides.palette.get(&1),
+            Some(&[0xff, 0x00, 0x55])
+        );
+        assert_eq!(
+            grid.color_overrides.palette.get(&2),
+            Some(&[0x00, 0xff, 0x9f])
+        );
+
+        // 問い合わせと同じ終端で返す（BEL と ST）
+        grid.feed_bytes(b"\x1b]4;1;?\x07\x1b]4;3;?\x1b\\");
+        let expected_3 = format!("\x1b]4;3;{}\x1b\\", rgb_spec(DEFAULT_PALETTE[3]));
+        assert_eq!(
+            grid.take_replies(),
+            vec![
+                b"\x1b]4;1;rgb:ffff/0000/5555\x07".to_vec(),
+                expected_3.into_bytes()
+            ]
+        );
+
+        grid.feed_bytes(b"\x1b]104;1\x07");
+        assert_eq!(
+            grid.color_overrides.palette.keys().collect::<Vec<_>>(),
+            vec![&2]
+        );
+        grid.feed_bytes(b"\x1b]104\x07");
+        assert!(grid.color_overrides.palette.is_empty());
+    }
+
+    #[test]
+    fn osc_10_to_12_set_query_and_reset_dynamic_colors() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.set_theme(&ResolvedTheme {
+            bg: [0x0a, 0x0a, 0x0f],
+            ..ResolvedTheme::default()
+        });
+
+        // 変えていない背景色はテーマの色を返す
+        grid.feed_bytes(b"\x1b]11;?\x07");
+        assert_eq!(
+            grid.take_replies(),
+            vec![b"\x1b]11;rgb:0a0a/0a0a/0f0f\x07".to_vec()]
+        );
+
+        // OSC 10 に続けて書いた色は 11, 12 に入る
+        grid.feed_bytes(b"\x1b]10;#d4b3f7;#000000;#00ffff\x07");
+        assert_eq!(grid.color_overrides.fg, Some([0xd4, 0xb3, 0xf7]));
+        assert_eq!(grid.color_overrides.bg, Some([0, 0, 0]));
+        assert_eq!(grid.color_overrides.cursor, Some([0x00, 0xff, 0xff]));
+        grid.feed_bytes(b"\x1b]10;?\x07");
+        assert_eq!(
+            grid.take_replies(),
+            vec![b"\x1b]10;rgb:d4d4/b3b3/f7f7\x07".to_vec()]
+        );
+
+        grid.feed_bytes(b"\x1b]111\x07");
+        assert_eq!(grid.color_overrides.bg, None);
+        // 全体のリセット (ESC c) で OSC の色も戻る
+        grid.feed_bytes(b"\x1bc");
+        assert_eq!(grid.color_overrides, ColorOverrides::default());
+    }
+
+    #[test]
+    fn parses_osc_color_specs() {
+        assert_eq!(parse_color_spec(b"rgb:f/0/5"), Some([0xff, 0x00, 0x55]));
+        assert_eq!(
+            parse_color_spec(b"rgb:ffff/0000/5555"),
+            Some([0xff, 0x00, 0x55])
+        );
+        assert_eq!(parse_color_spec(b"#f05"), Some([0xf0, 0x00, 0x50]));
+        assert_eq!(parse_color_spec(b"#ff0055"), Some([0xff, 0x00, 0x55]));
+        assert_eq!(parse_color_spec(b"#ff0000555"), Some([0xff, 0x00, 0x55]));
+        assert_eq!(parse_color_spec(b"#ffff00005555"), Some([0xff, 0x00, 0x55]));
+        assert_eq!(parse_color_spec(b"rgb:ff/00"), None);
+        assert_eq!(parse_color_spec(b"rgb:ff/00/55/00"), None);
+        assert_eq!(parse_color_spec(b"#ff00"), None);
+        assert_eq!(parse_color_spec(b"red"), None);
     }
 
     #[test]

@@ -546,7 +546,9 @@ impl App {
                 let (_, dummy_exit_rx) = std::sync::mpsc::channel();
                 let exit_rx = std::mem::replace(&mut pty.exit_rx, dummy_exit_rx);
 
-                let grid = Arc::new(Mutex::new(TerminalGrid::new(cols, rows)));
+                let mut grid = TerminalGrid::new(cols, rows);
+                grid.set_theme(&self.theme);
+                let grid = Arc::new(Mutex::new(grid));
                 let grid_clone = Arc::clone(&grid);
                 let proxy_out = self.proxy.clone();
                 let pty_dirty = Arc::clone(&self.pty_dirty);
@@ -860,6 +862,7 @@ impl App {
                 // [theme] の個別上書き色も維持するため resolve_theme() 経由で再計算する
                 self.theme = self.config.resolve_theme();
                 apply_theme_visuals(&self.egui_ctx, &self.theme);
+                self.apply_theme_to_grids();
                 MuxResponse::Ok { delivered_to: 1 }
             }
             _ => MuxResponse::Error {
@@ -1102,6 +1105,25 @@ impl App {
                 .collect();
             if let Ok(json) = serde_json::to_string_pretty(&names) {
                 let _ = std::fs::write(path, json);
+            }
+        }
+    }
+
+    /// grid が OSC の色の問い合わせに今のテーマで答えるよう、テーマを渡す
+    fn apply_theme_to_grids(&self) {
+        if self.config.features.multiplexer_mode {
+            // grid は server にあるので、server にもテーマを切り替えてもらう
+            let req = MuxRequest::SetTheme {
+                theme: self.config.appearance.theme.clone(),
+            };
+            let _ = self
+                .rt
+                .block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &req));
+            return;
+        }
+        for pane in self.panes.values() {
+            if let Ok(mut g) = pane.grid.lock() {
+                g.set_theme(&self.theme);
             }
         }
     }
@@ -1634,6 +1656,7 @@ impl App {
             Action::ReloadConfig => {
                 let new_cfg = AppConfig::load();
                 self.theme = new_cfg.resolve_theme();
+                self.apply_theme_to_grids();
                 self.router = InputRouter::from_config(&new_cfg);
                 self.left_drawer_mode = new_cfg.features.left_drawer_mode;
                 if !new_cfg.features.right_drawer {
@@ -4601,7 +4624,19 @@ fn render_grid_snapshot(
     theme: &ResolvedTheme,
 ) {
     let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
-    // セルの色は番号・既定色のまま届くので、ここで今のテーマの色に決める
+    // セルの色は番号・既定色のまま届くので、ここで今のテーマ（OSC で変えた色を含む）の色に決める
+    let theme = &theme.with_overrides(&snap.color_overrides);
+    // OSC 11 で背景色を変えたときは、ウィンドウの背景の上からペインを塗る
+    if let Some(bg) = snap.color_overrides.bg {
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(rect.x, rect.y),
+                Vec2::new(rect.width, rect.height),
+            ),
+            0.0,
+            rgb(bg),
+        );
+    }
     let cell_bg = |c: usize| snap.cells.get(c).and_then(|cell| theme.cell_colors(cell).1);
     let is_selected = |pos: (usize, usize)| sel_range.is_some_and(|(s, e)| pos >= s && pos <= e);
     // cursor-text があるときは Ghostty と同じく、塗りつぶしたカーソルの上に文字をその色で描く
