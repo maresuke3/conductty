@@ -390,6 +390,17 @@ mod tests {
     }
 
     #[test]
+    fn grid_snapshot_with_osc_colors_round_trips_through_json() {
+        let mut grid = term_core::grid::TerminalGrid::new(4, 1);
+        grid.feed_bytes(b"\x1b]4;200;#00ffff\x07\x1b]11;#0a0a0f\x07\x1b[38;5;200mA");
+        let snap = grid.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let decoded: GridSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.color_overrides, snap.color_overrides);
+        assert_eq!(decoded.cells, snap.cells);
+    }
+
+    #[test]
     fn auth_envelope_rejects_unauthenticated_and_http_smuggling() {
         let req = MuxRequest::Ping;
         let env = AuthEnvelope {

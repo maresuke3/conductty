@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use term_core::agent::{PaneAgentState, detect_pane_agent, snapshot_visible_lines};
-use term_core::config::AppConfig;
+use term_core::config::{AppConfig, ResolvedTheme, find_theme};
 use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::layout::{PaneId, WorkspaceManager};
 use term_core::pty::PtySession;
@@ -24,6 +24,8 @@ struct ServerPane {
 
 struct ServerState {
     config: AppConfig,
+    /// grid が OSC の色の問い合わせに答えるためのテーマ（描画はアプリ側）
+    theme: ResolvedTheme,
     manager: WorkspaceManager,
     panes: HashMap<PaneId, ServerPane>,
     agent_states: HashMap<PaneId, PaneAgentState>,
@@ -34,6 +36,7 @@ struct ServerState {
 impl ServerState {
     fn new(config: AppConfig) -> Self {
         let mut state = Self {
+            theme: config.resolve_theme(),
             config,
             manager: WorkspaceManager::new(1),
             panes: HashMap::new(),
@@ -70,7 +73,9 @@ impl ServerState {
         };
         let (_, dummy_rx) = std::sync::mpsc::channel();
         let rx = std::mem::replace(&mut pty.output_rx, dummy_rx);
-        let grid = Arc::new(Mutex::new(TerminalGrid::new(cols, rows)));
+        let mut grid = TerminalGrid::new(cols, rows);
+        grid.set_theme(&self.theme);
+        let grid = Arc::new(Mutex::new(grid));
         let grid_clone = Arc::clone(&grid);
 
         thread::spawn(move || {
@@ -419,7 +424,25 @@ impl ServerState {
                     snapshots: self.collect_snapshots(),
                 }
             }
-            MuxRequest::SetTheme { .. } => MuxResponse::Ok { delivered_to: 0 },
+            MuxRequest::SetTheme { theme } => {
+                let Some((name, _)) = find_theme(&theme) else {
+                    return MuxResponse::Error {
+                        message: format!("unknown theme: {theme}"),
+                    };
+                };
+                // アプリと同じく [theme] の上書きも効かせるため、設定を読み直してから決める
+                self.config = AppConfig::load();
+                self.config.appearance.theme = name;
+                self.theme = self.config.resolve_theme();
+                for pane in self.panes.values() {
+                    if let Ok(mut g) = pane.grid.lock() {
+                        g.set_theme(&self.theme);
+                    }
+                }
+                MuxResponse::Ok {
+                    delivered_to: self.panes.len(),
+                }
+            }
         }
     }
 }
