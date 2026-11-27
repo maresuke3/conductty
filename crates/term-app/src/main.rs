@@ -22,7 +22,7 @@ use term_core::grid::{
 };
 use term_core::input::{
     Action, GoToCommand, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode,
-    KeyEvent as CoreKeyEvent, Modifiers, PerformableContext,
+    KeyEvent as CoreKeyEvent, KeyEventKind, Modifiers, PerformableContext,
 };
 use term_core::layout::{NavDirection, PaneId, Rect as CoreRect, SplitDirection, WorkspaceManager};
 use term_core::mouse::{
@@ -415,6 +415,8 @@ struct App {
     window_title: String,
     /// server のペインごとに、クリップボードへ反映した OSC 52 の通し番号
     clipboard_applied: HashMap<PaneId, u64>,
+    /// 押したことを PTY に送ったキー。離したことはこのキーだけ送る
+    keys_sent_to_pty: std::collections::HashSet<PhysicalKey>,
     clipboard: Option<arboard::Clipboard>,
     browser: Option<EmbeddedBrowser>,
     pending_browser_url: Option<String>,
@@ -2406,6 +2408,18 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            // キティのキーボードプロトコルで離したことを求められていれば送る。押したことを PTY に送ったキーだけ
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                if self.keys_sent_to_pty.remove(&event.physical_key)
+                    && let Some(core_ev) = to_core_key_event(&event, self.modifiers)
+                {
+                    let focused = self.manager.active_tab().focused_pane;
+                    self.router.kitty_flags = self.pane_modes(focused).kitty_keyboard;
+                    if let Some(bytes) = self.router.encode_vt_bytes(&core_ev) {
+                        self.write_pane_bytes(focused, bytes);
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Workspace 名のリネームや右 Drawer のテキスト入力中は egui TextEdit にキー入力を委ねる
                 if self.renaming_workspace_idx.is_some() || self.drawer_input_action.is_some() {
@@ -2568,8 +2582,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(core_ev) = to_core_key_event(&event, self.modifiers) {
-                    let focused = self.manager.active_tab().focused_pane;
-                    self.router.app_cursor_keys = self.pane_modes(focused).app_cursor_keys;
+                    let modes = self.pane_modes(self.manager.active_tab().focused_pane);
+                    self.router.app_cursor_keys = modes.app_cursor_keys;
+                    self.router.kitty_flags = modes.kitty_keyboard;
                     let area = self.terminal_area();
                     let decision = {
                         let ctx = TabNavCtx {
@@ -2582,6 +2597,7 @@ impl ApplicationHandler<UserEvent> for App {
                     match decision {
                         InputDecision::SendToPty(bytes) => {
                             self.cursor_blink_epoch = std::time::Instant::now();
+                            self.keys_sent_to_pty.insert(event.physical_key);
                             self.suppress_next_ime_commit = false;
                             let focused = self.manager.active_tab().focused_pane;
                             if self.config.features.multiplexer_mode {
@@ -5874,6 +5890,20 @@ fn to_core_key_event(event: &WinitKeyEvent, mods: ModifiersState) -> Option<Core
             logo: mods.super_key(),
         },
         left_alt: mods.alt_key(),
+        unshifted: match &unmodified {
+            Key::Character(s) => s.chars().next(),
+            Key::Named(NamedKey::Space) => Some(' '),
+            _ => None,
+        },
+        base_layout: match physical_key_to_core_code(event.physical_key) {
+            Some(CoreKeyCode::Char(c)) => Some(c),
+            _ => None,
+        },
+        kind: match (event.state, event.repeat) {
+            (ElementState::Released, _) => KeyEventKind::Release,
+            (_, true) => KeyEventKind::Repeat,
+            _ => KeyEventKind::Press,
+        },
     })
 }
 
@@ -6409,6 +6439,7 @@ fn main() {
         hovered_link: None,
         window_title: "conductty".to_string(),
         clipboard_applied: HashMap::new(),
+        keys_sent_to_pty: std::collections::HashSet::new(),
         clipboard: arboard::Clipboard::new().ok(),
         browser: None,
         pending_browser_url: None,
@@ -6498,6 +6529,9 @@ mod tests {
                 logo: false,
             },
             left_alt: true,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&ev_right, &NoNav),
@@ -6522,6 +6556,9 @@ mod tests {
                 logo: false,
             },
             left_alt: true,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&ev_down, &NoNav),

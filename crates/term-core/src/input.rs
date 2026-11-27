@@ -48,6 +48,34 @@ pub struct KeyEvent {
     pub mods: Modifiers,
     /// macOS の `macos-option-as-alt = left` 用: 左 Option が押されているか
     pub left_alt: bool,
+    /// 修飾キーを押さずに押したときの文字（キティのキーボードプロトコルのキーの番号に使う）
+    pub unshifted: Option<char>,
+    /// US 配列でのキーの文字（キティのキーボードプロトコルの「US 配列のキー」に使う）
+    pub base_layout: Option<char>,
+    pub kind: KeyEventKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyEventKind {
+    #[default]
+    Press,
+    /// 押し続けて繰り返したとき
+    Repeat,
+    Release,
+}
+
+/// キティのキーボードプロトコルのフラグ
+pub mod kitty_flags {
+    /// Esc や Ctrl・Alt との組み合わせを CSI u で送り、見分けられるようにする
+    pub const DISAMBIGUATE: u8 = 1;
+    /// 繰り返しと離したことも送る
+    pub const EVENT_TYPES: u8 = 2;
+    /// Shift を押したときの文字と US 配列のキーも送る
+    pub const ALTERNATE_KEYS: u8 = 4;
+    /// 文字のキーも含めて、すべてのキーを CSI u で送る
+    pub const ALL_KEYS: u8 = 8;
+    /// キーが出す文字も送る
+    pub const TEXT: u8 = 16;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +231,8 @@ pub struct InputRouter {
     pub right_drawer_bindings: Vec<KeyBinding>,
     /// フォーカス中のペインがカーソルキーのアプリケーションモード (DECCKM) か。キーを送る前にアプリが入れる
     pub app_cursor_keys: bool,
+    /// フォーカス中のペインのキティのキーボードプロトコルのフラグ。キーを送る前にアプリが入れる
+    pub kitty_flags: u8,
 }
 
 impl Default for InputRouter {
@@ -316,6 +346,7 @@ impl InputRouter {
             go_to_bindings,
             right_drawer_bindings,
             app_cursor_keys: false,
+            kitty_flags: 0,
         }
     }
 
@@ -564,8 +595,15 @@ impl InputRouter {
     }
 
     /// キーを PTY に送るバイト列にする（xterm / Ghostty と同じ形）
-    fn encode_vt_bytes(&self, event: &KeyEvent) -> Option<Vec<u8>> {
+    pub fn encode_vt_bytes(&self, event: &KeyEvent) -> Option<Vec<u8>> {
         let treat_as_alt = event.mods.alt && (!self.macos_left_option_as_alt || event.left_alt);
+        if self.kitty_flags != 0 {
+            return encode_kitty_key(event, self.kitty_flags, treat_as_alt);
+        }
+        // 離したことはキティのキーボードプロトコルでしか送らない
+        if event.kind == KeyEventKind::Release {
+            return None;
+        }
         // xterm の修飾キーの番号: 1 + Shift(1) + Alt(2) + Ctrl(4)
         let m = 1 + event.mods.shift as u8 + 2 * treat_as_alt as u8 + 4 * event.mods.ctrl as u8;
         let seq = |s: String| Some(s.into_bytes());
@@ -649,6 +687,130 @@ impl InputRouter {
     }
 }
 
+/// キティのキーボードプロトコルでキーを送るバイト列にする
+/// shortcut: Caps Lock / Num Lock の状態と、修飾キーだけを押したことは送らない（winit から取れないため）。
+///           これらを使うアプリが出てきたら、OS から状態を取って足す
+fn encode_kitty_key(event: &KeyEvent, flags: u8, alt: bool) -> Option<Vec<u8>> {
+    use kitty_flags::*;
+    let all_keys = flags & ALL_KEYS != 0;
+    let report_events = flags & EVENT_TYPES != 0;
+    if event.kind == KeyEventKind::Release && !report_events {
+        return None;
+    }
+    let m = &event.mods;
+    let mod_bits = m.shift as u8 + 2 * alt as u8 + 4 * m.ctrl as u8 + 8 * m.logo as u8;
+    let event_type = match event.kind {
+        KeyEventKind::Press => None,
+        _ if !report_events => None,
+        KeyEventKind::Repeat => Some(2),
+        KeyEventKind::Release => Some(3),
+    };
+    // 「;修飾:種類」の部分。どちらも既定なら省く
+    let mods_part = match (mod_bits, event_type) {
+        (0, None) => String::new(),
+        (_, None) => format!(";{}", mod_bits + 1),
+        (_, Some(t)) => format!(";{}:{t}", mod_bits + 1),
+    };
+    let csi = |body: String| Some(format!("\x1b[{body}").into_bytes());
+    let legacy_ok = !all_keys && event.kind != KeyEventKind::Release;
+
+    match event.code {
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Right
+        | KeyCode::Left
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::F(1 | 2 | 4) => {
+            let c = match event.code {
+                KeyCode::Up => 'A',
+                KeyCode::Down => 'B',
+                KeyCode::Right => 'C',
+                KeyCode::Left => 'D',
+                KeyCode::Home => 'H',
+                KeyCode::End => 'F',
+                KeyCode::F(1) => 'P',
+                KeyCode::F(2) => 'Q',
+                _ => 'S',
+            };
+            let one = if mods_part.is_empty() { "" } else { "1" };
+            return csi(format!("{one}{mods_part}{c}"));
+        }
+        KeyCode::Insert | KeyCode::Delete | KeyCode::PageUp | KeyCode::PageDown | KeyCode::F(_) => {
+            let n = match event.code {
+                KeyCode::Insert => 2,
+                KeyCode::Delete => 3,
+                KeyCode::PageUp => 5,
+                KeyCode::PageDown => 6,
+                // F3 は CSI R（カーソル位置の返答）とぶつかるので 13~
+                KeyCode::F(3) => 13,
+                KeyCode::F(5) => 15,
+                KeyCode::F(f @ 6..=10) => f + 11,
+                KeyCode::F(f @ 11..=12) => f + 12,
+                _ => return None,
+            };
+            return csi(format!("{n}{mods_part}~"));
+        }
+        // Enter・Tab・BS は、修飾キーなしならアプリが壊れたあとも打てるよう昔のまま送る
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace => {
+            let (code, legacy) = match event.code {
+                KeyCode::Enter => (13, b'\r'),
+                KeyCode::Tab => (9, b'\t'),
+                _ => (127, 0x7f),
+            };
+            if legacy_ok && mod_bits == 0 {
+                return Some(vec![legacy]);
+            }
+            if !all_keys && event.kind == KeyEventKind::Release && mod_bits == 0 {
+                return None;
+            }
+            return csi(format!("{code}{mods_part}u"));
+        }
+        KeyCode::Escape => return csi(format!("27{mods_part}u")),
+        _ => {}
+    }
+
+    // 文字を出すキー
+    let c = match event.code {
+        KeyCode::Char(c) => c,
+        KeyCode::Space => ' ',
+        KeyCode::Backquote => '`',
+        _ => return None,
+    };
+    let produces_text = !m.ctrl && !alt && !m.logo;
+    // Shift だけなら、見分ける必要が無いので文字のまま送る（離したことは文字では表せないので送らない）
+    if !all_keys && produces_text {
+        if event.kind == KeyEventKind::Release {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        return Some(c.encode_utf8(&mut buf).as_bytes().to_vec());
+    }
+    // キーの番号は修飾キーを押さないときの文字（Shift+a でも a）
+    let key = event
+        .unshifted
+        .unwrap_or_else(|| c.to_lowercase().next().unwrap_or(c));
+    let mut key_part = (key as u32).to_string();
+    if flags & ALTERNATE_KEYS != 0 {
+        let shifted = (m.shift && c != key).then_some(c);
+        let base = event.base_layout.filter(|&b| b != key);
+        match (shifted, base) {
+            (Some(s), Some(b)) => key_part += &format!(":{}:{}", s as u32, b as u32),
+            (Some(s), None) => key_part += &format!(":{}", s as u32),
+            (None, Some(b)) => key_part += &format!("::{}", b as u32),
+            (None, None) => {}
+        }
+    }
+    let text =
+        (flags & TEXT != 0 && all_keys && produces_text && event.kind != KeyEventKind::Release)
+            .then(|| (c as u32).to_string());
+    match text {
+        Some(text) if mods_part.is_empty() => csi(format!("{key_part};;{text}u")),
+        Some(text) => csi(format!("{key_part}{mods_part};{text}u")),
+        None => csi(format!("{key_part}{mods_part}u")),
+    }
+}
+
 /// Ctrl+キーで送る制御文字（xterm と同じ。Ctrl+2〜8 は Ctrl+@ / [ / \\ / ] / ^ / _ / ? と同じ）
 fn ctrl_byte(c: char) -> Option<u8> {
     match c.to_ascii_lowercase() {
@@ -694,6 +856,9 @@ mod tests {
                 code,
                 mods: m,
                 left_alt: true,
+                unshifted: None,
+                base_layout: None,
+                kind: KeyEventKind::Press,
             };
             String::from_utf8(router.encode_vt_bytes(&ev).unwrap()).unwrap()
         };
@@ -729,6 +894,146 @@ mod tests {
     }
 
     #[test]
+    fn encodes_kitty_keyboard_protocol() {
+        use kitty_flags::*;
+        let key = |code, m: Modifiers, kind, unshifted, base_layout| KeyEvent {
+            code,
+            mods: m,
+            left_alt: true,
+            unshifted,
+            base_layout,
+            kind,
+        };
+        let enc = |flags: u8, ev: KeyEvent| {
+            let router = InputRouter {
+                kitty_flags: flags,
+                ..InputRouter::default()
+            };
+            router
+                .encode_vt_bytes(&ev)
+                .map(|b| String::from_utf8(b).unwrap())
+        };
+        let none = mods(false, false, false);
+        let ctrl = mods(true, false, false);
+        let alt = mods(false, true, false);
+        let shift = mods(false, false, true);
+        let press = KeyEventKind::Press;
+        let release = KeyEventKind::Release;
+        let repeat = KeyEventKind::Repeat;
+        let ch = |c: char| KeyCode::Char(c);
+        let d = DISAMBIGUATE;
+        let cases: [(u8, KeyEvent, Option<&str>); 22] = [
+            // 見分けるだけ: Esc・Ctrl・Alt は CSI u、文字と Shift+文字はそのまま
+            (
+                d,
+                key(KeyCode::Escape, none, press, None, None),
+                Some("\x1b[27u"),
+            ),
+            (
+                d,
+                key(ch('a'), ctrl, press, Some('a'), Some('a')),
+                Some("\x1b[97;5u"),
+            ),
+            (
+                d,
+                key(ch('a'), alt, press, Some('a'), Some('a')),
+                Some("\x1b[97;3u"),
+            ),
+            (
+                d,
+                key(ch('a'), none, press, Some('a'), Some('a')),
+                Some("a"),
+            ),
+            (
+                d,
+                key(ch('A'), shift, press, Some('a'), Some('a')),
+                Some("A"),
+            ),
+            (d, key(KeyCode::Enter, none, press, None, None), Some("\r")),
+            (
+                d,
+                key(KeyCode::Enter, shift, press, None, None),
+                Some("\x1b[13;2u"),
+            ),
+            (
+                d,
+                key(KeyCode::Tab, shift, press, None, None),
+                Some("\x1b[9;2u"),
+            ),
+            (d, key(KeyCode::Up, none, press, None, None), Some("\x1b[A")),
+            (
+                d,
+                key(KeyCode::Up, ctrl, press, None, None),
+                Some("\x1b[1;5A"),
+            ),
+            (
+                d,
+                key(KeyCode::F(3), none, press, None, None),
+                Some("\x1b[13~"),
+            ),
+            (
+                d,
+                key(KeyCode::F(1), none, press, None, None),
+                Some("\x1b[P"),
+            ),
+            // 離したことは、種類を送るフラグがないと送らない
+            (d, key(KeyCode::Escape, none, release, None, None), None),
+            (
+                d | EVENT_TYPES,
+                key(KeyCode::Escape, none, release, None, None),
+                Some("\x1b[27;1:3u"),
+            ),
+            (
+                d | EVENT_TYPES,
+                key(ch('a'), ctrl, repeat, Some('a'), Some('a')),
+                Some("\x1b[97;5:2u"),
+            ),
+            // 文字のまま送るキーは、離したことを表せないので送らない
+            (
+                d | EVENT_TYPES,
+                key(ch('a'), none, release, Some('a'), Some('a')),
+                None,
+            ),
+            (
+                d | EVENT_TYPES,
+                key(KeyCode::Enter, none, release, None, None),
+                None,
+            ),
+            // すべてのキーを CSI u で送る
+            (
+                ALL_KEYS,
+                key(ch('a'), none, press, Some('a'), Some('a')),
+                Some("\x1b[97u"),
+            ),
+            (
+                ALL_KEYS,
+                key(KeyCode::Enter, none, press, None, None),
+                Some("\x1b[13u"),
+            ),
+            (
+                ALL_KEYS | TEXT,
+                key(ch('A'), shift, press, Some('a'), Some('a')),
+                Some("\x1b[97;2;65u"),
+            ),
+            // Shift を押したときの文字と、US 配列のキー（ここでは ф が US 配列の a の位置）
+            (
+                ALL_KEYS | ALTERNATE_KEYS,
+                key(ch('A'), shift, press, Some('a'), Some('a')),
+                Some("\x1b[97:65;2u"),
+            ),
+            (
+                ALL_KEYS | ALTERNATE_KEYS,
+                key(ch('ф'), none, press, Some('ф'), Some('a')),
+                Some("\x1b[1092::97u"),
+            ),
+        ];
+        for (flags, ev, expected) in cases {
+            let label = format!("{flags} {ev:?}");
+            assert_eq!(enc(flags, ev).as_deref(), expected, "{label}");
+        }
+    }
+
+    #[test]
     fn app_cursor_keys_send_ss3_without_modifiers() {
         let router = InputRouter {
             app_cursor_keys: true,
@@ -739,6 +1044,9 @@ mod tests {
                 code,
                 mods: m,
                 left_alt: false,
+                unshifted: None,
+                base_layout: None,
+                kind: KeyEventKind::Press,
             };
             router.encode_vt_bytes(&ev).unwrap()
         };
@@ -755,6 +1063,9 @@ mod tests {
             code: KeyCode::Char('h'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         // 左にペインがないので PTY へ Ctrl+H (0x08) を透過
         assert_eq!(
@@ -772,6 +1083,9 @@ mod tests {
             code: KeyCode::Char('h'),
             mods: mods(true, false, true),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&enter_mode, &ctx),
@@ -784,6 +1098,9 @@ mod tests {
             code: KeyCode::Char('x'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(router.route(&random, &ctx), InputDecision::Ignore);
 
@@ -792,6 +1109,9 @@ mod tests {
             code: KeyCode::Escape,
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&esc, &ctx),
@@ -811,11 +1131,17 @@ mod tests {
             code: KeyCode::Char('b'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         let key_h = KeyEvent {
             code: KeyCode::Char('h'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
         assert_eq!(
@@ -835,11 +1161,17 @@ mod tests {
             code: KeyCode::Char('b'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         let key_r = KeyEvent {
             code: KeyCode::Char('r'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
         assert_eq!(
@@ -852,6 +1184,9 @@ mod tests {
             code: KeyCode::Char('l'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&key_l, &ctx),
@@ -862,6 +1197,9 @@ mod tests {
             code: KeyCode::Enter,
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&enter, &ctx),
@@ -879,6 +1217,9 @@ mod tests {
             code: KeyCode::Char('g'),
             mods: mods(true, false, true),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&toggle, &ctx),
@@ -890,6 +1231,9 @@ mod tests {
             code: KeyCode::Char('j'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&j, &ctx),
@@ -900,6 +1244,9 @@ mod tests {
             code: KeyCode::Char('l'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&l, &ctx),
@@ -910,6 +1257,9 @@ mod tests {
             code: KeyCode::Char('h'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&h, &ctx),
@@ -920,6 +1270,9 @@ mod tests {
             code: KeyCode::Char('q'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&q, &ctx),
@@ -939,6 +1292,9 @@ mod tests {
             code: KeyCode::Char('t'),
             mods: mods(true, false, true),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&ev, &ctx),
@@ -960,6 +1316,9 @@ mod tests {
             code: KeyCode::Char('t'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&ctrl_t, &ctx),
@@ -971,6 +1330,9 @@ mod tests {
             code: KeyCode::Char('a'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(router.route(&ctrl_a, &ctx), InputDecision::Ignore);
         assert_eq!(router.mode, InputMode::Prefix);
@@ -979,6 +1341,9 @@ mod tests {
             code: KeyCode::Char('c'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&key_c, &ctx),
@@ -992,6 +1357,9 @@ mod tests {
             code: KeyCode::Char('%'),
             mods: mods(false, false, true),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&pct, &ctx),
@@ -1013,6 +1381,9 @@ mod tests {
             code: KeyCode::Escape,
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(router.route(&esc, &ctx), InputDecision::Ignore);
         assert_eq!(router.mode, InputMode::Normal);
@@ -1027,26 +1398,41 @@ mod tests {
             code: KeyCode::Char('j'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         let k = KeyEvent {
             code: KeyCode::Char('k'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         let slash = KeyEvent {
             code: KeyCode::Char('/'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         let q = KeyEvent {
             code: KeyCode::Char('q'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         let ctrl_j = KeyEvent {
             code: KeyCode::Char('j'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
 
         assert_eq!(router.route_go_to(&j, false), Some(GoToCommand::Next));
@@ -1074,6 +1460,9 @@ mod tests {
             code: KeyCode::Char('b'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
         assert_eq!(router.mode, InputMode::Prefix);
@@ -1082,6 +1471,9 @@ mod tests {
             code: KeyCode::Char('?'),
             mods: mods(false, false, true),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&qmark, &ctx),
@@ -1101,6 +1493,9 @@ mod tests {
             code: KeyCode::Char('t'),
             mods: mods(true, false, true),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&ctrl_shift_t, &ctx),
@@ -1113,11 +1508,17 @@ mod tests {
             code: KeyCode::Char('b'),
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         let key_w = KeyEvent {
             code: KeyCode::Char('w'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(router.route(&ctrl_b, &ctx), InputDecision::Ignore);
         assert_eq!(
@@ -1136,6 +1537,9 @@ mod tests {
             code: KeyCode::Enter,
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&enter, &ctx),
@@ -1146,6 +1550,9 @@ mod tests {
             code: KeyCode::Enter,
             mods: mods(true, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&ctrl_enter, &ctx),
@@ -1161,6 +1568,9 @@ mod tests {
                 logo: true,
             },
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             router.route(&cmd_enter, &ctx),
@@ -1178,6 +1588,9 @@ mod tests {
             code: KeyCode::Char('p'),
             mods: mods(false, false, false),
             left_alt: false,
+            unshifted: None,
+            base_layout: None,
+            kind: KeyEventKind::Press,
         };
         assert_eq!(
             custom_router.route(&key_p, &ctx),
