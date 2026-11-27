@@ -401,6 +401,24 @@ mod tests {
     }
 
     #[test]
+    fn cell_json_omits_default_fields() {
+        use term_core::grid::Cell;
+        assert_eq!(
+            serde_json::to_string(&Cell::default()).unwrap(),
+            r#"{"ch":" "}"#
+        );
+        let bold: Cell = serde_json::from_str(r#"{"ch":"a","bold":true}"#).unwrap();
+        assert_eq!(
+            bold,
+            Cell {
+                ch: 'a',
+                bold: true,
+                ..Cell::default()
+            }
+        );
+    }
+
+    #[test]
     fn auth_envelope_rejects_unauthenticated_and_http_smuggling() {
         let req = MuxRequest::Ping;
         let env = AuthEnvelope {

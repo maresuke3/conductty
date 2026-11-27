@@ -26,14 +26,53 @@ pub enum Color {
     Rgb(Rgb),
 }
 
+/// 下線の種類 (SGR 4 / 4:N / 21)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Underline {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+// NOTE: server からは毎回全セルを JSON で送るため、既定値の項目は書き出さずに小さくする
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
     pub ch: char,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub fg: Color,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub bg: Color,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub bold: bool,
+    /// 薄字 (SGR 2)
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub dim: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub underline: Underline,
+    /// 下線の色 (SGR 58)。既定色なら文字色で引く
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub underline_color: Color,
     /// 反転表示 (SGR 7)。前景と背景は描画のときに入れ替える
+    #[serde(default, skip_serializing_if = "is_default")]
     pub reverse: bool,
+    /// 非表示 (SGR 8)。文字を描かない
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub invisible: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub strikethrough: bool,
+    /// 上線 (SGR 53)
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub overline: bool,
 }
 
 impl Default for Cell {
@@ -43,7 +82,14 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             bold: false,
+            dim: false,
+            italic: false,
+            underline: Underline::None,
+            underline_color: Color::Default,
             reverse: false,
+            invisible: false,
+            strikethrough: false,
+            overline: false,
         }
     }
 }
@@ -117,6 +163,42 @@ pub const DEFAULT_PALETTE: [[u8; 3]; 256] = {
     p
 };
 
+/// SGR 38 / 48 / 58 の色を読み、使った引数のぶん i を進める
+/// `38;5;N` `38;2;R;G;B`（; 区切り）と `38:5:N` `38:2:R:G:B` `38:2::R:G:B`（: 区切り）を受け付ける
+fn parse_sgr_color(params: &[&[u16]], i: &mut usize) -> Option<Color> {
+    let rgb = |v: &[u16]| {
+        Color::Rgb(Rgb {
+            r: v[0] as u8,
+            g: v[1] as u8,
+            b: v[2] as u8,
+        })
+    };
+    let p = params[*i];
+    if p.len() > 1 {
+        return match (p[1], p.len()) {
+            (5, 3..) => Some(Color::Indexed(p[2] as u8)),
+            // 色空間の ID が入る形（38:2::R:G:B）と入らない形（38:2:R:G:B）
+            (2, 6..) => Some(rgb(&p[3..6])),
+            (2, 5) => Some(rgb(&p[2..5])),
+            _ => None,
+        };
+    }
+    let next = |n: usize| params.get(*i + n).map(|v| v[0]);
+    match next(1)? {
+        5 => {
+            let index = next(2)?;
+            *i += 2;
+            Some(Color::Indexed(index as u8))
+        }
+        2 => {
+            let (r, g, b) = (next(2)?, next(3)?, next(4)?);
+            *i += 4;
+            Some(rgb(&[r, g, b]))
+        }
+        _ => None,
+    }
+}
+
 fn parse_number<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
@@ -186,10 +268,8 @@ pub struct TerminalGrid {
     pub color_overrides: ColorOverrides,
     /// OSC の問い合わせに答えるためのテーマ。描画するテーマと同じものを set_theme で渡す
     theme: ResolvedTheme,
-    current_fg: Color,
-    current_bg: Color,
-    current_bold: bool,
-    current_reverse: bool,
+    /// これから書く文字の色と属性（SGR で変わる）。ch は使わない
+    pen: Cell,
     pending_wrap: bool,
     scroll_top: usize,
     scroll_bottom: usize,
@@ -218,10 +298,7 @@ impl TerminalGrid {
             kitty: KittyState::new(),
             color_overrides: ColorOverrides::default(),
             theme: ResolvedTheme::default(),
-            current_fg: Color::Default,
-            current_bg: Color::Default,
-            current_bold: false,
-            current_reverse: false,
+            pen: Cell::default(),
             pending_wrap: false,
             scroll_top: 0,
             scroll_bottom: rows - 1,
@@ -686,51 +763,60 @@ impl TerminalGrid {
     }
 
     fn apply_sgr(&mut self, params: &Params) {
-        let list: Vec<u16> = params
-            .iter()
-            .map(|p| p.first().copied().unwrap_or(0))
-            .collect();
-        if list.is_empty() {
+        // NOTE: 1 つの引数に `:` で区切った値が入ることがある（4:3、38:2::r:g:b など）
+        let params: Vec<&[u16]> = params.iter().collect();
+        if params.is_empty() {
             self.reset_sgr();
             return;
         }
+        let pen = &mut self.pen;
         let mut i = 0;
-        while i < list.len() {
-            match list[i] {
-                0 => self.reset_sgr(),
-                1 => self.current_bold = true,
-                7 => self.current_reverse = true,
-                22 => self.current_bold = false,
-                27 => self.current_reverse = false,
-                30..=37 => self.current_fg = Color::Indexed((list[i] - 30) as u8),
-                39 => self.current_fg = Color::Default,
-                40..=47 => self.current_bg = Color::Indexed((list[i] - 40) as u8),
-                49 => self.current_bg = Color::Default,
-                90..=97 => self.current_fg = Color::Indexed((list[i] - 90 + 8) as u8),
-                100..=107 => self.current_bg = Color::Indexed((list[i] - 100 + 8) as u8),
-                38 | 48 if i + 1 < list.len() => {
-                    let is_fg = list[i] == 38;
-                    let color = if list[i + 1] == 5 && i + 2 < list.len() {
-                        let c = Color::Indexed(list[i + 2] as u8);
-                        i += 2;
-                        Some(c)
-                    } else if list[i + 1] == 2 && i + 4 < list.len() {
-                        let c = Color::Rgb(Rgb {
-                            r: list[i + 2] as u8,
-                            g: list[i + 3] as u8,
-                            b: list[i + 4] as u8,
-                        });
-                        i += 4;
-                        Some(c)
-                    } else {
-                        None
-                    };
-                    match (color, is_fg) {
-                        (Some(c), true) => self.current_fg = c,
-                        (Some(c), false) => self.current_bg = c,
-                        (None, _) => {}
+        while i < params.len() {
+            let p = params[i];
+            match p[0] {
+                0 => *pen = Cell::default(),
+                1 => pen.bold = true,
+                2 => pen.dim = true,
+                3 => pen.italic = true,
+                4 => {
+                    pen.underline = match p.get(1) {
+                        Some(0) => Underline::None,
+                        Some(2) => Underline::Double,
+                        Some(3) => Underline::Curly,
+                        Some(4) => Underline::Dotted,
+                        Some(5) => Underline::Dashed,
+                        _ => Underline::Single,
                     }
                 }
+                7 => pen.reverse = true,
+                8 => pen.invisible = true,
+                9 => pen.strikethrough = true,
+                21 => pen.underline = Underline::Double,
+                22 => (pen.bold, pen.dim) = (false, false),
+                23 => pen.italic = false,
+                24 => pen.underline = Underline::None,
+                27 => pen.reverse = false,
+                28 => pen.invisible = false,
+                29 => pen.strikethrough = false,
+                30..=37 => pen.fg = Color::Indexed((p[0] - 30) as u8),
+                39 => pen.fg = Color::Default,
+                40..=47 => pen.bg = Color::Indexed((p[0] - 40) as u8),
+                49 => pen.bg = Color::Default,
+                53 => pen.overline = true,
+                55 => pen.overline = false,
+                59 => pen.underline_color = Color::Default,
+                90..=97 => pen.fg = Color::Indexed((p[0] - 90 + 8) as u8),
+                100..=107 => pen.bg = Color::Indexed((p[0] - 100 + 8) as u8),
+                38 | 48 | 58 => {
+                    if let Some(color) = parse_sgr_color(&params, &mut i) {
+                        match p[0] {
+                            38 => pen.fg = color,
+                            48 => pen.bg = color,
+                            _ => pen.underline_color = color,
+                        }
+                    }
+                }
+                // NOTE: 点滅 (5 / 6 / 25) は Ghostty と同じく描かない
                 _ => {}
             }
             i += 1;
@@ -738,10 +824,7 @@ impl TerminalGrid {
     }
 
     fn reset_sgr(&mut self) {
-        self.current_fg = Color::Default;
-        self.current_bg = Color::Default;
-        self.current_bold = false;
-        self.current_reverse = false;
+        self.pen = Cell::default();
     }
 }
 
@@ -801,18 +884,10 @@ impl Perform for TerminalGrid {
             self.cursor_col = 0;
             self.newline();
         }
-        let (fg, bg) = (self.current_fg, self.current_bg);
-
         self.clear_wide_overlap(self.cursor_row, self.cursor_col);
         let idx = self.cursor_row * self.cols + self.cursor_col;
         if let Some(cell) = self.cells.get_mut(idx) {
-            *cell = Cell {
-                ch: c,
-                fg,
-                bg,
-                bold: self.current_bold,
-                reverse: self.current_reverse,
-            };
+            *cell = Cell { ch: c, ..self.pen };
         }
 
         if width == 2 && self.cursor_col + 1 < self.cols {
@@ -820,10 +895,7 @@ impl Perform for TerminalGrid {
             if let Some(cont) = self.cells.get_mut(idx + 1) {
                 *cont = Cell {
                     ch: '\0',
-                    fg,
-                    bg,
-                    bold: self.current_bold,
-                    reverse: self.current_reverse,
+                    ..self.pen
                 };
             }
             if self.cursor_col + 2 >= self.cols {
@@ -1299,6 +1371,64 @@ mod tests {
         assert_eq!(parse_color_spec(b"rgb:ff/00/55/00"), None);
         assert_eq!(parse_color_spec(b"#ff00"), None);
         assert_eq!(parse_color_spec(b"red"), None);
+    }
+
+    #[test]
+    fn sgr_sets_and_clears_text_attributes() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.feed_bytes(b"\x1b[1;2;3;4;7;8;9;53mA\x1b[22;23;24;27;28;29;55mB");
+        let a = *grid.cell(0, 0).unwrap();
+        assert!(
+            a.bold
+                && a.dim
+                && a.italic
+                && a.reverse
+                && a.invisible
+                && a.strikethrough
+                && a.overline
+        );
+        assert_eq!(a.underline, Underline::Single);
+        assert_eq!(
+            *grid.cell(1, 0).unwrap(),
+            Cell {
+                ch: 'B',
+                ..Cell::default()
+            }
+        );
+
+        grid.feed_bytes(b"\r\x1b[4:3mC\x1b[21mD\x1b[4:0mE\x1b[4:5mF");
+        let underline = |col| grid.cell(col, 0).unwrap().underline;
+        assert_eq!(
+            [underline(0), underline(1), underline(2), underline(3)],
+            [
+                Underline::Curly,
+                Underline::Double,
+                Underline::None,
+                Underline::Dashed
+            ]
+        );
+    }
+
+    #[test]
+    fn sgr_reads_colon_and_semicolon_extended_colors() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.feed_bytes(
+            b"\x1b[38:2::10:20:30mA\x1b[38:2:1:2:3mB\x1b[38:5:200mC\x1b[58;5;196mD\x1b[58:2::4:5:6;59mE",
+        );
+        let cell = |col| *grid.cell(col, 0).unwrap();
+        assert_eq!(
+            cell(0).fg,
+            Color::Rgb(Rgb {
+                r: 10,
+                g: 20,
+                b: 30
+            })
+        );
+        assert_eq!(cell(1).fg, Color::Rgb(Rgb { r: 1, g: 2, b: 3 }));
+        assert_eq!(cell(2).fg, Color::Indexed(200));
+        assert_eq!(cell(3).underline_color, Color::Indexed(196));
+        // 58 のあとの 59 で下線の色を既定に戻す
+        assert_eq!(cell(4).underline_color, Color::Default);
     }
 
     #[test]

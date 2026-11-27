@@ -111,6 +111,7 @@ background_opacity = 0.85
 window_padding_x = 10.0
 window_padding_y = 10.0
 window_padding_balance = true
+# bold_is_bright = false  # 太字の 0〜7 番の色を明るい 8〜15 番で描く
 
 # テーマ色を個別に上書きしたい場合
 # [theme]
