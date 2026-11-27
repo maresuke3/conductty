@@ -536,6 +536,26 @@ impl TerminalGrid {
         }
     }
 
+    /// DECRQM に答えるモードの状態。set_private_mode で切り替えられるモードと同じものを並べる
+    fn private_mode_state(&self, mode: u16) -> Option<bool> {
+        let tracking = self.modes.mouse_tracking;
+        Some(match mode {
+            1 => self.modes.app_cursor_keys,
+            9 => tracking == MouseTracking::X10,
+            1000 => tracking == MouseTracking::Normal,
+            1002 => tracking == MouseTracking::ButtonEvent,
+            1003 => tracking == MouseTracking::AnyEvent,
+            25 => self.cursor_visible,
+            1004 => self.modes.focus_events,
+            1006 => self.modes.mouse_sgr,
+            1007 => self.modes.alt_scroll,
+            1049 => self.modes.alt_screen,
+            2004 => self.bracketed_paste,
+            2026 => self.synchronized_output,
+            _ => return None,
+        })
+    }
+
     fn set_private_mode(&mut self, mode: u16, on: bool) {
         match mode {
             1 => self.modes.app_cursor_keys = on,
@@ -1134,6 +1154,37 @@ impl Perform for TerminalGrid {
             .and_then(|p| p.first().copied())
             .unwrap_or(0) as usize;
         let is_private = intermediates.contains(&b'?');
+        // 問い合わせ（端末の種類・版・モードの状態）。返答は Ghostty と同じ
+        let reply = match (intermediates, action) {
+            // DA1: VT220 でカラーに対応
+            ([], 'c') if first == 0 => Some("\x1b[?62;22c".to_string()),
+            // DA2
+            ([b'>'], 'c') if first == 0 => Some("\x1b[>1;10;0c".to_string()),
+            // XTVERSION: 端末の名前と版
+            ([b'>'], 'q') if first == 0 => Some(format!(
+                "\x1bP>|conductty {}\x1b\\",
+                env!("CARGO_PKG_VERSION")
+            )),
+            // DECRQM: モードの状態（1 = オン、2 = オフ、0 = 知らないモード）
+            ([b'?', b'$'], 'p') => {
+                let state = match self.private_mode_state(first as u16) {
+                    Some(true) => 1,
+                    Some(false) => 2,
+                    None => 0,
+                };
+                Some(format!("\x1b[?{first};{state}$y"))
+            }
+            ([b'$'], 'p') => Some(format!("\x1b[{first};0$y")),
+            _ => None,
+        };
+        if let Some(reply) = reply {
+            self.push_reply(reply.into_bytes());
+            return;
+        }
+        // NOTE: CSI > 4 ; 2 m（modifyOtherKeys）などを、記号の無い CSI m（SGR）として扱わない
+        if intermediates.iter().any(|&b| b != b'?') {
+            return;
+        }
         match action {
             'A' => {
                 self.pending_wrap = false;
@@ -1323,6 +1374,8 @@ impl Perform for TerminalGrid {
                     self.set_private_mode(mode, action == 'h');
                 }
             }
+            // DSR 5: 端末の状態。いつも「問題なし」
+            'n' if first == 5 => self.push_reply(b"\x1b[0n".to_vec()),
             'n' if first == 6 => {
                 let reply = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
                 self.push_reply(reply.into_bytes());
@@ -1553,6 +1606,41 @@ mod tests {
         grid.feed_bytes(b"\x1b7\r\nxy\x1b#8");
         // ESC # 8 はカーソルを戻す ESC 8 ではない（戻すなら ESC 7 で覚えた列 3・行 0 に行く）
         assert_eq!((grid.cursor_col, grid.cursor_row), (2, 1));
+    }
+
+    #[test]
+    fn answers_device_attribute_version_and_mode_queries() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.feed_bytes(
+            b"\x1b[c\x1b[>c\x1b[>q\x1b[5n\x1b[?2004h\x1b[?2004$p\x1b[?25l\x1b[?25$p\x1b[?9999$p",
+        );
+        let version = format!("\x1bP>|conductty {}\x1b\\", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            grid.take_replies(),
+            vec![
+                b"\x1b[?62;22c".to_vec(),
+                b"\x1b[>1;10;0c".to_vec(),
+                version.into_bytes(),
+                b"\x1b[0n".to_vec(),
+                b"\x1b[?2004;1$y".to_vec(),
+                b"\x1b[?25;2$y".to_vec(),
+                b"\x1b[?9999;0$y".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn csi_with_unknown_intermediates_is_ignored() {
+        let mut grid = TerminalGrid::new(4, 1);
+        // modifyOtherKeys を有効にする CSI > 4 ; 2 m を、SGR（下線・薄字）として扱わない
+        grid.feed_bytes(b"\x1b[>4;2mA");
+        assert_eq!(
+            *grid.cell(0, 0).unwrap(),
+            Cell {
+                ch: 'A',
+                ..Cell::default()
+            }
+        );
     }
 
     #[test]
