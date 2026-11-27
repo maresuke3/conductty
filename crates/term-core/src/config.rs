@@ -99,6 +99,10 @@ pub struct FeaturesConfig {
     pub embedded_browser: bool,
     pub kitty_graphics: bool,
     pub copy_on_select: bool,
+    /// アプリからの通知 (OSC 9 / 777) をデスクトップの通知で出す（Ghostty の desktop-notifications）
+    pub desktop_notifications: bool,
+    /// ベル (BEL) が鳴ったら、Dock のアイコンで知らせ、見ていないタブに 🔔 を付ける
+    pub bell: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +287,8 @@ impl Default for FeaturesConfig {
             embedded_browser: true,
             kitty_graphics: true,
             copy_on_select: true,
+            desktop_notifications: true,
+            bell: true,
         }
     }
 }
