@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::{Deserialize, Serialize};
 use vte::{Params, Parser, Perform};
@@ -73,6 +76,9 @@ pub struct Cell {
     /// 上線 (SGR 53)
     #[serde(default, skip_serializing_if = "is_default")]
     pub overline: bool,
+    /// OSC 8 のリンク。grid では grid.links、GridSnapshot では snapshot.links の番号
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub link: Option<u32>,
 }
 
 impl Default for Cell {
@@ -90,6 +96,7 @@ impl Default for Cell {
             invisible: false,
             strikethrough: false,
             overline: false,
+            link: None,
         }
     }
 }
@@ -111,6 +118,18 @@ pub struct GridSnapshot {
     pub cells: Vec<Cell>,
     #[serde(default)]
     pub color_overrides: ColorOverrides,
+    /// OSC 0 / 2 のタイトル
+    #[serde(default)]
+    pub title: Option<String>,
+    /// OSC 7 で知らされたカレントディレクトリ
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// 画面に出ているセルが指す OSC 8 のリンク（cells の link はこの番号）
+    #[serde(default)]
+    pub links: Vec<String>,
+    /// OSC 52 でクリップボードに書くよう頼まれた最後の文字列と、その通し番号
+    #[serde(default)]
+    pub clipboard_write: Option<(u64, String)>,
 }
 
 /// マウスの報告の範囲 (CSI ?9 / ?1000 / ?1002 / ?1003 h)
@@ -298,6 +317,37 @@ impl Charset {
     }
 }
 
+const MAX_TITLE_CHARS: usize = 1024;
+const MAX_LINKS: usize = 4096;
+/// OSC 52 で受け取る base64 の上限（元のデータで約 6MB）
+const MAX_CLIPBOARD_BASE64_BYTES: usize = 8 * 1024 * 1024;
+
+/// OSC 7 の `file://ホスト/パス` からパスを取り出す（%XX は戻す）
+/// NOTE: ホスト名は確かめない。ssh 先のパスが入ることもあるので、使う側で存在するディレクトリかを確かめる
+fn parse_osc7_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = &rest[rest.find('/')?..];
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match (bytes[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn parse_number<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
@@ -368,6 +418,14 @@ pub struct TerminalGrid {
     pub color_overrides: ColorOverrides,
     /// OSC の問い合わせに答えるためのテーマ。描画するテーマと同じものを set_theme で渡す
     theme: ResolvedTheme,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    /// OSC 8 のリンクの URI（セルの link はこの番号）と、同じ URI を探すための表
+    pub links: Vec<String>,
+    link_ids: HashMap<String, u32>,
+    /// OSC 52 でクリップボードに書くよう頼まれた最後の文字列と、その通し番号
+    pub clipboard_write: Option<(u64, String)>,
+    clipboard_seq: u64,
     /// これから書く文字の色と属性（SGR で変わる）。ch は使わない
     pen: Cell,
     pending_wrap: bool,
@@ -403,6 +461,12 @@ impl TerminalGrid {
             kitty: KittyState::new(),
             color_overrides: ColorOverrides::default(),
             theme: ResolvedTheme::default(),
+            title: None,
+            cwd: None,
+            links: Vec::new(),
+            link_ids: HashMap::new(),
+            clipboard_write: None,
+            clipboard_seq: 0,
             pen: Cell::default(),
             pending_wrap: false,
             scroll_top: 0,
@@ -460,9 +524,21 @@ impl TerminalGrid {
 
     pub fn snapshot(&self) -> GridSnapshot {
         let mut cells = Vec::with_capacity(self.cols * self.rows);
+        // NOTE: server から毎回送るため、リンクは画面に出ているセルが指すものだけを番号を振り直して入れる
+        let mut links = Vec::new();
+        let mut renumber = HashMap::new();
         for row in 0..self.rows {
             for col in 0..self.cols {
-                cells.push(self.visible_cell(col, row).copied().unwrap_or_default());
+                let mut cell = self.visible_cell(col, row).copied().unwrap_or_default();
+                if let Some(id) = cell.link {
+                    cell.link = self.links.get(id as usize).map(|uri| {
+                        *renumber.entry(id).or_insert_with(|| {
+                            links.push(uri.clone());
+                            links.len() as u32 - 1
+                        })
+                    });
+                }
+                cells.push(cell);
             }
         }
         GridSnapshot {
@@ -477,6 +553,10 @@ impl TerminalGrid {
             generation: self.generation,
             cells,
             color_overrides: self.color_overrides.clone(),
+            title: self.title.clone(),
+            cwd: self.cwd.clone(),
+            links,
+            clipboard_write: self.clipboard_write.clone(),
         }
     }
 
@@ -617,6 +697,44 @@ impl TerminalGrid {
             2004 => self.bracketed_paste = on,
             2026 => self.synchronized_output = on,
             _ => {}
+        }
+    }
+
+    /// リンクの URI の番号。同じ URI は同じ番号にする
+    fn link_id(&mut self, uri: String) -> Option<u32> {
+        if uri.is_empty() {
+            return None;
+        }
+        if let Some(&id) = self.link_ids.get(&uri) {
+            return Some(id);
+        }
+        // shortcut: 番号を振り直すとセルが別の URI を指してしまうため、上限を超えたリンクは記録しない。
+        //           長く開いたままの端末でリンクが効かなくなったら、使われなくなったリンクを捨てる仕組みを入れる
+        if self.links.len() >= MAX_LINKS {
+            return None;
+        }
+        let id = self.links.len() as u32;
+        self.links.push(uri.clone());
+        self.link_ids.insert(uri, id);
+        Some(id)
+    }
+
+    /// OSC 52 ; 種類 ; base64。書き込みだけを受け付ける
+    /// shortcut: 読み出し（? の問い合わせ）は、ほかのプログラムにクリップボードを読まれないよう答えない。
+    ///           Ghostty のように毎回確かめる画面を作るときに対応する
+    fn handle_clipboard_osc(&mut self, params: &[&[u8]]) {
+        let Some(data) = params.get(2) else {
+            return;
+        };
+        if *data == b"?" || data.len() > MAX_CLIPBOARD_BASE64_BYTES {
+            return;
+        }
+        if let Ok(bytes) = BASE64.decode(data) {
+            self.clipboard_seq += 1;
+            self.clipboard_write = Some((
+                self.clipboard_seq,
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ));
         }
     }
 
@@ -948,7 +1066,13 @@ impl TerminalGrid {
         while i < params.len() {
             let p = params[i];
             match p[0] {
-                0 => *pen = Cell::default(),
+                // NOTE: リンク (OSC 8) は文字の飾りではないので SGR 0 では閉じない
+                0 => {
+                    *pen = Cell {
+                        link: pen.link,
+                        ..Cell::default()
+                    }
+                }
                 1 => pen.bold = true,
                 2 => pen.dim = true,
                 3 => pen.italic = true,
@@ -998,7 +1122,10 @@ impl TerminalGrid {
     }
 
     fn reset_sgr(&mut self) {
-        self.pen = Cell::default();
+        self.pen = Cell {
+            link: self.pen.link,
+            ..Cell::default()
+        };
     }
 }
 
@@ -1113,7 +1240,20 @@ impl Perform for TerminalGrid {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
-        self.handle_color_osc(params, bell_terminated);
+        // NOTE: 値に ; が入ることがあり、vte が ; で分けてしまうので、2 つ目からはつなぎ直す
+        let rest = |from: usize| -> String {
+            let joined = params.get(from..).unwrap_or_default().join(&b';');
+            String::from_utf8_lossy(&joined).into_owned()
+        };
+        match params.first().and_then(|p| parse_number::<u16>(p)) {
+            // タイトル（1 はアイコン名なので使わない）
+            Some(0 | 2) => self.title = Some(rest(1).chars().take(MAX_TITLE_CHARS).collect()),
+            Some(7) => self.cwd = parse_osc7_path(&rest(1)),
+            // OSC 8 ; 引数 ; URI。URI が空ならリンクを閉じる
+            Some(8) => self.pen.link = self.link_id(rest(2)),
+            Some(52) => self.handle_clipboard_osc(params),
+            _ => self.handle_color_osc(params, bell_terminated),
+        }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
@@ -1176,8 +1316,8 @@ impl Perform for TerminalGrid {
         let is_private = intermediates.contains(&b'?');
         // 問い合わせ（端末の種類・版・モードの状態）。返答は Ghostty と同じ
         let reply = match (intermediates, action) {
-            // DA1: VT220 でカラーに対応
-            ([], 'c') if first == 0 => Some("\x1b[?62;22c".to_string()),
+            // DA1: VT220 でカラーとクリップボードの書き込み (OSC 52) に対応
+            ([], 'c') if first == 0 => Some("\x1b[?62;22;52c".to_string()),
             // DA2
             ([b'>'], 'c') if first == 0 => Some("\x1b[>1;10;0c".to_string()),
             // XTVERSION: 端末の名前と版
@@ -1651,7 +1791,7 @@ mod tests {
         assert_eq!(
             grid.take_replies(),
             vec![
-                b"\x1b[?62;22c".to_vec(),
+                b"\x1b[?62;22;52c".to_vec(),
                 b"\x1b[>1;10;0c".to_vec(),
                 version.into_bytes(),
                 b"\x1b[0n".to_vec(),
@@ -1697,6 +1837,48 @@ mod tests {
             (grid.modes.cursor_style, grid.modes.cursor_blink),
             (None, None)
         );
+    }
+
+    #[test]
+    fn osc_sets_title_and_cwd() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.feed_bytes(b"\x1b]2;vim; main.rs\x07\x1b]7;file://mac.local/Users/me/my%20dir\x1b\\");
+        assert_eq!(grid.title.as_deref(), Some("vim; main.rs"));
+        assert_eq!(grid.cwd.as_deref(), Some("/Users/me/my dir"));
+        grid.feed_bytes(b"\x1b]0;zsh\x07\x1b]7;not-a-file-uri\x07");
+        let snap = grid.snapshot();
+        assert_eq!((snap.title.as_deref(), snap.cwd), (Some("zsh"), None));
+    }
+
+    #[test]
+    fn osc_8_links_cells_and_snapshot_keeps_only_visible_links() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.feed_bytes(
+            b"\x1b]8;id=a;https://example.com/a;b\x1b\\A\x1b[0mB\x1b]8;;\x1b\\C\x1b]8;;https://example.com/a;b\x07D",
+        );
+        let link = |col| grid.cell(col, 0).unwrap().link;
+        // SGR 0 ではリンクを閉じない。同じ URI には同じ番号を使う
+        assert_eq!(
+            [link(0), link(1), link(2), link(3)],
+            [Some(0), Some(0), None, Some(0)]
+        );
+        assert_eq!(grid.links, vec!["https://example.com/a;b".to_string()]);
+
+        grid.feed_bytes(b"\r\x1b]8;;https://example.com/b\x07XYZW\x1b]8;;\x07");
+        let snap = grid.snapshot();
+        // 画面から消えた a は入らず、b が 0 番になる
+        assert_eq!(snap.links, vec!["https://example.com/b".to_string()]);
+        assert_eq!(snap.cells[0].link, Some(0));
+    }
+
+    #[test]
+    fn osc_52_writes_clipboard_but_ignores_reads() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.feed_bytes(b"\x1b]52;c;44GT44KT44Gr44Gh44Gv\x07");
+        assert_eq!(grid.clipboard_write, Some((1, "こんにちは".to_string())));
+        grid.feed_bytes(b"\x1b]52;c;?\x07\x1b]52;c;!!!\x07");
+        assert_eq!(grid.clipboard_write.as_ref().map(|w| w.0), Some(1));
+        assert!(grid.take_replies().is_empty());
     }
 
     #[test]

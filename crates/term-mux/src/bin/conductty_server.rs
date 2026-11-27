@@ -60,10 +60,16 @@ impl ServerState {
         let cols = cols.clamp(10, 1000);
         let rows = rows.clamp(4, 1000);
 
+        // Ghostty と同じく、フォーカス中のペインのカレントディレクトリ (OSC 7) で新しいペインを開く
+        let cwd = self
+            .panes
+            .get(&self.manager.active_tab().focused_pane)
+            .and_then(|p| p.grid.lock().ok()?.cwd.clone());
         let mut pty = match PtySession::spawn(
             cols as u16,
             rows as u16,
             &self.config.shell.windows_default_prog,
+            cwd.as_deref().map(std::path::Path::new),
         ) {
             Ok(p) => p,
             Err(err) => {
