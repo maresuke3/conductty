@@ -132,6 +132,11 @@ window_padding_balance = true
 # [os.windows.shell]
 # windows_default_prog = ["wsl.exe", "--cd", "~"]
 
+# zsh のシェル連携（プロンプトの区切り・カレントディレクトリ・タイトル）。既定でオン
+# Cmd+↑ / Cmd+↓ で前・次のプロンプトへスクロールできる
+# [shell]
+# shell_integration = false
+
 [window]
 save_state = "always"
 split_preserve_zoom = "navigation"

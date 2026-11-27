@@ -1,9 +1,9 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -41,11 +41,13 @@ impl Drop for PtySession {
 impl PtySession {
     /// OS に応じたデフォルトシェル（Windows は powershell.exe 等）を PTY 上で起動する。
     /// cwd を渡すとそのディレクトリでシェルを起動する（無いディレクトリなら渡さなかったのと同じ）
+    /// shell_integration が true なら、zsh にシェル連携のスクリプトを読ませる
     pub fn spawn(
         cols: u16,
         rows: u16,
         windows_prog: &[String],
         cwd: Option<&Path>,
+        shell_integration: bool,
     ) -> Result<Self, PtyError> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -71,7 +73,14 @@ impl PtySession {
             c.cwd(win_cwd);
             c
         } else {
-            unix_shell_command()
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let mut c = unix_shell_command(&shell);
+            if shell_integration && let Some(dir) = zsh_integration_dir() {
+                for (key, value) in zsh_integration_env(&shell, std::env::var_os("ZDOTDIR"), &dir) {
+                    c.env(key, value);
+                }
+            }
+            c
         };
         if let Some(dir) = cwd.filter(|d| d.is_dir()) {
             cmd.cwd(dir);
@@ -180,8 +189,48 @@ fn path_with_dir(path: Option<OsString>, dir: &Path) -> Option<OsString> {
     std::env::join_paths(paths).ok()
 }
 
-fn unix_shell_command() -> CommandBuilder {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+const ZSH_ENV: &str = include_str!("../shell-integration/zsh/.zshenv");
+const ZSH_INTEGRATION: &str = include_str!("../shell-integration/zsh/conductty-integration.zsh");
+
+/// zsh のシェル連携のスクリプトを ~/.cache/conductty/shell-integration/zsh に書き出し、そのディレクトリを返す
+/// 書き出せないときは None（シェル連携なしで起動する）
+fn zsh_integration_dir() -> Option<PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir =
+            PathBuf::from(std::env::var_os("HOME")?).join(".cache/conductty/shell-integration/zsh");
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(dir.join(".zshenv"), ZSH_ENV).ok()?;
+        std::fs::write(dir.join("conductty-integration.zsh"), ZSH_INTEGRATION).ok()?;
+        Some(dir)
+    })
+    .clone()
+}
+
+/// zsh のときだけ、ZDOTDIR を差し替えてシェル連携のスクリプトを読ませる（Ghostty と同じやり方）
+/// 元の ZDOTDIR は CONDUCTTY_ZSH_ZDOTDIR で渡し、スクリプトの中で戻す
+fn zsh_integration_env(
+    shell: &str,
+    zdotdir: Option<OsString>,
+    dir: &Path,
+) -> Vec<(&'static str, OsString)> {
+    if Path::new(shell).file_name() != Some("zsh".as_ref()) {
+        return Vec::new();
+    }
+    let mut env = vec![
+        ("ZDOTDIR", dir.as_os_str().to_owned()),
+        (
+            "CONDUCTTY_SHELL_INTEGRATION_DIR",
+            dir.as_os_str().to_owned(),
+        ),
+    ];
+    if let Some(zdotdir) = zdotdir {
+        env.push(("CONDUCTTY_ZSH_ZDOTDIR", zdotdir));
+    }
+    env
+}
+
+fn unix_shell_command(shell: &str) -> CommandBuilder {
     let mut c = CommandBuilder::new(shell);
     // .app 起動時は launchd の最小 PATH しか持たないため、ログインシェルで ~/.zprofile 等を読ませる
     if cfg!(target_os = "macos") {
@@ -195,8 +244,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zsh_integration_env_only_for_zsh_and_keeps_user_zdotdir() {
+        let dir = Path::new("/tmp/conductty-zsh");
+        assert!(zsh_integration_env("/bin/bash", None, dir).is_empty());
+        let env = zsh_integration_env("/opt/homebrew/bin/zsh", Some("/Users/me/.zsh".into()), dir);
+        assert_eq!(
+            env,
+            vec![
+                ("ZDOTDIR", OsString::from("/tmp/conductty-zsh")),
+                (
+                    "CONDUCTTY_SHELL_INTEGRATION_DIR",
+                    OsString::from("/tmp/conductty-zsh")
+                ),
+                ("CONDUCTTY_ZSH_ZDOTDIR", OsString::from("/Users/me/.zsh")),
+            ]
+        );
+        assert_eq!(zsh_integration_env("zsh", None, dir).len(), 2);
+    }
+
+    #[test]
     fn unix_shell_is_login_shell_only_on_macos() {
-        let argv = unix_shell_command().get_argv().clone();
+        let argv = unix_shell_command("/bin/zsh").get_argv().clone();
         let expected = if cfg!(target_os = "macos") { 2 } else { 1 };
         assert_eq!(argv.len(), expected);
         assert_eq!(

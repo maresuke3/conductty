@@ -70,6 +70,7 @@ impl ServerState {
             rows as u16,
             &self.config.shell.windows_default_prog,
             cwd.as_deref().map(std::path::Path::new),
+            self.config.shell.shell_integration,
         ) {
             Ok(p) => p,
             Err(err) => {

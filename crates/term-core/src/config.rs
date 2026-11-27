@@ -175,12 +175,17 @@ pub struct KeybindsConfig {
     pub paste: String,
     pub reload_config: String,
     pub keybind_hints: String,
+    /// 前・次のプロンプトへスクロールする（シェル連携が要る）
+    pub jump_to_prev_prompt: String,
+    pub jump_to_next_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
     pub windows_default_prog: Vec<String>,
+    /// zsh にシェル連携のスクリプトを読ませる（プロンプトの区切り・カレントディレクトリ・タイトル）
+    pub shell_integration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +347,8 @@ impl Default for KeybindsConfig {
             paste: "ctrl+v".to_string(),
             reload_config: "ctrl+shift+r".to_string(),
             keybind_hints: "prefix+?".to_string(),
+            jump_to_prev_prompt: "cmd+up".to_string(),
+            jump_to_next_prompt: "cmd+down".to_string(),
         }
     }
 }
@@ -350,6 +357,7 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             windows_default_prog: vec!["powershell.exe".into()],
+            shell_integration: true,
         }
     }
 }
