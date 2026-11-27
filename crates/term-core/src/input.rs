@@ -115,6 +115,8 @@ pub enum Action {
     ToggleKeybindHints,
     OpenPaneMode,
     OpenGoTo,
+    /// 前 (-1)・次 (1) のプロンプトへスクロールする
+    JumpToPrompt(i8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +266,8 @@ impl InputRouter {
             (&kb.paste, Action::Paste),
             (&kb.reload_config, Action::ReloadConfig),
             (&kb.keybind_hints, Action::ToggleKeybindHints),
+            (&kb.jump_to_prev_prompt, Action::JumpToPrompt(-1)),
+            (&kb.jump_to_next_prompt, Action::JumpToPrompt(1)),
         ];
 
         let prefix_trigger = if kb.prefix.trim().is_empty() {

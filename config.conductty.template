@@ -100,10 +100,16 @@ copy = "ctrl+shift+c"
 paste = "ctrl+v"
 reload_config = "ctrl+shift+r"
 keybind_hints = "prefix+?"
+# 前・次のプロンプトへスクロールする（シェル連携が要る。Ghostty と同じキー）
+jump_to_prev_prompt = "cmd+up"
+jump_to_next_prompt = "cmd+down"
 
 [shell]
 # Windows で起動するデフォルトシェル（既定値: ["powershell.exe"]）
 windows_default_prog = ["powershell.exe"]
+# zsh にシェル連携のスクリプトを読ませる（プロンプトの区切り・カレントディレクトリ・タイトルを送る。Ghostty と同じやり方）
+# スクリプトは ~/.cache/conductty/shell-integration/zsh に書き出し、ZDOTDIR をそこに向けて起動する
+shell_integration = true
 
 [window]
 # ウィンドウ状態保存ポリシー（例: "always"）

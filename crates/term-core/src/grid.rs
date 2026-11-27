@@ -79,6 +79,21 @@ pub struct Cell {
     /// OSC 8 のリンク。grid では grid.links、GridSnapshot では snapshot.links の番号
     #[serde(default, skip_serializing_if = "is_default")]
     pub link: Option<u32>,
+    /// シェル連携 (OSC 133) で知らされた、プロンプト・入力・出力のどれか
+    /// NOTE: プロンプト間の移動は grid の中で済むので、server からアプリへは送らない
+    #[serde(skip)]
+    pub semantic: Semantic,
+}
+
+/// シェル連携 (OSC 133) でのセルの役割
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Semantic {
+    /// コマンドの出力（印の無いところも含む）
+    #[default]
+    Output,
+    Prompt,
+    /// プロンプトのあとに打ったコマンド
+    Input,
 }
 
 impl Default for Cell {
@@ -97,6 +112,7 @@ impl Default for Cell {
             strikethrough: false,
             overline: false,
             link: None,
+            semantic: Semantic::Output,
         }
     }
 }
@@ -883,6 +899,39 @@ impl TerminalGrid {
         self.theme.with_overrides(&self.color_overrides)
     }
 
+    /// 前 (delta < 0)・次 (delta > 0) のプロンプトが画面のいちばん上に来るようにスクロールする
+    /// プロンプトか入力の印があるひと続きの行の、最初の行をプロンプトとみなす
+    /// NOTE: zle がプロンプトを描き直すと、印が入力に変わることがあるため、入力の行もまとめて数える
+    pub fn jump_to_prompt(&mut self, delta: isize) {
+        let history = self.scrollback.len();
+        let total = history + self.rows;
+        let is_prompt_line = |line: usize| {
+            let cells = if line < history {
+                &self.scrollback[line][..]
+            } else {
+                let start = (line - history) * self.cols;
+                &self.cells[start..start + self.cols]
+            };
+            cells.iter().any(|c| c.semantic != Semantic::Output)
+        };
+        let is_start =
+            |line: usize| is_prompt_line(line) && (line == 0 || !is_prompt_line(line - 1));
+        let mut top = history - self.scroll_offset.min(history);
+        for _ in 0..delta.unsigned_abs() {
+            let found = if delta < 0 {
+                (0..top).rev().find(|&l| is_start(l))
+            } else {
+                (top + 1..total).find(|&l| is_start(l))
+            };
+            match found {
+                Some(line) => top = line,
+                None => break,
+            }
+        }
+        // 画面の中のプロンプトなら、いちばん下まで戻す（スクロールしていない状態）
+        self.scroll_offset = history.saturating_sub(top);
+    }
+
     pub fn scroll_up(&mut self, lines: usize) {
         let next = (self.scroll_offset + lines).min(self.scrollback.len());
         if next != self.scroll_offset {
@@ -1212,10 +1261,11 @@ impl TerminalGrid {
         while i < params.len() {
             let p = params[i];
             match p[0] {
-                // NOTE: リンク (OSC 8) は文字の飾りではないので SGR 0 では閉じない
+                // NOTE: リンク (OSC 8) とシェル連携の役割 (OSC 133) は文字の飾りではないので SGR 0 では戻さない
                 0 => {
                     *pen = Cell {
                         link: pen.link,
+                        semantic: pen.semantic,
                         ..Cell::default()
                     }
                 }
@@ -1270,6 +1320,7 @@ impl TerminalGrid {
     fn reset_sgr(&mut self) {
         self.pen = Cell {
             link: self.pen.link,
+            semantic: self.pen.semantic,
             ..Cell::default()
         };
     }
@@ -1404,6 +1455,13 @@ impl Perform for TerminalGrid {
             // OSC 8 ; 引数 ; URI。URI が空ならリンクを閉じる
             Some(8) => self.pen.link = self.link_id(rest(2)),
             Some(52) => self.handle_clipboard_osc(params),
+            // シェル連携: A プロンプトの始まり、B 入力の始まり、C 出力の始まり、D コマンドの終わり
+            Some(133) => match params.get(1).and_then(|p| p.first()) {
+                Some(b'A') => self.pen.semantic = Semantic::Prompt,
+                Some(b'B') => self.pen.semantic = Semantic::Input,
+                Some(b'C' | b'D') => self.pen.semantic = Semantic::Output,
+                _ => {}
+            },
             _ => self.handle_color_osc(params, bell_terminated),
         }
     }
@@ -2180,6 +2238,39 @@ mod tests {
         // CSI u（記号なし）はカーソルを戻す命令のまま
         grid.feed_bytes(b"\x1b[sab\x1b[u");
         assert_eq!(grid.cursor_col, 0);
+    }
+
+    #[test]
+    fn osc_133_marks_prompts_and_jumps_between_them() {
+        let mut grid = TerminalGrid::new(10, 3);
+        // 3 つのコマンドを打ち、それぞれ 2 行ずつ出力する
+        for cmd in ["ls", "pwd", "date"] {
+            grid.feed_bytes(b"\x1b]133;A\x07$ \x1b[1m\x1b]133;B\x07\x1b[0m");
+            grid.feed_bytes(cmd.as_bytes());
+            grid.feed_bytes(b"\r\n\x1b]133;C\x07out1\r\nout2\r\n\x1b]133;D;0\x07");
+        }
+        grid.feed_bytes(b"\x1b]133;A\x07$ ");
+        // SGR 0 のあとも入力の印は残る
+        assert_eq!(grid.scrollback[0][2].semantic, Semantic::Input);
+        assert_eq!(grid.scrollback[1][0].semantic, Semantic::Output);
+
+        let top_text = |grid: &TerminalGrid| {
+            (0..grid.cols)
+                .map(|c| grid.visible_cell(c, 0).unwrap().ch)
+                .collect::<String>()
+        };
+        grid.jump_to_prompt(-1);
+        assert!(top_text(&grid).starts_with("$ date"));
+        grid.jump_to_prompt(-2);
+        assert!(top_text(&grid).starts_with("$ ls"));
+        // もう前には無いので動かない
+        grid.jump_to_prompt(-1);
+        assert!(top_text(&grid).starts_with("$ ls"));
+        grid.jump_to_prompt(1);
+        assert!(top_text(&grid).starts_with("$ pwd"));
+        // 最後のプロンプトは画面の中にあるので、スクロールしていない状態に戻る
+        grid.jump_to_prompt(5);
+        assert_eq!(grid.scroll_offset, 0);
     }
 
     #[test]

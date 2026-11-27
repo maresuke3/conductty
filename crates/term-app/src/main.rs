@@ -563,6 +563,7 @@ impl App {
             rows as u16,
             &self.config.shell.windows_default_prog,
             cwd.as_deref().map(std::path::Path::new),
+            self.config.shell.shell_integration,
         ) {
             Ok(mut pty) => {
                 let (_, dummy_rx) = std::sync::mpsc::channel();
@@ -1877,6 +1878,19 @@ impl App {
             }
             Action::Paste => {
                 self.paste_clipboard();
+            }
+            Action::JumpToPrompt(delta) => {
+                // shortcut: マルチプレクサのときは server のスクロールバックを動かせないので何もしない。
+                //           server でのスクロールに対応するときに、MuxRequest を足して同じことをする
+                let focused = self.manager.active_tab().focused_pane;
+                if let Some(pane) = self.panes.get(&focused)
+                    && let Ok(mut g) = pane.grid.lock()
+                {
+                    g.jump_to_prompt(delta as isize);
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             Action::ReloadConfig => {
                 let new_cfg = AppConfig::load();
