@@ -53,8 +53,10 @@ mod imp {
 
             // .rsrc のアイコンリソース (ID=1) をロードし、クラスアイコンとウィンドウアイコンの両方へ設定する
             let h_inst = GetModuleHandleW(core::ptr::null());
-            let big_icon = LoadImageW(h_inst, 1usize as *const u16, 1, 0, 0, 0x0040 | 0x8000);
-            let small_icon = LoadImageW(h_inst, 1usize as *const u16, 1, 32, 32, 0x8000);
+            // MAKEINTRESOURCEW(1)。clippy の勧める ptr::dangling は 2（u16 の整列）になり別のリソースを指すので使わない
+            let icon_id = core::ptr::without_provenance::<u16>(1);
+            let big_icon = LoadImageW(h_inst, icon_id, 1, 0, 0, 0x0040 | 0x8000);
+            let small_icon = LoadImageW(h_inst, icon_id, 1, 32, 32, 0x8000);
             if big_icon != 0 {
                 SetClassLongPtrW(hwnd, -14, big_icon); // GCLP_HICON
                 SendMessageW(hwnd, 0x0080, 1, big_icon); // WM_SETICON, ICON_BIG
