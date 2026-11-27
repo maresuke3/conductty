@@ -42,6 +42,7 @@ adjust_cell_height = 2.0
 #   "GitHub Dark" / "GitHub Light"
 #   "Gruvbox Dark" / "Gruvbox Light" / "Gruvbox Material"
 #   "Tokyo Night" / "Tokyo Night Day" / "Tokyo Night Moon" / "Tokyo Night Night" / "Tokyo Night Storm"
+#   "Cyberpunk" / "Dopagaki"
 # プリセットに無い名前は、Ghostty 形式のテーマファイル ~/.config/conductty/themes/<名前>（または絶対パス）を読む
 #   例: Ghostty の themes フォルダから cyberpunk-icy をコピーして theme = "cyberpunk-icy"
 theme = "TokyoNight Moon"

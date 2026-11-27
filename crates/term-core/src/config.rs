@@ -702,6 +702,8 @@ pub const THEME_PRESETS: &[&str] = &[
     "Tokyo Night Moon",
     "Tokyo Night Night",
     "Tokyo Night Storm",
+    "Cyberpunk",
+    "Dopagaki",
 ];
 
 fn normalize_theme_key(name: &str) -> String {
@@ -788,6 +790,26 @@ fn parse_palette_entry(value: &str) -> Option<(usize, [u8; 3])> {
 fn mix_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
 }
+
+/// Ghostty の cyberpunk-icy の 16 色
+const CYBERPUNK_ICY_ANSI: [[u8; 3]; 16] = [
+    [0x1a, 0x1a, 0x2e], // Black
+    [0xff, 0x00, 0x55], // Red
+    [0x00, 0xff, 0x9f], // Green
+    [0xff, 0xfc, 0x00], // Yellow
+    [0x7b, 0x2f, 0xff], // Blue
+    [0xff, 0x00, 0xff], // Magenta
+    [0x00, 0xff, 0xff], // Cyan
+    [0xd4, 0xb3, 0xf7], // White
+    [0x44, 0x44, 0x68], // Bright Black
+    [0xff, 0x33, 0x77], // Bright Red
+    [0x33, 0xff, 0xb2], // Bright Green
+    [0xff, 0xfe, 0x33], // Bright Yellow
+    [0x99, 0x55, 0xff], // Bright Blue
+    [0xff, 0x55, 0xff], // Bright Magenta
+    [0x55, 0xff, 0xff], // Bright Cyan
+    [0xff, 0xff, 0xff], // Bright White
+];
 
 /// テーマ名から正規名称と ResolvedTheme を解決する（大文字小文字・空白・ハイフン無視）
 pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)> {
@@ -937,6 +959,32 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x1e, 0x20, 0x30],
                 card_bg: [0x2f, 0x33, 0x4d],
                 cursor: [0x82, 0xaa, 0xff],
+                ..ResolvedTheme::default()
+            },
+        )),
+        // Ghostty の cyberpunk-icy に合わせる（黒に近い背景・薄紫の文字・シアンの差し色と、16 色）
+        "cyberpunk" => Some(("Cyberpunk", {
+            let mut theme = ResolvedTheme {
+                bg: [0x0a, 0x0a, 0x0f],
+                fg: [0xd4, 0xb3, 0xf7],
+                accent: [0x00, 0xff, 0xff],
+                drawer_bg: [0x05, 0x05, 0x09],
+                card_bg: [0x1a, 0x1a, 0x2e],
+                cursor: [0x00, 0xff, 0xff],
+                ..ResolvedTheme::default()
+            };
+            theme.palette[..16].copy_from_slice(&CYBERPUNK_ICY_ANSI);
+            theme
+        })),
+        "dopagaki" | "dopamine" => Some((
+            "Dopagaki",
+            ResolvedTheme {
+                bg: [0x14, 0x05, 0x24],
+                fg: [0xff, 0xf2, 0xff],
+                accent: [0x39, 0xff, 0x14],
+                drawer_bg: [0x0d, 0x03, 0x1a],
+                card_bg: [0x24, 0x0b, 0x42],
+                cursor: [0xff, 0x00, 0xc8],
                 ..ResolvedTheme::default()
             },
         )),
@@ -1221,6 +1269,23 @@ mod tests {
     }
 
     #[test]
+    fn cyberpunk_preset_has_ghostty_cyberpunk_icy_16_colors() {
+        let (_, theme) = resolve_theme_preset("cyberpunk").unwrap();
+        assert_eq!(theme.palette[..16], CYBERPUNK_ICY_ANSI);
+        assert_eq!(theme.palette[1], [0xff, 0x00, 0x55]);
+        // 17 番以降は標準の 256 色のまま
+        assert_eq!(theme.palette[16..], DEFAULT_PALETTE[16..]);
+        // Ghostty のテーマファイルを読んだときと同じ 16 色になる
+        let ghostty = parse_ghostty_theme(
+            "palette = 0=#1a1a2e\npalette = 1=#ff0055\npalette = 2=#00ff9f\npalette = 3=#fffc00\n\
+             palette = 4=#7b2fff\npalette = 5=#ff00ff\npalette = 6=#00ffff\npalette = 7=#d4b3f7\n\
+             palette = 8=#444468\npalette = 9=#ff3377\npalette = 10=#33ffb2\npalette = 11=#fffe33\n\
+             palette = 12=#9955ff\npalette = 13=#ff55ff\npalette = 14=#55ffff\npalette = 15=#ffffff\n",
+        );
+        assert_eq!(theme.palette, ghostty.palette);
+    }
+
+    #[test]
     fn search_paths_follow_exact_priority_order() {
         let home = Path::new("/home/tester");
         let paths = config_search_paths(home);
@@ -1467,6 +1532,14 @@ windows_default_prog = ["wsl.exe", "--cd", "~"]
         assert_eq!(
             resolve_theme_preset("gruvbox-material").map(|(n, _)| n),
             Some("Gruvbox Material")
+        );
+        assert_eq!(
+            resolve_theme_preset("cyberpunk").map(|(n, _)| n),
+            Some("Cyberpunk")
+        );
+        assert_eq!(
+            resolve_theme_preset("dopamine").map(|(n, _)| n),
+            Some("Dopagaki")
         );
 
         let raw = "[features]\nright_drawer = true\n\n[appearance]\ntheme = \"TokyoNight Moon\"\nfont_size = 18.0\n";
