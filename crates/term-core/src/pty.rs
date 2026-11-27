@@ -40,7 +40,13 @@ impl Drop for PtySession {
 
 impl PtySession {
     /// OS に応じたデフォルトシェル（Windows は powershell.exe 等）を PTY 上で起動する。
-    pub fn spawn(cols: u16, rows: u16, windows_prog: &[String]) -> Result<Self, PtyError> {
+    /// cwd を渡すとそのディレクトリでシェルを起動する（無いディレクトリなら渡さなかったのと同じ）
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        windows_prog: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<Self, PtyError> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -67,6 +73,9 @@ impl PtySession {
         } else {
             unix_shell_command()
         };
+        if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+            cmd.cwd(dir);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("TERM_PROGRAM", "conductty");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));

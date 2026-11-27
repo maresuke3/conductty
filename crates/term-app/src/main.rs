@@ -409,6 +409,12 @@ struct App {
     focus_reported: Option<PaneId>,
     /// カーソルの点滅を数え始めた時刻。キーを打つと戻して、打っている間はカーソルを見せる
     cursor_blink_epoch: std::time::Instant,
+    /// Cmd（Mac 以外は Ctrl）を押しながらマウスを重ねているリンクの URI
+    hovered_link: Option<String>,
+    /// ウィンドウに付けているタイトル
+    window_title: String,
+    /// server のペインごとに、クリップボードへ反映した OSC 52 の通し番号
+    clipboard_applied: HashMap<PaneId, u64>,
     clipboard: Option<arboard::Clipboard>,
     browser: Option<EmbeddedBrowser>,
     pending_browser_url: Option<String>,
@@ -547,11 +553,14 @@ impl App {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         let (cols, rows) = self.expected_pane_grid_size(split);
+        // Ghostty と同じく、フォーカス中のペインのカレントディレクトリ (OSC 7) で新しいペインを開く
+        let (_, cwd) = self.pane_title_and_cwd(self.manager.active_tab().focused_pane);
 
         match PtySession::spawn(
             cols as u16,
             rows as u16,
             &self.config.shell.windows_default_prog,
+            cwd.as_deref().map(std::path::Path::new),
         ) {
             Ok(mut pty) => {
                 let (_, dummy_rx) = std::sync::mpsc::channel();
@@ -1132,6 +1141,103 @@ impl App {
         }
     }
 
+    /// ペインの OSC 0 / 2 のタイトルと OSC 7 のカレントディレクトリ
+    fn pane_title_and_cwd(&self, pane_id: PaneId) -> (Option<String>, Option<String>) {
+        if self.config.features.multiplexer_mode {
+            return self
+                .mux_snapshots
+                .get(&pane_id)
+                .map(|s| (s.title.clone(), s.cwd.clone()))
+                .unwrap_or_default();
+        }
+        self.panes
+            .get(&pane_id)
+            .and_then(|p| p.grid.lock().ok().map(|g| (g.title.clone(), g.cwd.clone())))
+            .unwrap_or_default()
+    }
+
+    /// セルが指す OSC 8 のリンクの URI
+    fn link_at(&self, pane_id: PaneId, col: usize, row: usize) -> Option<String> {
+        if self.config.features.multiplexer_mode {
+            let snap = self.mux_snapshots.get(&pane_id)?;
+            let id = snap.cells.get(row * snap.cols + col)?.link?;
+            return snap.links.get(id as usize).cloned();
+        }
+        let g = self.panes.get(&pane_id)?.grid.lock().ok()?;
+        let id = g.visible_cell(col, row)?.link?;
+        g.links.get(id as usize).cloned()
+    }
+
+    /// リンクを開くときに押す修飾キー（Ghostty と同じく Mac は Cmd、ほかは Ctrl）
+    fn link_modifier_held(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.modifiers.super_key()
+        } else {
+            self.modifiers.control_key()
+        }
+    }
+
+    /// 修飾キーを押しながら重ねているリンクを覚え、マウスの形を指に変える
+    fn update_hovered_link(&mut self) {
+        let hovered = self
+            .link_modifier_held()
+            .then(|| self.hit_test_cell(self.cursor_pos))
+            .flatten()
+            .and_then(|(pane_id, col, row)| self.link_at(pane_id, col, row));
+        if hovered == self.hovered_link {
+            return;
+        }
+        if let Some(window) = &self.window {
+            window.set_cursor(if hovered.is_some() {
+                winit::window::CursorIcon::Pointer
+            } else {
+                winit::window::CursorIcon::Default
+            });
+            window.request_redraw();
+        }
+        self.hovered_link = hovered;
+    }
+
+    fn set_clipboard_text(&mut self, text: &str) {
+        if let Some(clipboard) = &mut self.clipboard {
+            let _ = clipboard.set_text(text);
+        }
+    }
+
+    /// OSC 52 でアプリに頼まれたクリップボードへの書き込みを反映する
+    fn apply_clipboard_writes(&mut self) {
+        if self.config.features.multiplexer_mode {
+            let writes: Vec<(PaneId, u64, String)> = self
+                .mux_snapshots
+                .iter()
+                .filter_map(|(id, snap)| snap.clipboard_write.clone().map(|(seq, t)| (*id, seq, t)))
+                .filter(|(id, seq, _)| self.clipboard_applied.get(id).is_none_or(|done| seq > done))
+                .collect();
+            for (pane_id, seq, text) in writes {
+                self.clipboard_applied.insert(pane_id, seq);
+                self.set_clipboard_text(&text);
+            }
+            return;
+        }
+        let writes: Vec<String> = self
+            .panes
+            .values()
+            .filter_map(|p| p.grid.lock().ok()?.clipboard_write.take())
+            .map(|(_, text)| text)
+            .collect();
+        for text in writes {
+            self.set_clipboard_text(&text);
+        }
+    }
+
+    /// server につないだときに、それまでの OSC 52 の書き込みをもう一度反映しないよう通し番号を覚える
+    fn seed_clipboard_applied(&mut self) {
+        for (id, snap) in &self.mux_snapshots {
+            let seq = snap.clipboard_write.as_ref().map_or(0, |(seq, _)| *seq);
+            self.clipboard_applied.insert(*id, seq);
+        }
+    }
+
     fn pane_modes(&self, pane_id: PaneId) -> TerminalModes {
         if self.config.features.multiplexer_mode {
             return self
@@ -1272,6 +1378,7 @@ impl App {
         {
             self.manager = manager;
             self.mux_snapshots = snapshots.into_iter().collect();
+            self.seed_clipboard_applied();
         } else {
             // サーバーが未起動ならバックグラウンドで起動して再接続
             let server_bin = if cfg!(target_os = "windows") {
@@ -1303,6 +1410,7 @@ impl App {
                         {
                             self.manager = manager;
                             self.mux_snapshots = snapshots.into_iter().collect();
+                            self.seed_clipboard_applied();
                             break;
                         }
                     }
@@ -2104,6 +2212,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(new_mods) => {
                 self.modifiers = new_mods.state();
+                self.update_hovered_link();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(window) = &self.window {
@@ -2111,6 +2220,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.cursor_pos =
                         Pos2::new(position.x as f32 / scale, position.y as f32 / scale);
                 }
+                self.update_hovered_link();
                 if !self.selecting {
                     let button = self.mouse_button_down.unwrap_or(CoreMouseButton::None);
                     self.report_mouse(MouseAction::Motion, button);
@@ -2127,6 +2237,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // Cmd（Mac 以外は Ctrl）+クリックで OSC 8 のリンクを開く。マウスの報告や選択より先に見る
+                if (button, state) == (MouseButton::Left, ElementState::Pressed)
+                    && let Some(url) = self.hovered_link.clone()
+                {
+                    open_url(&url);
+                    return;
+                }
                 let core_button = match button {
                     MouseButton::Left => Some(CoreMouseButton::Left),
                     MouseButton::Middle => Some(CoreMouseButton::Middle),
@@ -2502,6 +2619,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 // ペインのフォーカスはいろいろな操作で変わるので、描くたびに知らせる必要があるか確かめる
                 self.sync_focus_events();
+                self.apply_clipboard_writes();
+                let title = self
+                    .pane_title_and_cwd(self.manager.active_tab().focused_pane)
+                    .0
+                    .unwrap_or_else(|| "conductty".to_string());
+                if title != self.window_title {
+                    if let Some(window) = &self.window {
+                        window.set_title(&title);
+                    }
+                    self.window_title = title;
+                }
                 let is_minimized = self
                     .window
                     .as_ref()
@@ -2516,6 +2644,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pending_occluded_redraw = false;
                 self.refresh_agent_states();
                 let cursor_look = self.cursor_look();
+                let hovered_link = self.hovered_link.clone();
                 let area = self.terminal_area();
                 let focused_pane = self.manager.active_tab().focused_pane;
                 let pane_move_mode = self.router.mode == InputMode::PaneMove;
@@ -2558,7 +2687,10 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|(i, t)| {
                         (
                             t.id,
-                            t.name.clone().unwrap_or_else(|| format!("Tab {}", i + 1)),
+                            t.name
+                                .clone()
+                                .or_else(|| self.pane_title_and_cwd(t.focused_pane).0)
+                                .unwrap_or_else(|| format!("Tab {}", i + 1)),
                         )
                     })
                     .collect();
@@ -3472,6 +3604,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             selection.filter(|(p, _, _)| p == pane_id),
                                             &theme,
                                             cursor_look,
+                                            hovered_link.as_deref(),
                                         );
                                         if is_focused {
                                             ime_cursor_rect = Some(render_ime_preedit(
@@ -3508,6 +3641,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             selection.filter(|(p, _, _)| p == pane_id),
                                             &theme,
                                             cursor_look,
+                                            hovered_link.as_deref(),
                                         );
                                         if is_focused {
                                             ime_cursor_rect = Some(render_ime_preedit(
@@ -4815,6 +4949,7 @@ fn render_grid_snapshot(
     selection: Option<PaneSelection>,
     theme: &ResolvedTheme,
     cursor: CursorLook,
+    hovered_link: Option<&str>,
 ) {
     let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
     // セルの色は番号・既定色のまま届くので、ここで今のテーマ（OSC で変えた色を含む）の色に決める
@@ -4911,7 +5046,21 @@ fn render_grid_snapshot(
             } else {
                 fg_color
             };
-            draw_text_decorations(painter, cell, cell_rect, font_id.size, fg_color, theme);
+            // Cmd を押しながら重ねているリンクには下線を引く
+            let is_hovered_link = hovered_link.is_some_and(|url| {
+                cell.link
+                    .and_then(|id| snap.links.get(id as usize))
+                    .is_some_and(|u| u == url)
+            });
+            let deco = Cell {
+                underline: if is_hovered_link {
+                    Underline::Single
+                } else {
+                    cell.underline
+                },
+                ..*cell
+            };
+            draw_text_decorations(painter, &deco, cell_rect, font_id.size, fg_color, theme);
             let ch = cell.ch;
             if ch == ' ' || ch == '\0' {
                 continue;
@@ -6257,6 +6406,9 @@ fn main() {
         mouse_last_cell: None,
         focus_reported: None,
         cursor_blink_epoch: std::time::Instant::now(),
+        hovered_link: None,
+        window_title: "conductty".to_string(),
+        clipboard_applied: HashMap::new(),
         clipboard: arboard::Clipboard::new().ok(),
         browser: None,
         pending_browser_url: None,
