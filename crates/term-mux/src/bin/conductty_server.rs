@@ -10,9 +10,9 @@ use term_core::grid::{GridSnapshot, TerminalGrid};
 use term_core::layout::{PaneId, WorkspaceManager};
 use term_core::pty::PtySession;
 use term_mux::{
-    AgentInfo, DEFAULT_MUX_SERVER_ADDR, MAX_IPC_REQUEST_BYTES, MuxRequest, MuxResponse, PaneInfo,
-    SpaceInfo, SpawnKind, parse_authenticated_request, read_bounded_line, read_or_create_ipc_token,
-    split_dir_for_spawn,
+    AgentInfo, DEFAULT_MUX_SERVER_ADDR, MAX_IPC_REQUEST_BYTES, MUX_PROTOCOL_VERSION, MuxRequest,
+    MuxResponse, PaneInfo, SpaceInfo, SpawnKind, parse_authenticated_request, read_bounded_line,
+    read_or_create_ipc_token, split_dir_for_spawn,
 };
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -122,6 +122,9 @@ impl ServerState {
         self.cleanup_exited_panes();
         match req {
             MuxRequest::Ping => MuxResponse::Pong,
+            MuxRequest::Hello => MuxResponse::Hello {
+                protocol: MUX_PROTOCOL_VERSION,
+            },
             MuxRequest::ListPanes => {
                 let focused = self.manager.active_tab().focused_pane;
                 let mut panes = Vec::new();

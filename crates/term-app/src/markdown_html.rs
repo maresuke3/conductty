@@ -300,6 +300,7 @@ mod tests {
             drawer_bg: [1, 2, 3],
             card_bg: [4, 5, 6],
             cursor: fg,
+            ..ResolvedTheme::default()
         }
     }
 

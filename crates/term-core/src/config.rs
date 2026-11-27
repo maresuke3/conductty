@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::grid::{Cell, Color, DEFAULT_PALETTE};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -186,6 +188,44 @@ pub struct ResolvedTheme {
     pub drawer_bg: [u8; 3],
     pub card_bg: [u8; 3],
     pub cursor: [u8; 3],
+    /// 256色のパレット（ANSI の 0〜15 と、256色の 16〜255）
+    pub palette: [[u8; 3]; 256],
+}
+
+/// プリセットが見つからないときの TokyoNight Moon
+impl Default for ResolvedTheme {
+    fn default() -> Self {
+        Self {
+            bg: [0x22, 0x24, 0x36],
+            fg: [0xc8, 0xd3, 0xf5],
+            accent: [0x7a, 0xa2, 0xf7],
+            drawer_bg: [0x1e, 0x20, 0x30],
+            card_bg: [0x2f, 0x33, 0x4d],
+            cursor: [0x82, 0xaa, 0xff],
+            palette: DEFAULT_PALETTE,
+        }
+    }
+}
+
+impl ResolvedTheme {
+    fn color_rgb(&self, color: Color) -> Option<[u8; 3]> {
+        match color {
+            Color::Default => None,
+            Color::Indexed(i) => Some(self.palette[i as usize]),
+            Color::Rgb(c) => Some([c.r, c.g, c.b]),
+        }
+    }
+
+    /// セルを描く前景色と背景色。背景が None なら塗らない
+    pub fn cell_colors(&self, cell: &Cell) -> ([u8; 3], Option<[u8; 3]>) {
+        let fg = self.color_rgb(cell.fg).unwrap_or(self.fg);
+        let bg = self.color_rgb(cell.bg);
+        if cell.reverse {
+            (bg.unwrap_or(self.bg), Some(fg))
+        } else {
+            (fg, bg)
+        }
+    }
 }
 
 impl Default for FeaturesConfig {
@@ -627,6 +667,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x00, 0x21, 0x2b],
                 card_bg: [0x07, 0x36, 0x42],
                 cursor: [0x93, 0xa1, 0xa1],
+                ..ResolvedTheme::default()
             },
         )),
         "solarizedlight" => Some((
@@ -638,6 +679,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0xee, 0xe8, 0xd5],
                 card_bg: [0xe4, 0xdd, 0xc8],
                 cursor: [0x65, 0x7b, 0x83],
+                ..ResolvedTheme::default()
             },
         )),
         "dracula" => Some((
@@ -649,6 +691,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x21, 0x22, 0x2c],
                 card_bg: [0x34, 0x37, 0x46],
                 cursor: [0xff, 0x79, 0xc6],
+                ..ResolvedTheme::default()
             },
         )),
         "githubdark" => Some((
@@ -660,6 +703,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x01, 0x04, 0x09],
                 card_bg: [0x16, 0x1b, 0x22],
                 cursor: [0x58, 0xa6, 0xff],
+                ..ResolvedTheme::default()
             },
         )),
         "githublight" => Some((
@@ -671,6 +715,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0xf6, 0xf8, 0xfa],
                 card_bg: [0xea, 0xee, 0xf2],
                 cursor: [0x09, 0x69, 0xda],
+                ..ResolvedTheme::default()
             },
         )),
         "gruvboxdark" | "gruvbox" => Some((
@@ -682,6 +727,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x1d, 0x20, 0x21],
                 card_bg: [0x3c, 0x38, 0x36],
                 cursor: [0xfb, 0xf1, 0xc7],
+                ..ResolvedTheme::default()
             },
         )),
         "gruvboxlight" => Some((
@@ -693,6 +739,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0xf2, 0xe5, 0xbc],
                 card_bg: [0xeb, 0xdb, 0xb2],
                 cursor: [0x3c, 0x38, 0x36],
+                ..ResolvedTheme::default()
             },
         )),
         "gruvboxmaterial" => Some((
@@ -704,6 +751,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x1d, 0x20, 0x21],
                 card_bg: [0x32, 0x30, 0x2f],
                 cursor: [0xd4, 0xbe, 0x98],
+                ..ResolvedTheme::default()
             },
         )),
         "tokyonight" | "tokyonightnight" => Some((
@@ -719,6 +767,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x16, 0x16, 0x1e],
                 card_bg: [0x24, 0x28, 0x3b],
                 cursor: [0xc0, 0xca, 0xf5],
+                ..ResolvedTheme::default()
             },
         )),
         "tokyonightday" => Some((
@@ -730,6 +779,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0xd0, 0xd5, 0xe3],
                 card_bg: [0xc4, 0xc8, 0xda],
                 cursor: [0x37, 0x60, 0xbf],
+                ..ResolvedTheme::default()
             },
         )),
         "tokyonightstorm" => Some((
@@ -741,6 +791,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x1f, 0x23, 0x35],
                 card_bg: [0x29, 0x2e, 0x42],
                 cursor: [0xc0, 0xca, 0xf5],
+                ..ResolvedTheme::default()
             },
         )),
         "tokyonightmoon" => Some((
@@ -752,6 +803,7 @@ pub fn resolve_theme_preset(name: &str) -> Option<(&'static str, ResolvedTheme)>
                 drawer_bg: [0x1e, 0x20, 0x30],
                 card_bg: [0x2f, 0x33, 0x4d],
                 cursor: [0x82, 0xaa, 0xff],
+                ..ResolvedTheme::default()
             },
         )),
         _ => None,
@@ -833,14 +885,7 @@ impl AppConfig {
     pub fn resolve_theme(&self) -> ResolvedTheme {
         let mut base = resolve_theme_preset(&self.appearance.theme)
             .map(|(_, t)| t)
-            .unwrap_or(ResolvedTheme {
-                bg: [0x22, 0x24, 0x36],
-                fg: [0xc8, 0xd3, 0xf5],
-                accent: [0x7a, 0xa2, 0xf7],
-                drawer_bg: [0x1e, 0x20, 0x30],
-                card_bg: [0x2f, 0x33, 0x4d],
-                cursor: [0x82, 0xaa, 0xff],
-            });
+            .unwrap_or_default();
 
         if let Some(hex) = self.theme.background.as_deref().and_then(parse_hex_rgb) {
             base.bg = hex;
@@ -888,6 +933,34 @@ pub fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_colors_resolve_with_theme_palette_and_reverse() {
+        use crate::grid::Rgb;
+        let mut theme = ResolvedTheme::default();
+        theme.palette[1] = [0xff, 0x00, 0x55];
+        let cell = |fg, bg, reverse| Cell {
+            fg,
+            bg,
+            reverse,
+            ..Cell::default()
+        };
+
+        assert_eq!(theme.cell_colors(&Cell::default()), (theme.fg, None));
+        assert_eq!(
+            theme.cell_colors(&cell(
+                Color::Indexed(1),
+                Color::Rgb(Rgb { r: 1, g: 2, b: 3 }),
+                false
+            )),
+            ([0xff, 0x00, 0x55], Some([1, 2, 3]))
+        );
+        // 反転で背景が既定色なら、前景にはテーマの背景色を使う
+        assert_eq!(
+            theme.cell_colors(&cell(Color::Indexed(1), Color::Default, true)),
+            (theme.bg, Some([0xff, 0x00, 0x55]))
+        );
+    }
 
     #[test]
     fn search_paths_follow_exact_priority_order() {

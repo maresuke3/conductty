@@ -14,12 +14,37 @@ pub struct Rgb {
     pub b: u8,
 }
 
+/// セルの色。番号と既定色は描画のときにテーマで RGB に決めるため、テーマを変えると表示済みの文字の色も変わる
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Color {
+    /// テーマの前景色・背景色（背景は塗らない）
+    #[default]
+    Default,
+    /// パレットの番号（0〜255）
+    Indexed(u8),
+    Rgb(Rgb),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
     pub ch: char,
-    pub fg: Rgb,
-    pub bg: Option<Rgb>,
+    pub fg: Color,
+    pub bg: Color,
     pub bold: bool,
+    /// 反転表示 (SGR 7)。前景と背景は描画のときに入れ替える
+    pub reverse: bool,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            fg: Color::Default,
+            bg: Color::Default,
+            bold: false,
+            reverse: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,129 +62,48 @@ pub struct GridSnapshot {
     pub cells: Vec<Cell>,
 }
 
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            // TokyoNight Moon foreground (#c8d3f5)
-            fg: Rgb {
-                r: 0xc8,
-                g: 0xd3,
-                b: 0xf5,
-            },
-            bg: None,
-            bold: false,
-        }
+/// 既定の256色。0〜15 は TokyoNight Moon、16〜231 は 6x6x6 の色の立方体、232〜255 はグレー（xterm と同じ計算）
+pub const DEFAULT_PALETTE: [[u8; 3]; 256] = {
+    const BASE: [[u8; 3]; 16] = [
+        [0x1b, 0x1d, 0x2b], // Black
+        [0xff, 0x75, 0x7f], // Red
+        [0xc3, 0xe8, 0x8d], // Green
+        [0xff, 0xc7, 0x77], // Yellow
+        [0x82, 0xaa, 0xff], // Blue
+        [0xc0, 0x99, 0xff], // Magenta
+        [0x86, 0xe1, 0xfc], // Cyan
+        [0x82, 0x8b, 0xb8], // White
+        [0x44, 0x4a, 0x73], // Bright Black
+        [0xff, 0x8d, 0x94], // Bright Red
+        [0xc7, 0xfb, 0x6d], // Bright Green
+        [0xff, 0xd8, 0xab], // Bright Yellow
+        [0x9a, 0xb8, 0xff], // Bright Blue
+        [0xca, 0xab, 0xff], // Bright Magenta
+        [0xb2, 0xeb, 0xff], // Bright Cyan
+        [0xc8, 0xd3, 0xf5], // Bright White
+    ];
+    const fn cube(v: usize) -> u8 {
+        if v == 0 { 0 } else { (55 + v * 40) as u8 }
     }
-}
-
-/// TokyoNight Moon 準拠の ANSI 16色パレット
-fn ansi_color(idx: u8) -> Rgb {
-    match idx {
-        0 => Rgb {
-            r: 0x1b,
-            g: 0x1d,
-            b: 0x2b,
-        }, // Black
-        1 => Rgb {
-            r: 0xff,
-            g: 0x75,
-            b: 0x7f,
-        }, // Red
-        2 => Rgb {
-            r: 0xc3,
-            g: 0xe8,
-            b: 0x8d,
-        }, // Green
-        3 => Rgb {
-            r: 0xff,
-            g: 0xc7,
-            b: 0x77,
-        }, // Yellow
-        4 => Rgb {
-            r: 0x82,
-            g: 0xaa,
-            b: 0xff,
-        }, // Blue
-        5 => Rgb {
-            r: 0xc0,
-            g: 0x99,
-            b: 0xff,
-        }, // Magenta
-        6 => Rgb {
-            r: 0x86,
-            g: 0xe1,
-            b: 0xfc,
-        }, // Cyan
-        7 => Rgb {
-            r: 0x82,
-            g: 0x8b,
-            b: 0xb8,
-        }, // White
-        8 => Rgb {
-            r: 0x44,
-            g: 0x4a,
-            b: 0x73,
-        }, // Bright Black
-        9 => Rgb {
-            r: 0xff,
-            g: 0x8d,
-            b: 0x94,
-        }, // Bright Red
-        10 => Rgb {
-            r: 0xc7,
-            g: 0xfb,
-            b: 0x6d,
-        }, // Bright Green
-        11 => Rgb {
-            r: 0xff,
-            g: 0xd8,
-            b: 0xab,
-        }, // Bright Yellow
-        12 => Rgb {
-            r: 0x9a,
-            g: 0xb8,
-            b: 0xff,
-        }, // Bright Blue
-        13 => Rgb {
-            r: 0xca,
-            g: 0xab,
-            b: 0xff,
-        }, // Bright Magenta
-        14 => Rgb {
-            r: 0xb2,
-            g: 0xeb,
-            b: 0xff,
-        }, // Bright Cyan
-        _ => Rgb {
-            r: 0xc8,
-            g: 0xd3,
-            b: 0xf5,
-        }, // Bright White
+    let mut p = [[0u8; 3]; 256];
+    let mut i = 0;
+    while i < 16 {
+        p[i] = BASE[i];
+        i += 1;
     }
-}
-
-fn color_256(idx: u8) -> Rgb {
-    match idx {
-        0..=15 => ansi_color(idx),
-        16..=231 => {
-            let n = idx - 16;
-            let r = n / 36;
-            let g = (n % 36) / 6;
-            let b = n % 6;
-            let to_u8 = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-            Rgb {
-                r: to_u8(r),
-                g: to_u8(g),
-                b: to_u8(b),
-            }
-        }
-        232..=255 => {
-            let v = 8 + (idx - 232) * 10;
-            Rgb { r: v, g: v, b: v }
-        }
+    let mut n = 0;
+    while n < 216 {
+        p[16 + n] = [cube(n / 36), cube((n % 36) / 6), cube(n % 6)];
+        n += 1;
     }
-}
+    let mut g = 0;
+    while g < 24 {
+        let v = (8 + g * 10) as u8;
+        p[232 + g] = [v, v, v];
+        g += 1;
+    }
+    p
+};
 
 /// 副作用ゼロの端末グリッド状態マシン。
 /// VT バイト列を `feed_bytes` で食わせると、セル配列・スクロールバック・カーソル位置を更新する。
@@ -177,8 +121,8 @@ pub struct TerminalGrid {
     pub scroll_offset: usize,
     pub pending_replies: Vec<Vec<u8>>,
     pub kitty: KittyState,
-    current_fg: Rgb,
-    current_bg: Option<Rgb>,
+    current_fg: Color,
+    current_bg: Color,
     current_bold: bool,
     current_reverse: bool,
     pending_wrap: bool,
@@ -207,8 +151,8 @@ impl TerminalGrid {
             scroll_offset: 0,
             pending_replies: Vec::new(),
             kitty: KittyState::new(),
-            current_fg: Cell::default().fg,
-            current_bg: None,
+            current_fg: Color::Default,
+            current_bg: Color::Default,
             current_bold: false,
             current_reverse: false,
             pending_wrap: false,
@@ -612,36 +556,33 @@ impl TerminalGrid {
                 7 => self.current_reverse = true,
                 22 => self.current_bold = false,
                 27 => self.current_reverse = false,
-                30..=37 => self.current_fg = ansi_color((list[i] - 30) as u8),
-                39 => self.current_fg = Cell::default().fg,
-                40..=47 => self.current_bg = Some(ansi_color((list[i] - 40) as u8)),
-                49 => self.current_bg = None,
-                90..=97 => self.current_fg = ansi_color((list[i] - 90 + 8) as u8),
-                100..=107 => self.current_bg = Some(ansi_color((list[i] - 100 + 8) as u8)),
-                38 if i + 1 < list.len() => {
-                    if list[i + 1] == 5 && i + 2 < list.len() {
-                        self.current_fg = color_256(list[i + 2] as u8);
+                30..=37 => self.current_fg = Color::Indexed((list[i] - 30) as u8),
+                39 => self.current_fg = Color::Default,
+                40..=47 => self.current_bg = Color::Indexed((list[i] - 40) as u8),
+                49 => self.current_bg = Color::Default,
+                90..=97 => self.current_fg = Color::Indexed((list[i] - 90 + 8) as u8),
+                100..=107 => self.current_bg = Color::Indexed((list[i] - 100 + 8) as u8),
+                38 | 48 if i + 1 < list.len() => {
+                    let is_fg = list[i] == 38;
+                    let color = if list[i + 1] == 5 && i + 2 < list.len() {
+                        let c = Color::Indexed(list[i + 2] as u8);
                         i += 2;
+                        Some(c)
                     } else if list[i + 1] == 2 && i + 4 < list.len() {
-                        self.current_fg = Rgb {
-                            r: list[i + 2] as u8,
-                            g: list[i + 3] as u8,
-                            b: list[i + 4] as u8,
-                        };
-                        i += 4;
-                    }
-                }
-                48 if i + 1 < list.len() => {
-                    if list[i + 1] == 5 && i + 2 < list.len() {
-                        self.current_bg = Some(color_256(list[i + 2] as u8));
-                        i += 2;
-                    } else if list[i + 1] == 2 && i + 4 < list.len() {
-                        self.current_bg = Some(Rgb {
+                        let c = Color::Rgb(Rgb {
                             r: list[i + 2] as u8,
                             g: list[i + 3] as u8,
                             b: list[i + 4] as u8,
                         });
                         i += 4;
+                        Some(c)
+                    } else {
+                        None
+                    };
+                    match (color, is_fg) {
+                        (Some(c), true) => self.current_fg = c,
+                        (Some(c), false) => self.current_bg = c,
+                        (None, _) => {}
                     }
                 }
                 _ => {}
@@ -651,8 +592,8 @@ impl TerminalGrid {
     }
 
     fn reset_sgr(&mut self) {
-        self.current_fg = Cell::default().fg;
-        self.current_bg = None;
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
         self.current_bold = false;
         self.current_reverse = false;
     }
@@ -714,16 +655,7 @@ impl Perform for TerminalGrid {
             self.cursor_col = 0;
             self.newline();
         }
-        let (fg, bg) = if self.current_reverse {
-            let bg_or_default = self.current_bg.unwrap_or(Rgb {
-                r: 0x22,
-                g: 0x24,
-                b: 0x36,
-            });
-            (bg_or_default, Some(self.current_fg))
-        } else {
-            (self.current_fg, self.current_bg)
-        };
+        let (fg, bg) = (self.current_fg, self.current_bg);
 
         self.clear_wide_overlap(self.cursor_row, self.cursor_col);
         let idx = self.cursor_row * self.cols + self.cursor_col;
@@ -733,6 +665,7 @@ impl Perform for TerminalGrid {
                 fg,
                 bg,
                 bold: self.current_bold,
+                reverse: self.current_reverse,
             };
         }
 
@@ -744,6 +677,7 @@ impl Perform for TerminalGrid {
                     fg,
                     bg,
                     bold: self.current_bold,
+                    reverse: self.current_reverse,
                 };
             }
             if self.cursor_col + 2 >= self.cols {
@@ -1091,16 +1025,51 @@ mod tests {
         assert_eq!(grid.scrollback[0][0].ch, 'A');
         assert_eq!(
             grid.scrollback[0][0].fg,
-            Rgb {
+            Color::Rgb(Rgb {
                 r: 10,
                 g: 20,
                 b: 30
-            }
+            })
         );
         grid.scroll_up(1);
         assert_eq!(grid.visible_cell(0, 0).unwrap().ch, 'A');
         grid.scroll_down(1);
         assert_eq!(grid.visible_cell(0, 0).unwrap().ch, 'B');
+    }
+
+    #[test]
+    fn keeps_sgr_colors_as_palette_index_and_reverse_flag() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.feed_bytes(b"\x1b[31;42mA\x1b[38;5;200;48;5;17mB\x1b[39;49;7mC\x1b[0mD");
+        let cell = |col| *grid.cell(col, 0).unwrap();
+        assert_eq!(
+            (cell(0).fg, cell(0).bg),
+            (Color::Indexed(1), Color::Indexed(2))
+        );
+        assert_eq!(
+            (cell(1).fg, cell(1).bg),
+            (Color::Indexed(200), Color::Indexed(17))
+        );
+        assert_eq!(
+            (cell(2).fg, cell(2).bg, cell(2).reverse),
+            (Color::Default, Color::Default, true)
+        );
+        assert_eq!(
+            cell(3),
+            Cell {
+                ch: 'D',
+                ..Cell::default()
+            }
+        );
+    }
+
+    #[test]
+    fn default_palette_matches_xterm_cube_and_grays() {
+        assert_eq!(DEFAULT_PALETTE[16], [0, 0, 0]);
+        assert_eq!(DEFAULT_PALETTE[17], [0, 0, 95]);
+        assert_eq!(DEFAULT_PALETTE[231], [255, 255, 255]);
+        assert_eq!(DEFAULT_PALETTE[232], [8, 8, 8]);
+        assert_eq!(DEFAULT_PALETTE[255], [238, 238, 238]);
     }
 
     #[test]
