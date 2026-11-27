@@ -98,6 +98,8 @@ right_drawer_default_open = false
 embedded_browser = true
 kitty_graphics = true
 copy_on_select = true
+desktop_notifications = true  # アプリからの通知 (OSC 9 / 777) を出す
+bell = true                   # ベルで Dock のアイコンとタブの 🔔 で知らせる
 
 [appearance]
 font_families = ["Cica", "FiraCode Nerd Font", "Fira Code"]

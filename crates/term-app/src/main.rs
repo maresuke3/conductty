@@ -417,6 +417,12 @@ struct App {
     clipboard_applied: HashMap<PaneId, u64>,
     /// 押したことを PTY に送ったキー。離したことはこのキーだけ送る
     keys_sent_to_pty: std::collections::HashSet<PhysicalKey>,
+    /// ペインごとに、受け取り済みのベルの回数と通知の通し番号
+    pane_signals_seen: HashMap<PaneId, (u64, u64)>,
+    /// ベルが鳴ったが、まだ見ていないペイン（タブに 🔔 を付ける）
+    bell_pending: std::collections::HashSet<PaneId>,
+    /// 最後にデスクトップの通知を出した時刻（出しすぎないため）
+    last_notification_at: Option<std::time::Instant>,
     clipboard: Option<arboard::Clipboard>,
     browser: Option<EmbeddedBrowser>,
     pending_browser_url: Option<String>,
@@ -1233,12 +1239,83 @@ impl App {
         }
     }
 
-    /// server につないだときに、それまでの OSC 52 の書き込みをもう一度反映しないよう通し番号を覚える
+    /// server につないだときに、それまでのクリップボードの書き込み・ベル・通知をもう一度扱わないよう通し番号を覚える
     fn seed_clipboard_applied(&mut self) {
         for (id, snap) in &self.mux_snapshots {
             let seq = snap.clipboard_write.as_ref().map_or(0, |(seq, _)| *seq);
             self.clipboard_applied.insert(*id, seq);
+            let note_seq = snap.notification.as_ref().map_or(0, |n| n.0);
+            self.pane_signals_seen
+                .insert(*id, (snap.bell_seq, note_seq));
         }
+    }
+
+    /// ペインごとのベルの回数と最後の通知
+    fn pane_signals(&self) -> Vec<PaneSignal> {
+        if self.config.features.multiplexer_mode {
+            return self
+                .mux_snapshots
+                .iter()
+                .map(|(id, s)| (*id, s.bell_seq, s.notification.clone()))
+                .collect();
+        }
+        self.panes
+            .iter()
+            .filter_map(|(id, p)| {
+                let g = p.grid.lock().ok()?;
+                Some((*id, g.bell_seq, g.notification.clone()))
+            })
+            .collect()
+    }
+
+    /// 新しく鳴ったベルと、新しく届いた通知を扱う。見ているペインのものは知らせない
+    fn handle_pane_signals(&mut self) {
+        let focused = self.manager.active_tab().focused_pane;
+        for (pane_id, bell_seq, notification) in self.pane_signals() {
+            let (seen_bell, seen_note) = self
+                .pane_signals_seen
+                .get(&pane_id)
+                .copied()
+                .unwrap_or((0, 0));
+            let watching = self.window_focused && pane_id == focused;
+            if bell_seq > seen_bell && self.config.features.bell {
+                if !self.window_focused
+                    && let Some(window) = &self.window
+                {
+                    window.request_user_attention(Some(
+                        winit::window::UserAttentionType::Informational,
+                    ));
+                }
+                if !watching {
+                    self.bell_pending.insert(pane_id);
+                }
+            }
+            let note_seq = notification.as_ref().map_or(seen_note, |n| n.0);
+            if let Some((seq, title, body)) = notification
+                && seq > seen_note
+                && self.config.features.desktop_notifications
+                && !watching
+            {
+                self.show_notification(&title, &body);
+            }
+            self.pane_signals_seen.insert(pane_id, (bell_seq, note_seq));
+        }
+        if self.window_focused {
+            self.bell_pending.remove(&focused);
+        }
+    }
+
+    /// 1 秒に 1 回までデスクトップの通知を出す（アプリが連続で送っても通知であふれないように）
+    fn show_notification(&mut self, title: &str, body: &str) {
+        let now = std::time::Instant::now();
+        if self
+            .last_notification_at
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_notification_at = Some(now);
+        show_desktop_notification(if title.is_empty() { "conductty" } else { title }, body);
     }
 
     fn pane_modes(&self, pane_id: PaneId) -> TerminalModes {
@@ -2650,6 +2727,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // ペインのフォーカスはいろいろな操作で変わるので、描くたびに知らせる必要があるか確かめる
                 self.sync_focus_events();
                 self.apply_clipboard_writes();
+                self.handle_pane_signals();
                 let title = self
                     .pane_title_and_cwd(self.manager.active_tab().focused_pane)
                     .0
@@ -2715,13 +2793,19 @@ impl ApplicationHandler<UserEvent> for App {
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        (
-                            t.id,
-                            t.name
+                        (t.id, {
+                            let label = t
+                                .name
                                 .clone()
                                 .or_else(|| self.pane_title_and_cwd(t.focused_pane).0)
-                                .unwrap_or_else(|| format!("Tab {}", i + 1)),
-                        )
+                                .unwrap_or_else(|| format!("Tab {}", i + 1));
+                            // ベルが鳴って、まだ見ていないペインがあるタブ
+                            if t.all_panes().iter().any(|p| self.bell_pending.contains(p)) {
+                                format!("🔔 {label}")
+                            } else {
+                                label
+                            }
+                        })
                     })
                     .collect();
                 let ws_summaries: Vec<(String, usize, usize, usize)> = self
@@ -5556,6 +5640,34 @@ fn load_window_icon(size: u32) -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
+/// ペインのベルの回数と、最後の通知（通し番号、タイトル、本文）
+type PaneSignal = (PaneId, u64, Option<(u64, String, String)>);
+
+/// デスクトップの通知を出す。アプリから来た文字は、命令として読まれないよう引数で渡す
+/// shortcut: Windows はトーストの通知の仕組みが要るので出さない。使う人が出てきたら足す
+fn show_desktop_notification(title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display notification (item 2 of argv) with title (item 1 of argv)",
+            "-e",
+            "end run",
+            "--",
+            title,
+            body,
+        ])
+        .spawn();
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("notify-send")
+        .args(["--", title, body])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (title, body);
+}
+
 fn open_url(url: &str) {
     let Ok(safe_url) = validate_http_url(url) else {
         return;
@@ -6454,6 +6566,9 @@ fn main() {
         window_title: "conductty".to_string(),
         clipboard_applied: HashMap::new(),
         keys_sent_to_pty: std::collections::HashSet::new(),
+        pane_signals_seen: HashMap::new(),
+        bell_pending: std::collections::HashSet::new(),
+        last_notification_at: None,
         clipboard: arboard::Clipboard::new().ok(),
         browser: None,
         pending_browser_url: None,

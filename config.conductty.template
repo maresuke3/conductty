@@ -27,6 +27,10 @@ right_drawer_default_open = false
 embedded_browser = true
 kitty_graphics = true
 copy_on_select = true
+# アプリからの通知 (OSC 9 / 777) をデスクトップの通知で出す。見ているペインからの通知は出さない
+desktop_notifications = true
+# ベル (BEL) が鳴ったら、ウィンドウにフォーカスが無ければ Dock のアイコンで知らせ、見ていないタブに 🔔 を付ける
+bell = true
 
 [appearance]
 font_families = ["Cica", "FiraCode Nerd Font", "Fira Code"]

@@ -146,6 +146,12 @@ pub struct GridSnapshot {
     /// OSC 52 でクリップボードに書くよう頼まれた最後の文字列と、その通し番号
     #[serde(default)]
     pub clipboard_write: Option<(u64, String)>,
+    /// ベル (BEL) が鳴った回数
+    #[serde(default)]
+    pub bell_seq: u64,
+    /// OSC 9 / 777 で頼まれた最後の通知（通し番号、タイトル、本文）
+    #[serde(default)]
+    pub notification: Option<(u64, String, String)>,
 }
 
 /// マウスの報告の範囲 (CSI ?9 / ?1000 / ?1002 / ?1003 h)
@@ -337,6 +343,8 @@ impl Charset {
 }
 
 const MAX_TITLE_CHARS: usize = 1024;
+const MAX_NOTIFICATION_TITLE_CHARS: usize = 256;
+const MAX_NOTIFICATION_BODY_CHARS: usize = 1024;
 const MAX_LINKS: usize = 4096;
 /// OSC 52 で受け取る base64 の上限（元のデータで約 6MB）
 const MAX_CLIPBOARD_BASE64_BYTES: usize = 8 * 1024 * 1024;
@@ -450,6 +458,10 @@ pub struct TerminalGrid {
     /// OSC 52 でクリップボードに書くよう頼まれた最後の文字列と、その通し番号
     pub clipboard_write: Option<(u64, String)>,
     clipboard_seq: u64,
+    /// ベル (BEL) が鳴った回数
+    pub bell_seq: u64,
+    /// OSC 9 / 777 で頼まれた最後の通知（通し番号、タイトル、本文）
+    pub notification: Option<(u64, String, String)>,
     /// これから書く文字の色と属性（SGR で変わる）。ch は使わない
     pen: Cell,
     pending_wrap: bool,
@@ -503,6 +515,8 @@ impl TerminalGrid {
             link_ids: HashMap::new(),
             clipboard_write: None,
             clipboard_seq: 0,
+            bell_seq: 0,
+            notification: None,
             pen: Cell::default(),
             pending_wrap: false,
             autowrap: true,
@@ -599,6 +613,8 @@ impl TerminalGrid {
             cwd: self.cwd.clone(),
             links,
             clipboard_write: self.clipboard_write.clone(),
+            bell_seq: self.bell_seq,
+            notification: self.notification.clone(),
         }
     }
 
@@ -780,6 +796,13 @@ impl TerminalGrid {
         self.links.push(uri.clone());
         self.link_ids.insert(uri, id);
         Some(id)
+    }
+
+    fn notify(&mut self, title: String, body: String) {
+        let seq = self.notification.as_ref().map_or(0, |n| n.0) + 1;
+        let title = title.chars().take(MAX_NOTIFICATION_TITLE_CHARS).collect();
+        let body = body.chars().take(MAX_NOTIFICATION_BODY_CHARS).collect();
+        self.notification = Some((seq, title, body));
     }
 
     /// OSC 52 ; 種類 ; base64。書き込みだけを受け付ける
@@ -1435,6 +1458,7 @@ impl Perform for TerminalGrid {
                 self.cursor_col = self.cursor_col.saturating_sub(1);
             }
             b'\t' => self.tab_forward(1),
+            0x07 => self.bell_seq = self.bell_seq.wrapping_add(1),
             // SO / SI: G1 / G0 の文字セットに切り替える
             0x0e => self.active_charset = 1,
             0x0f => self.active_charset = 0,
@@ -1455,6 +1479,15 @@ impl Perform for TerminalGrid {
             // OSC 8 ; 引数 ; URI。URI が空ならリンクを閉じる
             Some(8) => self.pen.link = self.link_id(rest(2)),
             Some(52) => self.handle_clipboard_osc(params),
+            // iTerm2 の通知: OSC 9 ; 本文。OSC 9 ; 4 ; … は ConEmu の進み具合の表示なので通知にしない
+            Some(9) if params.get(1).is_none_or(|p| *p != b"4") => {
+                self.notify(String::new(), rest(1))
+            }
+            // rxvt の通知: OSC 777 ; notify ; タイトル ; 本文
+            Some(777) if params.get(1).is_some_and(|p| *p == b"notify") => {
+                let title = String::from_utf8_lossy(params.get(2).copied().unwrap_or_default());
+                self.notify(title.into_owned(), rest(3));
+            }
             // シェル連携: A プロンプトの始まり、B 入力の始まり、C 出力の始まり、D コマンドの終わり
             Some(133) => match params.get(1).and_then(|p| p.first()) {
                 Some(b'A') => self.pen.semantic = Semantic::Prompt,
@@ -2271,6 +2304,29 @@ mod tests {
         // 最後のプロンプトは画面の中にあるので、スクロールしていない状態に戻る
         grid.jump_to_prompt(5);
         assert_eq!(grid.scroll_offset, 0);
+    }
+
+    #[test]
+    fn bell_and_osc_9_777_notifications() {
+        let mut grid = TerminalGrid::new(4, 1);
+        // OSC の終わりの BEL はベルとして数えない
+        grid.feed_bytes(b"\x07a\x07\x1b]2;title\x07");
+        assert_eq!(grid.bell_seq, 2);
+        grid.feed_bytes("\x1b]9;ビルドが終わりました\x07".as_bytes());
+        assert_eq!(
+            grid.notification,
+            Some((1, String::new(), "ビルドが終わりました".to_string()))
+        );
+        // ConEmu の進み具合 (OSC 9 ; 4) は通知にしない
+        grid.feed_bytes(b"\x1b]9;4;1;50\x07");
+        assert_eq!(grid.notification.as_ref().map(|n| n.0), Some(1));
+        grid.feed_bytes("\x1b]777;notify;テスト;本文; 続き\x1b\\".as_bytes());
+        let snap = grid.snapshot();
+        assert_eq!(
+            snap.notification,
+            Some((2, "テスト".to_string(), "本文; 続き".to_string()))
+        );
+        assert_eq!(snap.bell_seq, 2);
     }
 
     #[test]
