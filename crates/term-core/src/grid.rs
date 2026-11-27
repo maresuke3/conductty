@@ -102,9 +102,8 @@ pub struct GridSnapshot {
     pub cursor_row: usize,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
-    /// カーソルキーのアプリケーションモード (DECCKM, CSI ?1 h)。矢印キーを SS3 で送る
     #[serde(default)]
-    pub app_cursor_keys: bool,
+    pub modes: TerminalModes,
     #[serde(default)]
     pub synchronized_output: bool,
     #[serde(default)]
@@ -112,6 +111,51 @@ pub struct GridSnapshot {
     pub cells: Vec<Cell>,
     #[serde(default)]
     pub color_overrides: ColorOverrides,
+}
+
+/// マウスの報告の範囲 (CSI ?9 / ?1000 / ?1002 / ?1003 h)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MouseTracking {
+    #[default]
+    Off,
+    /// ボタンを押したときだけ（修飾キーなし）
+    X10,
+    /// 押したときと離したとき
+    Normal,
+    /// それに加えて、ボタンを押したまま動かしたとき
+    ButtonEvent,
+    /// それに加えて、ボタンを押していなくても動かしたとき
+    AnyEvent,
+}
+
+/// アプリが CSI ? h / l で切り替える、キー・マウスの送り方のモード
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalModes {
+    /// カーソルキーのアプリケーションモード (?1)。矢印・Home・End を SS3 で送る
+    pub app_cursor_keys: bool,
+    pub mouse_tracking: MouseTracking,
+    /// マウスの報告を SGR の形（CSI < b ; x ; y M）で送る (?1006)
+    pub mouse_sgr: bool,
+    /// フォーカスの出入りを CSI I / CSI O で知らせる (?1004)
+    pub focus_events: bool,
+    /// 代替画面でマウスの報告がオフのとき、ホイールを矢印キーとして送る (?1007。Ghostty と同じく既定でオン)
+    pub alt_scroll: bool,
+    /// 代替画面 (?1049) を使っているか
+    pub alt_screen: bool,
+}
+
+impl Default for TerminalModes {
+    fn default() -> Self {
+        Self {
+            app_cursor_keys: false,
+            mouse_tracking: MouseTracking::Off,
+            mouse_sgr: false,
+            focus_events: false,
+            alt_scroll: true,
+            alt_screen: false,
+        }
+    }
 }
 
 /// OSC 4 / 10 / 11 / 12 で変えた色。テーマの色より優先し、OSC 104 / 110 / 111 / 112 で戻す
@@ -261,7 +305,7 @@ pub struct TerminalGrid {
     pub cursor_row: usize,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
-    pub app_cursor_keys: bool,
+    pub modes: TerminalModes,
     pub synchronized_output: bool,
     pub generation: u64,
     pub cells: Vec<Cell>,
@@ -293,7 +337,7 @@ impl TerminalGrid {
             cursor_row: 0,
             cursor_visible: true,
             bracketed_paste: false,
-            app_cursor_keys: false,
+            modes: TerminalModes::default(),
             synchronized_output: false,
             generation: 0,
             cells: vec![Cell::default(); cols * rows],
@@ -370,7 +414,7 @@ impl TerminalGrid {
             cursor_row: self.cursor_row,
             cursor_visible: self.cursor_visible,
             bracketed_paste: self.bracketed_paste,
-            app_cursor_keys: self.app_cursor_keys,
+            modes: self.modes,
             synchronized_output: self.synchronized_output,
             generation: self.generation,
             cells,
@@ -449,6 +493,50 @@ impl TerminalGrid {
             10 => &mut self.color_overrides.fg,
             11 => &mut self.color_overrides.bg,
             _ => &mut self.color_overrides.cursor,
+        }
+    }
+
+    fn set_private_mode(&mut self, mode: u16, on: bool) {
+        match mode {
+            1 => self.modes.app_cursor_keys = on,
+            9 | 1000 | 1002 | 1003 => {
+                self.modes.mouse_tracking = match (on, mode) {
+                    (false, _) => MouseTracking::Off,
+                    (true, 9) => MouseTracking::X10,
+                    (true, 1000) => MouseTracking::Normal,
+                    (true, 1002) => MouseTracking::ButtonEvent,
+                    (true, _) => MouseTracking::AnyEvent,
+                }
+            }
+            25 => self.cursor_visible = on,
+            1004 => self.modes.focus_events = on,
+            1006 => self.modes.mouse_sgr = on,
+            1007 => self.modes.alt_scroll = on,
+            1049 if on => {
+                if self.alt_screen.is_none() {
+                    let saved = std::mem::replace(
+                        &mut self.cells,
+                        vec![Cell::default(); self.cols * self.rows],
+                    );
+                    self.alt_screen = Some((saved, self.cursor_col, self.cursor_row));
+                    self.cursor_col = 0;
+                    self.cursor_row = 0;
+                }
+                self.modes.alt_screen = true;
+            }
+            1049 => {
+                if let Some((saved, col, row)) = self.alt_screen.take() {
+                    if saved.len() == self.cols * self.rows {
+                        self.cells = saved;
+                    }
+                    self.cursor_col = col.min(self.cols - 1);
+                    self.cursor_row = row.min(self.rows - 1);
+                }
+                self.modes.alt_screen = false;
+            }
+            2004 => self.bracketed_paste = on,
+            2026 => self.synchronized_output = on,
+            _ => {}
         }
     }
 
@@ -968,7 +1056,10 @@ impl Perform for TerminalGrid {
             }
             b'c' => {
                 self.color_overrides = ColorOverrides::default();
-                self.app_cursor_keys = false;
+                self.modes = TerminalModes {
+                    alt_screen: self.alt_screen.is_some(),
+                    ..TerminalModes::default()
+                };
                 self.clear_all();
                 self.cursor_col = 0;
                 self.cursor_row = 0;
@@ -1171,44 +1262,10 @@ impl Perform for TerminalGrid {
                 self.cursor_row = 0;
                 self.pending_wrap = false;
             }
-            'h' if is_private && first == 1 => self.app_cursor_keys = true,
-            'l' if is_private && first == 1 => self.app_cursor_keys = false,
-            'h' if is_private && first == 25 => {
-                self.cursor_visible = true;
-            }
-            'l' if is_private && first == 25 => {
-                self.cursor_visible = false;
-            }
-            'h' if is_private && first == 2004 => {
-                self.bracketed_paste = true;
-            }
-            'l' if is_private && first == 2004 => {
-                self.bracketed_paste = false;
-            }
-            'h' if is_private && first == 2026 => {
-                self.synchronized_output = true;
-            }
-            'l' if is_private && first == 2026 => {
-                self.synchronized_output = false;
-            }
-            'h' if is_private && first == 1049 => {
-                if self.alt_screen.is_none() {
-                    let saved = std::mem::replace(
-                        &mut self.cells,
-                        vec![Cell::default(); self.cols * self.rows],
-                    );
-                    self.alt_screen = Some((saved, self.cursor_col, self.cursor_row));
-                    self.cursor_col = 0;
-                    self.cursor_row = 0;
-                }
-            }
-            'l' if is_private && first == 1049 => {
-                if let Some((saved, col, row)) = self.alt_screen.take() {
-                    if saved.len() == self.cols * self.rows {
-                        self.cells = saved;
-                    }
-                    self.cursor_col = col.min(self.cols - 1);
-                    self.cursor_row = row.min(self.rows - 1);
+            // NOTE: CSI ?1000;1006h のように 1 回で複数のモードを切り替えることがある
+            'h' | 'l' if is_private => {
+                for mode in params.iter().map(|p| p[0]) {
+                    self.set_private_mode(mode, action == 'h');
                 }
             }
             'n' if first == 6 => {
@@ -1383,12 +1440,43 @@ mod tests {
     }
 
     #[test]
+    fn private_modes_toggle_mouse_focus_and_alt_screen() {
+        let mut grid = TerminalGrid::new(4, 2);
+        assert!(grid.modes.alt_scroll);
+        // 1 回で複数のモードを切り替える
+        grid.feed_bytes(b"\x1b[?1000;1006;1004h");
+        assert_eq!(grid.modes.mouse_tracking, MouseTracking::Normal);
+        assert!(grid.modes.mouse_sgr && grid.modes.focus_events);
+        grid.feed_bytes(b"\x1b[?1003h");
+        assert_eq!(grid.modes.mouse_tracking, MouseTracking::AnyEvent);
+        grid.feed_bytes(b"\x1b[?1003l\x1b[?1007l");
+        assert_eq!(grid.modes.mouse_tracking, MouseTracking::Off);
+        assert!(!grid.modes.alt_scroll);
+
+        grid.feed_bytes(b"\x1b[?1049;25l");
+        assert!(!grid.modes.alt_screen && !grid.cursor_visible);
+        grid.feed_bytes(b"\x1b[?1049h");
+        assert!(grid.snapshot().modes.alt_screen);
+        // 全体のリセットでモードは戻るが、代替画面にいることは変わらない
+        grid.feed_bytes(b"\x1bc");
+        assert_eq!(
+            grid.modes,
+            TerminalModes {
+                alt_screen: true,
+                ..TerminalModes::default()
+            }
+        );
+        grid.feed_bytes(b"\x1b[?1049l");
+        assert!(!grid.modes.alt_screen);
+    }
+
+    #[test]
     fn decckm_toggles_app_cursor_keys() {
         let mut grid = TerminalGrid::new(4, 1);
         grid.feed_bytes(b"\x1b[?1h");
-        assert!(grid.snapshot().app_cursor_keys);
+        assert!(grid.snapshot().modes.app_cursor_keys);
         grid.feed_bytes(b"\x1b[?1l");
-        assert!(!grid.app_cursor_keys);
+        assert!(!grid.modes.app_cursor_keys);
     }
 
     #[test]
