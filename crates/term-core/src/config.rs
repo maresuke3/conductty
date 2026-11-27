@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::grid::{Cell, Color, ColorOverrides, DEFAULT_PALETTE};
+use crate::grid::{Cell, Color, ColorOverrides, CursorStyle, DEFAULT_PALETTE};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -115,6 +115,10 @@ pub struct AppearanceConfig {
     pub window_padding_balance: bool,
     /// 太字の 0〜7 番の色を 8〜15 番の明るい色で描く（Ghostty の bold-is-bright）。未指定ならテーマに従う
     pub bold_is_bright: Option<bool>,
+    /// カーソルの形: "block" / "bar" / "underline" / "block_hollow"（Ghostty の cursor-style）
+    pub cursor_style: CursorStyle,
+    /// カーソルを点滅させるか。未指定なら点滅し、アプリの指定に従う（Ghostty の cursor-style-blink）
+    pub cursor_style_blink: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +299,8 @@ impl Default for AppearanceConfig {
             window_padding_y: 10.0,
             window_padding_balance: true,
             bold_is_bright: None,
+            cursor_style: CursorStyle::Block,
+            cursor_style_blink: None,
         }
     }
 }
@@ -1243,6 +1249,19 @@ new_tab = "ctrl+shift+t"
         let resolved = cfg.resolve_theme();
         assert_eq!(resolved.bg, [0x1a, 0x1b, 0x26]); // TokyoNight preset
         assert_eq!(resolved.accent, [0xff, 0x9e, 0x64]); // custom hex override
+    }
+
+    #[test]
+    fn reads_cursor_style_like_ghostty() {
+        let cfg = AppConfig::from_toml_str(
+            "[appearance]\ncursor_style = \"block_hollow\"\ncursor_style_blink = false\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.appearance.cursor_style, CursorStyle::BlockHollow);
+        assert_eq!(cfg.appearance.cursor_style_blink, Some(false));
+        let default = AppConfig::from_toml_str("").unwrap();
+        assert_eq!(default.appearance.cursor_style, CursorStyle::Block);
+        assert_eq!(default.appearance.cursor_style_blink, None);
     }
 
     #[test]

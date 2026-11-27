@@ -17,7 +17,9 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, S
 use markdown_html::{markdown_contains_mermaid, render_markdown_to_html};
 use term_core::agent::{AgentStatus, PaneAgentState, detect_pane_agent, snapshot_visible_lines};
 use term_core::config::{AppConfig, LeftDrawerMode, ResolvedTheme, find_theme};
-use term_core::grid::{Cell, GridSnapshot, MouseTracking, TerminalGrid, TerminalModes, Underline};
+use term_core::grid::{
+    Cell, CursorStyle, GridSnapshot, MouseTracking, TerminalGrid, TerminalModes, Underline,
+};
 use term_core::input::{
     Action, GoToCommand, InputDecision, InputMode, InputRouter, KeyCode as CoreKeyCode,
     KeyEvent as CoreKeyEvent, Modifiers, PerformableContext,
@@ -405,6 +407,8 @@ struct App {
     mouse_last_cell: Option<(PaneId, usize, usize)>,
     /// フォーカスがあると知らせたペイン (?1004)
     focus_reported: Option<PaneId>,
+    /// カーソルの点滅を数え始めた時刻。キーを打つと戻して、打っている間はカーソルを見せる
+    cursor_blink_epoch: std::time::Instant,
     clipboard: Option<arboard::Clipboard>,
     browser: Option<EmbeddedBrowser>,
     pending_browser_url: Option<String>,
@@ -1115,6 +1119,16 @@ impl App {
             if let Ok(json) = serde_json::to_string_pretty(&names) {
                 let _ = std::fs::write(path, json);
             }
+        }
+    }
+
+    fn cursor_look(&self) -> CursorLook {
+        let phase =
+            self.cursor_blink_epoch.elapsed().as_millis() / CURSOR_BLINK_INTERVAL.as_millis();
+        CursorLook {
+            style: self.config.appearance.cursor_style,
+            blink: self.config.appearance.cursor_style_blink,
+            phase_on: phase.is_multiple_of(2),
         }
     }
 
@@ -2450,6 +2464,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                     match decision {
                         InputDecision::SendToPty(bytes) => {
+                            self.cursor_blink_epoch = std::time::Instant::now();
                             self.suppress_next_ime_commit = false;
                             let focused = self.manager.active_tab().focused_pane;
                             if self.config.features.multiplexer_mode {
@@ -2500,6 +2515,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pending_redraw_deadline = None;
                 self.pending_occluded_redraw = false;
                 self.refresh_agent_states();
+                let cursor_look = self.cursor_look();
                 let area = self.terminal_area();
                 let focused_pane = self.manager.active_tab().focused_pane;
                 let pane_move_mode = self.router.mode == InputMode::PaneMove;
@@ -3455,6 +3471,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             is_focused,
                                             selection.filter(|(p, _, _)| p == pane_id),
                                             &theme,
+                                            cursor_look,
                                         );
                                         if is_focused {
                                             ime_cursor_rect = Some(render_ime_preedit(
@@ -3490,6 +3507,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             is_focused,
                                             selection.filter(|(p, _, _)| p == pane_id),
                                             &theme,
+                                            cursor_look,
                                         );
                                         if is_focused {
                                             ime_cursor_rect = Some(render_ime_preedit(
@@ -4225,6 +4243,18 @@ impl ApplicationHandler<UserEvent> for App {
                         self.agent_scan_start + std::time::Duration::from_millis(expiry_ms + 300),
                     );
                 }
+                // カーソルが点滅するなら、表示と非表示が切り替わる時刻に描き直す
+                let focused = self.manager.active_tab().focused_pane;
+                if self.window_focused && self.cursor_look().for_pane(&self.pane_modes(focused)).1 {
+                    let interval = CURSOR_BLINK_INTERVAL.as_millis();
+                    let elapsed = self.cursor_blink_epoch.elapsed().as_millis();
+                    let next = self.cursor_blink_epoch
+                        + std::time::Duration::from_millis(
+                            ((elapsed / interval + 1) * interval) as u64,
+                        );
+                    self.pending_redraw_deadline =
+                        Some(self.pending_redraw_deadline.map_or(next, |d| d.min(next)));
+                }
                 if need_redraw && let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -4784,6 +4814,7 @@ fn render_grid_snapshot(
     is_focused: bool,
     selection: Option<PaneSelection>,
     theme: &ResolvedTheme,
+    cursor: CursorLook,
 ) {
     let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
     // セルの色は番号・既定色のまま届くので、ここで今のテーマ（OSC で変えた色を含む）の色に決める
@@ -4802,7 +4833,16 @@ fn render_grid_snapshot(
     let cell_bg = |c: usize| snap.cells.get(c).and_then(|cell| theme.cell_colors(cell).1);
     let is_selected = |pos: (usize, usize)| sel_range.is_some_and(|(s, e)| pos >= s && pos <= e);
     // cursor-text があるときは Ghostty と同じく、塗りつぶしたカーソルの上に文字をその色で描く
-    let solid_cursor = is_focused && snap.cursor_visible && theme.cursor_text.is_some();
+    let (cursor_style, blinking) = cursor.for_pane(&snap.modes);
+    // フォーカスの無いペインは Ghostty と同じく枠だけのカーソルにし、点滅もさせない
+    let cursor_style = if is_focused {
+        cursor_style
+    } else {
+        CursorStyle::BlockHollow
+    };
+    let cursor_shown = snap.cursor_visible && (!is_focused || !blinking || cursor.phase_on);
+    let solid_cursor =
+        cursor_shown && cursor_style == CursorStyle::Block && theme.cursor_text.is_some();
 
     for row in 0..snap.rows {
         let y = rect.y + pad_y + row as f32 * row_h;
@@ -4883,15 +4923,64 @@ fn render_grid_snapshot(
         }
     }
 
-    if is_focused && snap.cursor_visible && !solid_cursor {
+    if cursor_shown && !solid_cursor {
         let cx = rect.x + pad_x + snap.cursor_col as f32 * char_w;
         let cy = rect.y + pad_y + snap.cursor_row as f32 * row_h;
-        let cursor_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(char_w, row_h));
-        painter.rect_filled(
-            cursor_rect,
-            0.0,
-            Color32::from_rgba_unmultiplied(theme.cursor[0], theme.cursor[1], theme.cursor[2], 160),
-        );
+        let cell = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(char_w, row_h));
+        draw_cursor(painter, cell, cursor_style, font_id.size, theme);
+    }
+}
+
+/// 設定のカーソルの形と点滅、それに今が点滅の「見える」側か
+#[derive(Clone, Copy)]
+struct CursorLook {
+    style: CursorStyle,
+    blink: Option<bool>,
+    phase_on: bool,
+}
+
+impl CursorLook {
+    /// アプリの指定 (DECSCUSR / ?12) を設定より優先して、ペインのカーソルの形と点滅を決める
+    fn for_pane(self, modes: &TerminalModes) -> (CursorStyle, bool) {
+        let style = modes.cursor_style.unwrap_or(self.style);
+        (style, modes.cursor_blink.or(self.blink).unwrap_or(true))
+    }
+}
+
+/// Ghostty と同じ点滅の間隔
+const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(600);
+
+fn draw_cursor(
+    painter: &egui::Painter,
+    cell: Rect,
+    style: CursorStyle,
+    font_size: f32,
+    theme: &ResolvedTheme,
+) {
+    let color = rgb(theme.cursor);
+    let thickness = (font_size / 9.0).max(2.0);
+    match style {
+        // 下の文字が透けて見えるよう半透明で重ねる
+        CursorStyle::Block => {
+            let [r, g, b] = theme.cursor;
+            painter.rect_filled(cell, 0.0, Color32::from_rgba_unmultiplied(r, g, b, 160));
+        }
+        CursorStyle::BlockHollow => {
+            painter.rect_stroke(cell, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        }
+        CursorStyle::Bar => {
+            let bar = Rect::from_min_size(cell.min, Vec2::new(thickness, cell.height()));
+            painter.rect_filled(bar, 0.0, color);
+        }
+        // 文字の下線と同じ高さに引く
+        CursorStyle::Underline => {
+            let y = (cell.top() + font_size * 1.05).min(cell.bottom() - thickness);
+            let line = Rect::from_min_size(
+                Pos2::new(cell.left(), y),
+                Vec2::new(cell.width(), thickness),
+            );
+            painter.rect_filled(line, 0.0, color);
+        }
     }
 }
 
@@ -6167,6 +6256,7 @@ fn main() {
         mouse_button_down: None,
         mouse_last_cell: None,
         focus_reported: None,
+        cursor_blink_epoch: std::time::Instant::now(),
         clipboard: arboard::Clipboard::new().ok(),
         browser: None,
         pending_browser_url: None,
