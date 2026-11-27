@@ -29,9 +29,10 @@ use term_drawer::{
     format_item_for_pane, invoke_plugin_action, validate_http_url,
 };
 use term_mux::{
-    AgentInfo, DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MAX_IPC_REQUEST_BYTES, MuxRequest,
-    MuxResponse, PaneInfo, SpaceInfo, SpawnKind, parse_authenticated_request, read_bounded_line,
-    read_or_create_ipc_token, send_request, split_dir_for_spawn,
+    AgentInfo, DEFAULT_IPC_ADDR, DEFAULT_MUX_SERVER_ADDR, MAX_IPC_REQUEST_BYTES,
+    MUX_PROTOCOL_VERSION, MuxRequest, MuxResponse, PaneInfo, SpaceInfo, SpawnKind,
+    parse_authenticated_request, read_bounded_line, read_or_create_ipc_token, send_request,
+    split_dir_for_spawn,
 };
 use term_render::bg_from_rgb;
 use winit::application::ApplicationHandler;
@@ -363,6 +364,8 @@ struct App {
     panes: HashMap<PaneId, PaneRuntime>,
     mux_snapshots: HashMap<PaneId, GridSnapshot>,
     mux_last_sizes: HashMap<PaneId, (usize, usize)>,
+    /// conductty-server の版が合わずつながなかったときの案内
+    mux_error: Option<String>,
     next_pane_id: PaneId,
     pane_mode_active: bool,
     go_to_open: bool,
@@ -1104,6 +1107,28 @@ impl App {
     }
 
     fn ensure_mux_server_and_attach(&mut self) {
+        // 起動したまま残った古い server とは画面のデータの形が違うため、つながずに案内を出す
+        match self
+            .rt
+            .block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Hello))
+        {
+            Ok(MuxResponse::Hello { protocol }) if protocol == MUX_PROTOCOL_VERSION => {}
+            Ok(resp) => {
+                // 版 1 の server は Hello を知らずエラーを返す
+                let server = match resp {
+                    MuxResponse::Hello { protocol } => protocol,
+                    _ => 1,
+                };
+                let msg = format!(
+                    "conductty-server の版 ({server}) がアプリ ({MUX_PROTOCOL_VERSION}) と合いません。\n古い conductty-server を終了してから開き直してください"
+                );
+                eprintln!("[conductty-mux] {msg}");
+                self.mux_error = Some(msg);
+                return;
+            }
+            // server が起動していない。下の Attach の失敗で起動する
+            Err(_) => {}
+        }
         if let Ok(MuxResponse::State { manager, snapshots }) = self
             .rt
             .block_on(send_request(DEFAULT_MUX_SERVER_ADDR, &MuxRequest::Attach))
@@ -1687,7 +1712,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         if self.config.features.multiplexer_mode {
-            if self.mux_snapshots.is_empty() {
+            if self.mux_snapshots.is_empty() && self.mux_error.is_none() {
                 self.ensure_mux_server_and_attach();
             }
         } else if self.panes.is_empty()
@@ -3178,6 +3203,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 (w, h)
                             });
                             computed_cell_size = (char_w, row_h);
+                            if let Some(msg) = &self.mux_error {
+                                ui.painter().text(
+                                    panel_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    msg,
+                                    font_id.clone(),
+                                    rgb(theme.fg),
+                                );
+                            }
 
                             for (pane_id, rect) in &visible_panes {
                                 let egui_rect = Rect::from_min_size(
@@ -4567,9 +4601,8 @@ fn render_grid_snapshot(
     theme: &ResolvedTheme,
 ) {
     let sel_range = selection.map(|(_, a, b)| if a <= b { (a, b) } else { (b, a) });
-    // 既定前景色のセルはテーマの前景色で描く（Light テーマで文字が読めるように）
-    let default_fg = term_core::grid::Cell::default().fg;
-    let theme_fg = rgb(theme.fg);
+    // セルの色は番号・既定色のまま届くので、ここで今のテーマの色に決める
+    let cell_bg = |c: usize| snap.cells.get(c).and_then(|cell| theme.cell_colors(cell).1);
 
     for row in 0..snap.rows {
         let y = rect.y + pad_y + row as f32 * row_h;
@@ -4577,27 +4610,19 @@ fn render_grid_snapshot(
         let mut col = 0;
 
         while col < snap.cols {
-            let Some(cell) = snap.cells.get(row_start + col) else {
+            if snap.cells.get(row_start + col).is_none() {
                 break;
-            };
-            if let Some(bg_rgb) = cell.bg {
+            }
+            if let Some(bg_rgb) = cell_bg(row_start + col) {
                 let mut end_col = col + 1;
-                while end_col < snap.cols {
-                    if snap.cells.get(row_start + end_col).and_then(|c| c.bg) == Some(bg_rgb) {
-                        end_col += 1;
-                    } else {
-                        break;
-                    }
+                while end_col < snap.cols && cell_bg(row_start + end_col) == Some(bg_rgb) {
+                    end_col += 1;
                 }
                 let bg_rect = Rect::from_min_size(
                     Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
                     Vec2::new((end_col - col) as f32 * char_w, row_h),
                 );
-                painter.rect_filled(
-                    bg_rect,
-                    0.0,
-                    Color32::from_rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b),
-                );
+                painter.rect_filled(bg_rect, 0.0, rgb(bg_rgb));
                 col = end_col;
             } else {
                 col += 1;
@@ -4631,11 +4656,7 @@ fn render_grid_snapshot(
                 col += 1;
                 continue;
             }
-            let fg_color = if cell.fg == default_fg {
-                theme_fg
-            } else {
-                Color32::from_rgb(cell.fg.r, cell.fg.g, cell.fg.b)
-            };
+            let fg_color = rgb(theme.cell_colors(cell).0);
             if is_box_drawing_char(ch) {
                 let cell_rect = Rect::from_min_size(
                     Pos2::new(rect.x + pad_x + col as f32 * char_w, y),
@@ -5811,6 +5832,7 @@ fn main() {
         panes: HashMap::new(),
         mux_snapshots: HashMap::new(),
         mux_last_sizes: HashMap::new(),
+        mux_error: None,
         next_pane_id: 1,
         pane_mode_active: false,
         go_to_open: false,

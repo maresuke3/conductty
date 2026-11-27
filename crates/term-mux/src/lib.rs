@@ -8,6 +8,9 @@ use tokio::net::TcpStream;
 
 pub const DEFAULT_IPC_ADDR: &str = "127.0.0.1:47321";
 pub const DEFAULT_MUX_SERVER_ADDR: &str = "127.0.0.1:47322";
+/// conductty-server とアプリでやり取りするデータの版。GridSnapshot などの形を変えたら上げる
+/// 2: セルの色を番号・既定色のまま送るようにした
+pub const MUX_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_IPC_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_IPC_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -220,6 +223,8 @@ pub enum SpawnKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MuxRequest {
     Ping,
+    /// server の版を問い合わせる。版 1 の server はこの要求を知らずエラーを返す
+    Hello,
     ListPanes,
     ListSpaces,
     ListAgents,
@@ -280,6 +285,9 @@ pub enum MuxRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MuxResponse {
     Pong,
+    Hello {
+        protocol: u32,
+    },
     Panes {
         panes: Vec<PaneInfo>,
     },
