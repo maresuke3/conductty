@@ -348,6 +348,11 @@ fn parse_osc7_path(uri: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// 8 列ごとのタブの位置
+fn default_tab_stops(cols: usize) -> Vec<bool> {
+    (0..cols).map(|c| c > 0 && c % 8 == 0).collect()
+}
+
 fn parse_number<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
@@ -429,6 +434,16 @@ pub struct TerminalGrid {
     /// これから書く文字の色と属性（SGR で変わる）。ch は使わない
     pen: Cell,
     pending_wrap: bool,
+    /// 右端で次の行に折り返す (?7)
+    autowrap: bool,
+    /// カーソルの位置をスクロール範囲の中で数える (?6)
+    origin_mode: bool,
+    /// 書くときに右の文字をずらして挿入する (CSI 4 h)
+    insert_mode: bool,
+    /// 列ごとのタブの止まる位置
+    tab_stops: Vec<bool>,
+    /// CSI b（直前の文字を繰り返す）のために覚えておく、最後に書いた文字
+    last_printed: Option<char>,
     scroll_top: usize,
     scroll_bottom: usize,
     saved_cursor: (usize, usize),
@@ -469,6 +484,11 @@ impl TerminalGrid {
             clipboard_seq: 0,
             pen: Cell::default(),
             pending_wrap: false,
+            autowrap: true,
+            origin_mode: false,
+            insert_mode: false,
+            tab_stops: default_tab_stops(cols),
+            last_printed: None,
             scroll_top: 0,
             scroll_bottom: rows - 1,
             saved_cursor: (0, 0),
@@ -647,7 +667,9 @@ impl TerminalGrid {
             1004 => self.modes.focus_events,
             1006 => self.modes.mouse_sgr,
             1007 => self.modes.alt_scroll,
-            1049 => self.modes.alt_screen,
+            6 => self.origin_mode,
+            7 => self.autowrap,
+            47 | 1047 | 1049 => self.modes.alt_screen,
             2004 => self.bracketed_paste,
             2026 => self.synchronized_output,
             _ => return None,
@@ -672,28 +694,43 @@ impl TerminalGrid {
             1004 => self.modes.focus_events = on,
             1006 => self.modes.mouse_sgr = on,
             1007 => self.modes.alt_scroll = on,
-            1049 if on => {
+            6 => {
+                self.origin_mode = on;
+                self.cursor_col = 0;
+                self.cursor_row = self.origin_row(0);
+                self.pending_wrap = false;
+            }
+            7 => self.autowrap = on,
+            // 代替画面。1049 は入る前のカーソルを覚えて戻し、47 / 1047 はカーソルを動かさない
+            47 | 1047 | 1049 if on => {
                 if self.alt_screen.is_none() {
                     let saved = std::mem::replace(
                         &mut self.cells,
                         vec![Cell::default(); self.cols * self.rows],
                     );
                     self.alt_screen = Some((saved, self.cursor_col, self.cursor_row));
-                    self.cursor_col = 0;
-                    self.cursor_row = 0;
+                    if mode == 1049 {
+                        self.cursor_col = 0;
+                        self.cursor_row = 0;
+                    }
                 }
                 self.modes.alt_screen = true;
             }
-            1049 => {
+            47 | 1047 | 1049 => {
                 if let Some((saved, col, row)) = self.alt_screen.take() {
                     if saved.len() == self.cols * self.rows {
                         self.cells = saved;
                     }
-                    self.cursor_col = col.min(self.cols - 1);
-                    self.cursor_row = row.min(self.rows - 1);
+                    if mode == 1049 {
+                        self.cursor_col = col.min(self.cols - 1);
+                        self.cursor_row = row.min(self.rows - 1);
+                    }
                 }
                 self.modes.alt_screen = false;
             }
+            // カーソルの位置を覚える・戻す（ESC 7 / ESC 8 と同じ）
+            1048 if on => self.save_cursor(),
+            1048 => self.restore_cursor(),
             2004 => self.bracketed_paste = on,
             2026 => self.synchronized_output = on,
             _ => {}
@@ -735,6 +772,58 @@ impl TerminalGrid {
                 self.clipboard_seq,
                 String::from_utf8_lossy(&bytes).into_owned(),
             ));
+        }
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cursor = (self.cursor_col, self.cursor_row);
+    }
+
+    fn restore_cursor(&mut self) {
+        self.cursor_col = self.saved_cursor.0.min(self.cols - 1);
+        self.cursor_row = self.saved_cursor.1.min(self.rows - 1);
+        self.pending_wrap = false;
+    }
+
+    /// カーソルを置く行。原点モード (?6) ではスクロール範囲の上端から数え、範囲の中に収める
+    fn origin_row(&self, row: usize) -> usize {
+        if self.origin_mode {
+            (self.scroll_top + row).min(self.scroll_bottom)
+        } else {
+            row.min(self.rows - 1)
+        }
+    }
+
+    /// カーソルの位置に n 個の空白を挿入し、右の文字をずらす（右端からはみ出た文字は消える）
+    fn insert_blanks(&mut self, n: usize) {
+        let n = n.min(self.cols - self.cursor_col);
+        let row_start = self.cursor_row * self.cols;
+        let start = row_start + self.cursor_col;
+        let row_end = row_start + self.cols;
+        self.cells[start..row_end].rotate_right(n);
+        for c in &mut self.cells[start..start + n] {
+            *c = Cell::default();
+        }
+    }
+
+    /// n 個先のタブの位置へ。無ければ右端へ
+    fn tab_forward(&mut self, n: usize) {
+        self.pending_wrap = false;
+        for _ in 0..n {
+            self.cursor_col = (self.cursor_col + 1..self.cols)
+                .find(|&c| self.tab_stops[c])
+                .unwrap_or(self.cols - 1);
+        }
+    }
+
+    /// n 個前のタブの位置へ。無ければ左端へ
+    fn tab_backward(&mut self, n: usize) {
+        self.pending_wrap = false;
+        for _ in 0..n {
+            self.cursor_col = (0..self.cursor_col)
+                .rev()
+                .find(|&c| self.tab_stops[c])
+                .unwrap_or(0);
         }
     }
 
@@ -826,6 +915,11 @@ impl TerminalGrid {
         if new_cols == self.cols && new_rows == self.rows {
             return;
         }
+        // 残る列のタブの位置はそのままにし、増えた列は 8 列ごとにする
+        let mut tab_stops = default_tab_stops(new_cols);
+        let keep = self.cols.min(new_cols);
+        tab_stops[..keep].copy_from_slice(&self.tab_stops[..keep]);
+        self.tab_stops = tab_stops;
 
         let Some(total) = new_cols.checked_mul(new_rows) else {
             return;
@@ -1168,6 +1262,7 @@ fn char_display_width(c: char) -> usize {
 
 impl Perform for TerminalGrid {
     fn print(&mut self, c: char) {
+        self.last_printed = Some(c);
         let c = self.charsets[self.active_charset].map(c);
         let width = char_display_width(c);
         if width == 0 {
@@ -1179,12 +1274,20 @@ impl Perform for TerminalGrid {
             self.pending_wrap = false;
         }
         if width == 2 && self.cols >= 2 && self.cursor_col + 1 >= self.cols {
-            let idx = self.cursor_row * self.cols + self.cursor_col;
-            if let Some(cell) = self.cells.get_mut(idx) {
-                *cell = Cell::default();
+            if self.autowrap {
+                let idx = self.cursor_row * self.cols + self.cursor_col;
+                if let Some(cell) = self.cells.get_mut(idx) {
+                    *cell = Cell::default();
+                }
+                self.cursor_col = 0;
+                self.newline();
+            } else {
+                // 折り返さないときは、右端の 2 列に書く
+                self.cursor_col = self.cols - 2;
             }
-            self.cursor_col = 0;
-            self.newline();
+        }
+        if self.insert_mode {
+            self.insert_blanks(width);
         }
         self.clear_wide_overlap(self.cursor_row, self.cursor_col);
         let idx = self.cursor_row * self.cols + self.cursor_col;
@@ -1202,12 +1305,13 @@ impl Perform for TerminalGrid {
             }
             if self.cursor_col + 2 >= self.cols {
                 self.cursor_col = self.cols - 1;
-                self.pending_wrap = true;
+                self.pending_wrap = self.autowrap;
             } else {
                 self.cursor_col += 2;
             }
         } else if self.cursor_col + 1 >= self.cols {
-            self.pending_wrap = true;
+            // 折り返さないときは右端に留まり、次の文字で上書きする
+            self.pending_wrap = self.autowrap;
         } else {
             self.cursor_col += 1;
         }
@@ -1227,11 +1331,7 @@ impl Perform for TerminalGrid {
                 self.pending_wrap = false;
                 self.cursor_col = self.cursor_col.saturating_sub(1);
             }
-            b'\t' => {
-                self.pending_wrap = false;
-                let next = ((self.cursor_col / 8) + 1) * 8;
-                self.cursor_col = next.min(self.cols - 1);
-            }
+            b'\t' => self.tab_forward(1),
             // SO / SI: G1 / G0 の文字セットに切り替える
             0x0e => self.active_charset = 1,
             0x0f => self.active_charset = 0,
@@ -1267,14 +1367,10 @@ impl Perform for TerminalGrid {
             return;
         }
         match byte {
-            b'7' => {
-                self.saved_cursor = (self.cursor_col, self.cursor_row);
-            }
-            b'8' => {
-                self.cursor_col = self.saved_cursor.0.min(self.cols - 1);
-                self.cursor_row = self.saved_cursor.1.min(self.rows - 1);
-                self.pending_wrap = false;
-            }
+            b'7' => self.save_cursor(),
+            b'8' => self.restore_cursor(),
+            // HTS: 今の列をタブの止まる位置にする
+            b'H' => self.tab_stops[self.cursor_col] = true,
             b'D' => {
                 self.pending_wrap = false;
                 self.newline();
@@ -1291,6 +1387,10 @@ impl Perform for TerminalGrid {
                 self.color_overrides = ColorOverrides::default();
                 self.charsets = [Charset::Ascii; 2];
                 self.active_charset = 0;
+                self.autowrap = true;
+                self.origin_mode = false;
+                self.insert_mode = false;
+                self.tab_stops = default_tab_stops(self.cols);
                 self.modes = TerminalModes {
                     alt_screen: self.alt_screen.is_some(),
                     ..TerminalModes::default()
@@ -1334,7 +1434,14 @@ impl Perform for TerminalGrid {
                 };
                 Some(format!("\x1b[?{first};{state}$y"))
             }
-            ([b'$'], 'p') => Some(format!("\x1b[{first};0$y")),
+            ([b'$'], 'p') => {
+                let state = match (first, self.insert_mode) {
+                    (4, true) => 1,
+                    (4, false) => 2,
+                    _ => 0,
+                };
+                Some(format!("\x1b[{first};{state}$y"))
+            }
             _ => None,
         };
         if let Some(reply) = reply {
@@ -1391,7 +1498,7 @@ impl Perform for TerminalGrid {
             }
             'd' => {
                 self.pending_wrap = false;
-                self.cursor_row = first.saturating_sub(1).min(self.rows - 1);
+                self.cursor_row = self.origin_row(first.saturating_sub(1));
             }
             'H' | 'f' => {
                 self.pending_wrap = false;
@@ -1406,7 +1513,7 @@ impl Perform for TerminalGrid {
                     .and_then(|p| p.first().copied())
                     .unwrap_or(1)
                     .max(1) as usize;
-                self.cursor_row = (r - 1).min(self.rows - 1);
+                self.cursor_row = self.origin_row(r - 1);
                 self.cursor_col = (c - 1).min(self.cols - 1);
             }
             's' if !is_private => {
@@ -1428,15 +1535,29 @@ impl Perform for TerminalGrid {
                     *c = Cell::default();
                 }
             }
-            '@' => {
-                // ICH: Insert N blank characters at cursor, shifting remaining cells right
-                let n = first.max(1).min(self.cols - self.cursor_col);
-                let row_start = self.cursor_row * self.cols;
-                let start = row_start + self.cursor_col;
-                let row_end = row_start + self.cols;
-                self.cells[start..row_end].rotate_right(n);
-                for c in &mut self.cells[start..start + n] {
-                    *c = Cell::default();
+            // ICH: Insert N blank characters at cursor, shifting remaining cells right
+            '@' => self.insert_blanks(first.max(1)),
+            // REP: 直前の文字を N 回繰り返す
+            'b' if !is_private => {
+                if let Some(c) = self.last_printed {
+                    for _ in 0..first.max(1) {
+                        self.print(c);
+                    }
+                }
+            }
+            // CHT / CBT: N 個先・前のタブの位置へ
+            'I' if !is_private => self.tab_forward(first.max(1)),
+            'Z' if !is_private => self.tab_backward(first.max(1)),
+            // TBC: 0 は今の列、3 はすべてのタブの位置を消す
+            'g' if !is_private => match first {
+                0 => self.tab_stops[self.cursor_col] = false,
+                3 => self.tab_stops.fill(false),
+                _ => {}
+            },
+            // ANSI のモード。挿入モード (4) だけを扱う
+            'h' | 'l' if !is_private => {
+                if params.iter().any(|p| p[0] == 4) {
+                    self.insert_mode = action == 'h';
                 }
             }
             'J' => match first {
@@ -1538,7 +1659,7 @@ impl Perform for TerminalGrid {
                     self.scroll_bottom = self.rows - 1;
                 }
                 self.cursor_col = 0;
-                self.cursor_row = 0;
+                self.cursor_row = self.origin_row(0);
                 self.pending_wrap = false;
             }
             // NOTE: CSI ?1000;1006h のように 1 回で複数のモードを切り替えることがある
@@ -1879,6 +2000,101 @@ mod tests {
         grid.feed_bytes(b"\x1b]52;c;?\x07\x1b]52;c;!!!\x07");
         assert_eq!(grid.clipboard_write.as_ref().map(|w| w.0), Some(1));
         assert!(grid.take_replies().is_empty());
+    }
+
+    fn row_text(grid: &TerminalGrid, row: usize) -> String {
+        (0..grid.cols)
+            .map(|col| grid.cell(col, row).unwrap().ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn autowrap_off_overwrites_last_column() {
+        let mut grid = TerminalGrid::new(5, 2);
+        grid.feed_bytes(b"\x1b[?7labcdefg");
+        assert_eq!(row_text(&grid, 0), "abcdg");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (4, 0));
+        grid.feed_bytes(b"\x1b[?7h\rabcdefg");
+        assert_eq!(
+            (row_text(&grid, 0), row_text(&grid, 1)),
+            ("abcde".into(), "fg".into())
+        );
+    }
+
+    #[test]
+    fn insert_mode_shifts_text_right() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.feed_bytes(b"abcdef\r\x1b[4hXY\x1b[4lZ");
+        assert_eq!(row_text(&grid, 0), "XYZbcdef");
+        grid.feed_bytes(b"\x1b[4$p\x1b[4h\x1b[4$p");
+        assert_eq!(
+            grid.take_replies(),
+            vec![b"\x1b[4;2$y".to_vec(), b"\x1b[4;1$y".to_vec()]
+        );
+    }
+
+    #[test]
+    fn origin_mode_positions_cursor_inside_scroll_region() {
+        let mut grid = TerminalGrid::new(10, 6);
+        grid.feed_bytes(b"\x1b[2;4r\x1b[?6h");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (0, 1));
+        grid.feed_bytes(b"\x1b[2;3H");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (2, 2));
+        // スクロール範囲より下は範囲の下端に収める
+        grid.feed_bytes(b"\x1b[9;1H");
+        assert_eq!(grid.cursor_row, 3);
+        grid.feed_bytes(b"\x1b[?6l");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (0, 0));
+    }
+
+    #[test]
+    fn tab_stops_can_be_set_cleared_and_moved_between() {
+        let mut grid = TerminalGrid::new(30, 1);
+        grid.feed_bytes(b"\t");
+        assert_eq!(grid.cursor_col, 8);
+        grid.feed_bytes(b"\r\x1b[2I");
+        assert_eq!(grid.cursor_col, 16);
+        grid.feed_bytes(b"\x1b[Z");
+        assert_eq!(grid.cursor_col, 8);
+        // すべて消してから 3 列目にだけ置く
+        grid.feed_bytes(b"\x1b[3g\r\x1b[3C\x1bH\r\t");
+        assert_eq!(grid.cursor_col, 3);
+        grid.feed_bytes(b"\t");
+        assert_eq!(grid.cursor_col, 29);
+        // 今の列のタブの位置だけを消す
+        grid.feed_bytes(b"\r\x1b[3C\x1b[g\r\t");
+        assert_eq!(grid.cursor_col, 29);
+    }
+
+    #[test]
+    fn rep_repeats_last_printed_char() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.feed_bytes(b"ab\x1b[3b\x1b(0q\x1b[2b");
+        assert_eq!(row_text(&grid, 0), "abbbb───");
+    }
+
+    #[test]
+    fn alt_screen_47_keeps_cursor_and_1048_saves_cursor() {
+        let mut grid = TerminalGrid::new(10, 3);
+        grid.feed_bytes(b"main\x1b[?47h");
+        assert!(grid.modes.alt_screen);
+        assert_eq!((grid.cursor_col, row_text(&grid, 0)), (4, String::new()));
+        grid.feed_bytes(b"\r\nalt\x1b[?47l");
+        assert_eq!(row_text(&grid, 0), "main");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (3, 1));
+        grid.feed_bytes(b"\x1b[?1048h\x1b[3;8H\x1b[?1048l");
+        assert_eq!((grid.cursor_col, grid.cursor_row), (3, 1));
+        grid.feed_bytes(b"\x1b[?7$p\x1b[?6$p\x1b[?47$p");
+        assert_eq!(
+            grid.take_replies(),
+            vec![
+                b"\x1b[?7;1$y".to_vec(),
+                b"\x1b[?6;2$y".to_vec(),
+                b"\x1b[?47;2$y".to_vec()
+            ]
+        );
     }
 
     #[test]
