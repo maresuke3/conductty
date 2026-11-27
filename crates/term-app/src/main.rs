@@ -1109,6 +1109,20 @@ impl App {
         }
     }
 
+    fn focused_app_cursor_keys(&self) -> bool {
+        let focused = self.manager.active_tab().focused_pane;
+        if self.config.features.multiplexer_mode {
+            return self
+                .mux_snapshots
+                .get(&focused)
+                .is_some_and(|s| s.app_cursor_keys);
+        }
+        self.panes
+            .get(&focused)
+            .and_then(|p| p.grid.lock().ok().map(|g| g.app_cursor_keys))
+            .unwrap_or(false)
+    }
+
     /// grid が OSC の色の問い合わせに今のテーマで答えるよう、テーマを渡す
     fn apply_theme_to_grids(&self) {
         if self.config.features.multiplexer_mode {
@@ -2279,6 +2293,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(core_ev) = to_core_key_event(&event, self.modifiers) {
+                    self.router.app_cursor_keys = self.focused_app_cursor_keys();
                     let area = self.terminal_area();
                     let decision = {
                         let ctx = TabNavCtx {
@@ -5368,6 +5383,24 @@ fn key_to_core_code(key: &Key, mods: ModifiersState) -> Option<CoreKeyCode> {
         Key::Named(NamedKey::ArrowDown) => Some(CoreKeyCode::Down),
         Key::Named(NamedKey::ArrowLeft) => Some(CoreKeyCode::Left),
         Key::Named(NamedKey::ArrowRight) => Some(CoreKeyCode::Right),
+        Key::Named(NamedKey::Home) => Some(CoreKeyCode::Home),
+        Key::Named(NamedKey::End) => Some(CoreKeyCode::End),
+        Key::Named(NamedKey::PageUp) => Some(CoreKeyCode::PageUp),
+        Key::Named(NamedKey::PageDown) => Some(CoreKeyCode::PageDown),
+        Key::Named(NamedKey::Insert) => Some(CoreKeyCode::Insert),
+        Key::Named(NamedKey::Delete) => Some(CoreKeyCode::Delete),
+        Key::Named(NamedKey::F1) => Some(CoreKeyCode::F(1)),
+        Key::Named(NamedKey::F2) => Some(CoreKeyCode::F(2)),
+        Key::Named(NamedKey::F3) => Some(CoreKeyCode::F(3)),
+        Key::Named(NamedKey::F4) => Some(CoreKeyCode::F(4)),
+        Key::Named(NamedKey::F5) => Some(CoreKeyCode::F(5)),
+        Key::Named(NamedKey::F6) => Some(CoreKeyCode::F(6)),
+        Key::Named(NamedKey::F7) => Some(CoreKeyCode::F(7)),
+        Key::Named(NamedKey::F8) => Some(CoreKeyCode::F(8)),
+        Key::Named(NamedKey::F9) => Some(CoreKeyCode::F(9)),
+        Key::Named(NamedKey::F10) => Some(CoreKeyCode::F(10)),
+        Key::Named(NamedKey::F11) => Some(CoreKeyCode::F(11)),
+        Key::Named(NamedKey::F12) => Some(CoreKeyCode::F(12)),
         _ => None,
     }
 }

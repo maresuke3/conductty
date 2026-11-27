@@ -102,6 +102,9 @@ pub struct GridSnapshot {
     pub cursor_row: usize,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    /// カーソルキーのアプリケーションモード (DECCKM, CSI ?1 h)。矢印キーを SS3 で送る
+    #[serde(default)]
+    pub app_cursor_keys: bool,
     #[serde(default)]
     pub synchronized_output: bool,
     #[serde(default)]
@@ -258,6 +261,7 @@ pub struct TerminalGrid {
     pub cursor_row: usize,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    pub app_cursor_keys: bool,
     pub synchronized_output: bool,
     pub generation: u64,
     pub cells: Vec<Cell>,
@@ -289,6 +293,7 @@ impl TerminalGrid {
             cursor_row: 0,
             cursor_visible: true,
             bracketed_paste: false,
+            app_cursor_keys: false,
             synchronized_output: false,
             generation: 0,
             cells: vec![Cell::default(); cols * rows],
@@ -365,6 +370,7 @@ impl TerminalGrid {
             cursor_row: self.cursor_row,
             cursor_visible: self.cursor_visible,
             bracketed_paste: self.bracketed_paste,
+            app_cursor_keys: self.app_cursor_keys,
             synchronized_output: self.synchronized_output,
             generation: self.generation,
             cells,
@@ -962,6 +968,7 @@ impl Perform for TerminalGrid {
             }
             b'c' => {
                 self.color_overrides = ColorOverrides::default();
+                self.app_cursor_keys = false;
                 self.clear_all();
                 self.cursor_col = 0;
                 self.cursor_row = 0;
@@ -1164,6 +1171,8 @@ impl Perform for TerminalGrid {
                 self.cursor_row = 0;
                 self.pending_wrap = false;
             }
+            'h' if is_private && first == 1 => self.app_cursor_keys = true,
+            'l' if is_private && first == 1 => self.app_cursor_keys = false,
             'h' if is_private && first == 25 => {
                 self.cursor_visible = true;
             }
@@ -1371,6 +1380,15 @@ mod tests {
         assert_eq!(parse_color_spec(b"rgb:ff/00/55/00"), None);
         assert_eq!(parse_color_spec(b"#ff00"), None);
         assert_eq!(parse_color_spec(b"red"), None);
+    }
+
+    #[test]
+    fn decckm_toggles_app_cursor_keys() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.feed_bytes(b"\x1b[?1h");
+        assert!(grid.snapshot().app_cursor_keys);
+        grid.feed_bytes(b"\x1b[?1l");
+        assert!(!grid.app_cursor_keys);
     }
 
     #[test]
