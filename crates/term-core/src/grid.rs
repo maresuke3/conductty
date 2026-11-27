@@ -246,6 +246,40 @@ fn parse_sgr_color(params: &[&[u16]], i: &mut usize) -> Option<Color> {
     }
 }
 
+/// G0 / G1 に割り当てる文字セット
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Charset {
+    Ascii,
+    /// DEC の罫線・記号 (ESC ( 0)
+    DecSpecial,
+    /// イギリス (ESC ( A)。# が £ になる
+    British,
+}
+
+impl Charset {
+    fn from_final(byte: u8) -> Self {
+        match byte {
+            b'0' => Charset::DecSpecial,
+            b'A' => Charset::British,
+            _ => Charset::Ascii,
+        }
+    }
+
+    fn map(self, c: char) -> char {
+        match (self, c) {
+            (Charset::British, '#') => '£',
+            (Charset::DecSpecial, '_'..='~') => {
+                const TABLE: [char; 32] = [
+                    ' ', '◆', '▒', '␉', '␌', '␍', '␊', '°', '±', '␤', '␋', '┘', '┐', '┌', '└', '┼',
+                    '⎺', '⎻', '─', '⎼', '⎽', '├', '┤', '┴', '┬', '│', '≤', '≥', 'π', '≠', '£', '·',
+                ];
+                TABLE[c as usize - '_' as usize]
+            }
+            _ => c,
+        }
+    }
+}
+
 fn parse_number<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
@@ -322,6 +356,10 @@ pub struct TerminalGrid {
     scroll_top: usize,
     scroll_bottom: usize,
     saved_cursor: (usize, usize),
+    /// G0 / G1 に割り当てた文字セット (ESC ( F / ESC ) F)
+    charsets: [Charset; 2],
+    /// 使っている文字セット。0 = G0（SI）、1 = G1（SO）
+    active_charset: usize,
     alt_screen: Option<(Vec<Cell>, usize, usize)>,
     parser: Parser,
 }
@@ -352,6 +390,8 @@ impl TerminalGrid {
             scroll_top: 0,
             scroll_bottom: rows - 1,
             saved_cursor: (0, 0),
+            charsets: [Charset::Ascii; 2],
+            active_charset: 0,
             alt_screen: None,
             parser: Parser::new(),
         }
@@ -961,6 +1001,7 @@ fn char_display_width(c: char) -> usize {
 
 impl Perform for TerminalGrid {
     fn print(&mut self, c: char) {
+        let c = self.charsets[self.active_charset].map(c);
         let width = char_display_width(c);
         if width == 0 {
             return;
@@ -1024,6 +1065,9 @@ impl Perform for TerminalGrid {
                 let next = ((self.cursor_col / 8) + 1) * 8;
                 self.cursor_col = next.min(self.cols - 1);
             }
+            // SO / SI: G1 / G0 の文字セットに切り替える
+            0x0e => self.active_charset = 1,
+            0x0f => self.active_charset = 0,
             _ => {}
         }
     }
@@ -1032,7 +1076,16 @@ impl Perform for TerminalGrid {
         self.handle_color_osc(params, bell_terminated);
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        match intermediates {
+            [b'('] => self.charsets[0] = Charset::from_final(byte),
+            [b')'] => self.charsets[1] = Charset::from_final(byte),
+            _ => {}
+        }
+        // NOTE: ESC ( c や ESC # 8 を、記号の無い ESC c（リセット）や ESC 8 として扱わない
+        if !intermediates.is_empty() {
+            return;
+        }
         match byte {
             b'7' => {
                 self.saved_cursor = (self.cursor_col, self.cursor_row);
@@ -1056,6 +1109,8 @@ impl Perform for TerminalGrid {
             }
             b'c' => {
                 self.color_overrides = ColorOverrides::default();
+                self.charsets = [Charset::Ascii; 2];
+                self.active_charset = 0;
                 self.modes = TerminalModes {
                     alt_screen: self.alt_screen.is_some(),
                     ..TerminalModes::default()
@@ -1468,6 +1523,36 @@ mod tests {
         );
         grid.feed_bytes(b"\x1b[?1049l");
         assert!(!grid.modes.alt_screen);
+    }
+
+    #[test]
+    fn dec_special_graphics_draws_lines_and_switches_with_so_si() {
+        let mut grid = TerminalGrid::new(10, 2);
+        let row = |grid: &TerminalGrid, row| {
+            (0..grid.cols)
+                .map(|col| grid.cell(col, row).unwrap().ch)
+                .collect::<String>()
+        };
+        // G0 を罫線にして書き、ESC ( B で戻す
+        grid.feed_bytes(b"\x1b(0lqkx\x1b(Bq");
+        assert_eq!(row(&grid, 0).trim_end(), "┌─┐│q");
+        // G1 を罫線にして、SO で G1・SI で G0 に切り替える。イギリスの # は £
+        grid.feed_bytes(b"\r\n\x1b)0\x0eqn\x0fq\x1b(A#");
+        assert_eq!(row(&grid, 1).trim_end(), "─┼q£");
+        // 全体のリセットで ASCII に戻る
+        grid.feed_bytes(b"\x1bc\x1b)0\x0eq\x1bcq");
+        assert_eq!(grid.cell(0, 0).unwrap().ch, 'q');
+    }
+
+    #[test]
+    fn esc_with_intermediates_is_not_treated_as_plain_esc() {
+        let mut grid = TerminalGrid::new(10, 2);
+        grid.feed_bytes(b"abc\x1b(c");
+        // ESC ( c はリセットではない
+        assert_eq!(grid.cell(0, 0).unwrap().ch, 'a');
+        grid.feed_bytes(b"\x1b7\r\nxy\x1b#8");
+        // ESC # 8 はカーソルを戻す ESC 8 ではない（戻すなら ESC 7 で覚えた列 3・行 0 に行く）
+        assert_eq!((grid.cursor_col, grid.cursor_row), (2, 1));
     }
 
     #[test]
