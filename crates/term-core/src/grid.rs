@@ -178,6 +178,8 @@ pub struct TerminalModes {
     pub cursor_style: Option<CursorStyle>,
     /// アプリが決めたカーソルの点滅（DECSCUSR / ?12）。None なら設定に従う
     pub cursor_blink: Option<bool>,
+    /// キティのキーボードプロトコルのフラグ（今の画面のスタックのいちばん上）
+    pub kitty_keyboard: u8,
 }
 
 impl Default for TerminalModes {
@@ -191,6 +193,7 @@ impl Default for TerminalModes {
             alt_screen: false,
             cursor_style: None,
             cursor_blink: None,
+            kitty_keyboard: 0,
         }
     }
 }
@@ -444,6 +447,8 @@ pub struct TerminalGrid {
     tab_stops: Vec<bool>,
     /// CSI b（直前の文字を繰り返す）のために覚えておく、最後に書いた文字
     last_printed: Option<char>,
+    /// キティのキーボードプロトコルのフラグのスタック。メインの画面と代替画面で別に持つ
+    kitty_keyboard: [Vec<u8>; 2],
     scroll_top: usize,
     scroll_bottom: usize,
     saved_cursor: (usize, usize),
@@ -489,6 +494,7 @@ impl TerminalGrid {
             insert_mode: false,
             tab_stops: default_tab_stops(cols),
             last_printed: None,
+            kitty_keyboard: [Vec::new(), Vec::new()],
             scroll_top: 0,
             scroll_bottom: rows - 1,
             saved_cursor: (0, 0),
@@ -713,8 +719,11 @@ impl TerminalGrid {
                         self.cursor_col = 0;
                         self.cursor_row = 0;
                     }
+                    // 代替画面のスタックは入るたびに空から始める
+                    self.kitty_keyboard[1].clear();
                 }
                 self.modes.alt_screen = true;
+                self.sync_kitty_keyboard();
             }
             47 | 1047 | 1049 => {
                 if let Some((saved, col, row)) = self.alt_screen.take() {
@@ -727,6 +736,7 @@ impl TerminalGrid {
                     }
                 }
                 self.modes.alt_screen = false;
+                self.sync_kitty_keyboard();
             }
             // カーソルの位置を覚える・戻す（ESC 7 / ESC 8 と同じ）
             1048 if on => self.save_cursor(),
@@ -773,6 +783,48 @@ impl TerminalGrid {
                 String::from_utf8_lossy(&bytes).into_owned(),
             ));
         }
+    }
+
+    fn handle_kitty_keyboard(&mut self, kind: u8, params: &Params) {
+        const MAX_DEPTH: usize = 16;
+        let mut values = params.iter().map(|p| p[0]);
+        let first = values.next().unwrap_or(0);
+        let stack = &mut self.kitty_keyboard[self.alt_screen.is_some() as usize];
+        match kind {
+            b'>' => {
+                // いっぱいなら古いものから捨てる
+                if stack.len() >= MAX_DEPTH {
+                    stack.remove(0);
+                }
+                stack.push(first as u8);
+            }
+            b'<' => stack.truncate(stack.len().saturating_sub(first.max(1) as usize)),
+            b'=' => {
+                let flags = first as u8;
+                let current = stack.last().copied().unwrap_or(0);
+                // 1 は置き換え、2 は足す、3 は取り除く
+                let new = match values.next().unwrap_or(1) {
+                    2 => current | flags,
+                    3 => current & !flags,
+                    _ => flags,
+                };
+                match stack.last_mut() {
+                    Some(top) => *top = new,
+                    None => stack.push(new),
+                }
+            }
+            _ => {
+                let reply = format!("\x1b[?{}u", stack.last().copied().unwrap_or(0));
+                self.push_reply(reply.into_bytes());
+            }
+        }
+        self.sync_kitty_keyboard();
+    }
+
+    /// 今の画面のフラグを、アプリへ渡すモードに写す
+    fn sync_kitty_keyboard(&mut self) {
+        let stack = &self.kitty_keyboard[self.alt_screen.is_some() as usize];
+        self.modes.kitty_keyboard = stack.last().copied().unwrap_or(0);
     }
 
     fn save_cursor(&mut self) {
@@ -1391,6 +1443,7 @@ impl Perform for TerminalGrid {
                 self.origin_mode = false;
                 self.insert_mode = false;
                 self.tab_stops = default_tab_stops(self.cols);
+                self.kitty_keyboard = [Vec::new(), Vec::new()];
                 self.modes = TerminalModes {
                     alt_screen: self.alt_screen.is_some(),
                     ..TerminalModes::default()
@@ -1446,6 +1499,11 @@ impl Perform for TerminalGrid {
         };
         if let Some(reply) = reply {
             self.push_reply(reply.into_bytes());
+            return;
+        }
+        // キティのキーボードプロトコル: CSI > f u（積む）/ CSI < n u（n 個降ろす）/ CSI = f ; m u（変える）/ CSI ? u（問い合わせ）
+        if action == 'u' && matches!(intermediates, [b'>' | b'<' | b'=' | b'?']) {
+            self.handle_kitty_keyboard(intermediates[0], params);
             return;
         }
         // DECSCUSR (CSI Ps SP q): カーソルの形。0 は設定に戻し、1・3・5 は点滅、2・4・6 は点滅しない
@@ -2095,6 +2153,33 @@ mod tests {
                 b"\x1b[?47;2$y".to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn kitty_keyboard_flags_push_pop_set_query_per_screen() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.feed_bytes(b"\x1b[>1u\x1b[>11u\x1b[?u");
+        assert_eq!(grid.modes.kitty_keyboard, 11);
+        grid.feed_bytes(b"\x1b[=4;2u");
+        assert_eq!(grid.modes.kitty_keyboard, 15);
+        grid.feed_bytes(b"\x1b[=8;3u");
+        assert_eq!(grid.modes.kitty_keyboard, 7);
+        grid.feed_bytes(b"\x1b[<u");
+        assert_eq!(grid.modes.kitty_keyboard, 1);
+        // 代替画面は別のスタック
+        grid.feed_bytes(b"\x1b[?1049h");
+        assert_eq!(grid.modes.kitty_keyboard, 0);
+        grid.feed_bytes(b"\x1b[>31u\x1b[?1049l");
+        assert_eq!(grid.modes.kitty_keyboard, 1);
+        grid.feed_bytes(b"\x1b[<5u\x1b[?u");
+        assert_eq!(grid.modes.kitty_keyboard, 0);
+        assert_eq!(
+            grid.take_replies(),
+            vec![b"\x1b[?11u".to_vec(), b"\x1b[?0u".to_vec()]
+        );
+        // CSI u（記号なし）はカーソルを戻す命令のまま
+        grid.feed_bytes(b"\x1b[sab\x1b[u");
+        assert_eq!(grid.cursor_col, 0);
     }
 
     #[test]
